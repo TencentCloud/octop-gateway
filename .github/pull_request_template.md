@@ -4,8 +4,8 @@
 
 ## Target branch
 
-- [ ] Base is **`main`** (feature / fix — default)
-- [ ] Base is **`main`** via `release/*` or `hotfix/*` (publish only)
+- [ ] Base is **`develop`** (feature / fix — default)
+- [ ] Base is **`main`** (`release/*` or `hotfix/*` only)
 
 ## Type of change
 

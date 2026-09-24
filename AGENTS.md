@@ -661,29 +661,29 @@ Use an existing channel as the template (Feishu/DingTalk for SDK callbacks, MQTT
 ### Branching & release
 
 ```
-feature/* / fix/* ──PR──► main
-release/x.y.z    ──PR──► main ──auto-tag v*──► PyPI + GitHub Release
-hotfix/*         ──PR──► main
+feature/* ──PR──► develop ──► release/x.y.z ──PR──► main ──tag v*──► publish
+hotfix/* ──PR──► main (+ tag) and ──PR──► develop
 ```
-
-`main` is the default branch and the production source of truth; it doubles as the daily integration branch.
 
 | Branch | Role |
 |--------|------|
-| `main` | Production source of truth; default branch; base for every PR |
-| `feature/*` / `fix/*` | Day-to-day work — open PRs into `main` |
-| `release/x.y.z` | Temporary release snapshot (version bump + CHANGELOG); delete after ship |
-| `hotfix/*` | Emergency patch branched from `main`, merged back into `main` |
+| `main` | Production source of truth; **default branch**; only release / hotfix merges; **only `v*` tags on `main` are production** |
+| `develop` | Daily integration; **base for feature PRs** |
+| `release/x.y.z` | Temporary freeze (version bump / CHANGELOG / README sync); **delete after ship** |
+| `hotfix/*` | Emergency fix from `main`; merge to `main` and back to `develop` |
 
 **Rules**
 
-- Open feature / fix PRs against **`main`** with a `feature/` or `fix/` prefix.
-- Ship only via `release/x.y.z` → `main` (or `hotfix/*` → `main`). Never push a production `v*` tag from a feature branch.
-- Merge `release/x.y.z` → `main` with a **merge commit** when possible, so tag ancestry stays clear.
-- Production `v*` tags are created **on the main tip after** the release PR merges.
-- Delete the temporary `release/x.y.z` branch after publishing.
+- Never push `develop` directly onto `main` — ship via `release/*` → `main` (or hotfix → `main`) only. Do **not** bulk-merge `develop` → `main`; it forks history and breaks post-release sync.
+- Never push directly to `main` or `develop` — always open a PR (GitHub branch protection).
+- Merge `release/*` → `main` with a **merge commit** (not squash) so `main` stays reconcilable with `develop`.
+- Release sequence: cut `release/*` from latest `develop` → PR into `main` → **tag `v*` on main tip only after merge** → delete `release/*` → Actions syncs `main` → `develop` (`sync-main-to-develop.yml`; opens `chore/sync-develop-after-*` on conflict / branch protection).
+- Keep **`main` an ancestor of `develop`** after every release. Do not use legacy `head=main` → `develop` sync PRs.
+- Do **not** push a production tag from a release/feature branch before it is on `main`.
+- Hotfix: branch from `main`, PR to `main` (and tag if shipping), then PR into `develop`.
+- Day-to-day feature work: branch from `develop`, open PR **into `develop`** (not `main`).
+- Human detail: `CONTRIBUTING.md`. Agent publish flow: `.cursor/skills/publish` / `.codebuddy/skills/publish`.
 
-Human detail lives in `CONTRIBUTING.md`.
 
 ## 13. Communication
 

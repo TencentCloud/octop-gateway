@@ -1,8 +1,9 @@
 name: CI
 
+# Pull requests only. GitHub runs PR checks on the merge result, so a push
+# build on main would re-test content that the release / feature PR already
+# proved green.
 on:
-  push:
-    branches: [main]
   pull_request:
 
 concurrency:
@@ -13,6 +14,8 @@ jobs:
   quality:
     name: "Python ${{ matrix.python-version }}"
     runs-on: ubuntu-latest
+    # Post-release main → develop sync PRs carry main's already-tested tree.
+    if: ${{ !startsWith(github.head_ref, 'chore/sync-develop-after-') }}
     strategy:
       fail-fast: false
       matrix:
