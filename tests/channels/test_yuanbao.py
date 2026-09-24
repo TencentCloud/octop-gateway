@@ -930,3 +930,139 @@ async def test_send_local_media_failure_emits_visible_text_marker(monkeypatch: p
 
 def time_left() -> float:
     return asyncio.get_event_loop().time() + 600
+
+
+def _mention_elem(user_id: str, text: str = "@bot") -> dict[str, Any]:
+    return {
+        "msg_type": "TIMCustomElem",
+        "msg_content": {"data": json.dumps({"elem_type": 1002, "text": text, "user_id": user_id})},
+    }
+
+
+def _group_channel() -> YuanbaoChannel:
+    channel = YuanbaoChannel(
+        processor=_noop_processor,
+        config=YuanbaoConfig(app_key="app-key", app_secret="app-secret"),
+    )
+    channel._bot_id = "bot-1"
+    return channel
+
+
+def _group_payload(*elements: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "callback_command": proto.CALLBACK_GROUP_SEND_MSG,
+        "from_account": "user-9",
+        "group_code": "group-1",
+        "msg_id": "msg-g1",
+        "msg_body": list(elements),
+    }
+
+
+def test_parse_group_mention_of_bot_sets_bot_mentioned() -> None:
+    msg = _group_channel().parse_inbound(
+        _group_payload(
+            {"msg_type": proto.MSG_TYPE_TEXT, "msg_content": {"text": "hello"}},
+            _mention_elem("bot-1"),
+        )
+    )
+    assert msg.channel_subject is not None
+    assert msg.channel_subject.chat_type == "group"
+    assert msg.metadata["bot_mentioned"] is True
+    assert msg.metadata["mentioned_user_ids"] == ["bot-1"]
+    assert msg.metadata["at_elems"] == [{"user_id": "bot-1", "text": "@bot"}]
+    assert msg.metadata["at_all"] is False
+
+
+def test_parse_group_mention_of_other_user_is_not_bot_mentioned() -> None:
+    msg = _group_channel().parse_inbound(
+        _group_payload(
+            {"msg_type": proto.MSG_TYPE_TEXT, "msg_content": {"text": "hi"}},
+            _mention_elem("user-2", "@someone"),
+        )
+    )
+    assert msg.metadata["bot_mentioned"] is False
+    assert msg.metadata["mentioned_user_ids"] == ["user-2"]
+
+
+def test_parse_group_at_all_marks_bot_mentioned() -> None:
+    for elem in (_mention_elem("0", "@所有人"), _mention_elem("all", "@all")):
+        msg = _group_channel().parse_inbound(_group_payload(elem))
+        assert msg.metadata["bot_mentioned"] is True
+        assert msg.metadata["at_all"] is True
+
+
+def test_parse_non_mention_custom_elem_is_ignored() -> None:
+    msg = _group_channel().parse_inbound(
+        _group_payload(
+            {
+                "msg_type": "TIMCustomElem",
+                "msg_content": {"data": json.dumps({"elem_type": 999, "text": "x", "user_id": "bot-1"})},
+            }
+        )
+    )
+    assert msg.metadata["bot_mentioned"] is False
+    assert msg.metadata["at_elems"] == []
+
+
+def test_parse_direct_message_has_no_mention_metadata() -> None:
+    # Direct chat has no @ semantics; the mention filter must never apply.
+    msg = _group_channel().parse_inbound(
+        {
+            "callback_command": proto.CALLBACK_C2C_SEND_MSG,
+            "from_account": "user-1",
+            "msg_id": "msg-d1",
+            "msg_body": [{"msg_type": proto.MSG_TYPE_TEXT, "msg_content": {"text": "hello"}}],
+        }
+    )
+    assert msg.channel_subject is not None
+    assert msg.channel_subject.chat_type == "direct"
+    assert "bot_mentioned" not in msg.metadata
+
+
+def test_default_group_context_drops_unmentioned_group_message() -> None:
+    channel = _group_channel()
+    manager = channel.group_context_manager
+    unmentioned = channel.parse_inbound(
+        _group_payload({"msg_type": proto.MSG_TYPE_TEXT, "msg_content": {"text": "chatter"}})
+    )
+    assert manager.will_trigger(unmentioned) is False
+    assert manager.prepare(unmentioned) is None
+
+    mentioned = channel.parse_inbound(
+        _group_payload(
+            {"msg_type": proto.MSG_TYPE_TEXT, "msg_content": {"text": "hello @bot"}},
+            _mention_elem("bot-1"),
+        )
+    )
+    assert manager.will_trigger(mentioned) is True
+    assert manager.prepare(mentioned) is not None
+
+
+def test_always_activation_keeps_replying_to_all_group_messages() -> None:
+    from octop_gateway.group_context import GroupContextConfig
+
+    channel = YuanbaoChannel(
+        processor=_noop_processor,
+        config=YuanbaoConfig(
+            app_key="app-key",
+            app_secret="app-secret",
+            # "always" only avoids degrading to mention with explicit full visibility.
+            group_context=GroupContextConfig(enabled=True, activation="always", visibility="all"),
+        ),
+    )
+    channel._bot_id = "bot-1"
+    manager = channel.group_context_manager
+    unmentioned = channel.parse_inbound(
+        _group_payload({"msg_type": proto.MSG_TYPE_TEXT, "msg_content": {"text": "chatter"}})
+    )
+    assert manager.will_trigger(unmentioned) is True
+    assert manager.prepare(unmentioned) is not None
+
+
+def test_partial_group_context_override_keeps_policy_enabled() -> None:
+    cfg = YuanbaoConfig.from_dict({"group_context": {"history_limit": 5}})
+    assert cfg.group_context.enabled is True
+    assert cfg.group_context.history_limit == 5
+
+    cfg = YuanbaoConfig.from_dict({"group_context": {"enabled": False}})
+    assert cfg.group_context.enabled is False
