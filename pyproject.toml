@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "octop-gateway"
-version = "0.9.9"
+version = "1.0.0"
 description = "Multi-platform IM channel bridge with unified message abstraction for AI agents and bots"
 readme = "README.md"
 license = { text = "MIT" }
