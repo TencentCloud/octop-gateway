@@ -13,6 +13,7 @@ from octop_gateway.channels.yuanbao.constants import (
     HERMES_INSTANCE_ID,
 )
 from octop_gateway.channels.yuanbao.utils import _normalize_http_origin, _normalize_ws_url
+from octop_gateway.group_context import GroupContextConfig
 
 
 @dataclass
@@ -58,6 +59,16 @@ class YuanbaoConfig(ChannelConfig):
     connect_timeout: float = 15.0
     probe_mode: str = "full"
 
+    group_context: GroupContextConfig = field(
+        default_factory=lambda: GroupContextConfig(
+            enabled=True,
+            visibility="auto",
+            activation="mention",
+            history="recent",
+            history_limit=10,
+        )
+    )
+
     required_credentials: ClassVar[tuple[str, ...]] = ("app_key", "app_secret")
     field_aliases: ClassVar[dict[str, str]] = {
         "appId": "app_key",
@@ -99,3 +110,13 @@ class YuanbaoConfig(ChannelConfig):
         if not self.app_secret:
             missing.append("app_secret")
         return missing
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> YuanbaoConfig:
+        config = super().from_dict(data)
+        # A partial group_context override (e.g. only history_limit) must not
+        # silently disable the enabled-by-default group policy.
+        raw_group_context = data.get("group_context")
+        if isinstance(raw_group_context, dict) and "enabled" not in raw_group_context:
+            config.group_context.enabled = True
+        return config
