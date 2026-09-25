@@ -650,6 +650,8 @@ class WeComChannel(BaseChannel):
             content=content_parts,
             metadata={
                 "to_handle": sender_id,
+                "sender_id": sender_id,
+                "sender_name": sender_info.get("name", "") or "",
                 "chat_id": chat_id,
                 "chat_type": chat_type,
                 "msgid": data.get("msgid", ""),
