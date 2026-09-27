@@ -801,9 +801,9 @@ class QQChannel(BaseChannel):
             locked = _locked_stream_text(answer) if answer else session.last_accepted
             await session.finish(locked)
             await _flush_thinking()
-            # Hold-only frames are not visible. Fall back when nothing
-            # readable was accepted, even if sent_frames > 0.
-            if session.sent_frames <= 0 or not session.last_accepted.strip():
+            # Hold-only frames are not visible. A failed stream also needs
+            # the full answer when an earlier visible frame was accepted.
+            if session.failed or session.sent_frames <= 0 or not session.last_accepted.strip():
                 await _deliver_static(answer)
             for media in media_buffer:
                 await self.reply_media(subject, media)
