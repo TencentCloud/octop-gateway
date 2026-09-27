@@ -23,8 +23,7 @@ disable-model-invocation: true
 | `CHANGELOG_FILE` | `CHANGELOG.md` | 相对于仓库根目录的路径，文件不存在则跳过 |
 | `VERSION_FILE` | `pyproject.toml` | 包含版本号的文件 |
 | `VERSION_PATTERN` | `^\s*version\s*=\s*"[^"]+"` | 匹配版本行的正则表达式 |
-| `README_FILE` | `README.md` | 发版时同步检查/更新的 README（见步骤 4b） |
-| `README_CN_FILE` | `README_CN.md` | 若存在则同样同步；缺失则跳过 |
+| `README_GLOB` | `README*.md` | 含版本徽标或硬编码安装版本的 README（含多语言变体，如 `README.md`、`README_CN.md`）；全部同步检查/升级 |
 | `INIT_VERSION_FILE` | `(none — package metadata)` | 含硬编码 `__version__` 时同步；本包通常由 `importlib.metadata` 读取，缺失/元数据驱动则跳过 |
 | `TAG_PREFIX` | `v` | Git tag 前缀；工作流监听 `v*` |
 | `REMOTE` | `github` | Git 远程仓库名（推送 release 分支与创建 PR） |
@@ -189,11 +188,16 @@ git checkout -B {RELEASE_BRANCH_PREFIX}{version} {REMOTE}/{INTEGRATION_BRANCH}
    grep -n '^\s*version\s*=\s*"[^"]+"' pyproject.toml
    # 用 Edit 工具将该行的 "X.Y.Z" 替换为 "A.B.C"
    ```
-2. `README_FILE` / `README_CN_FILE`（若存在）：
+2. 所有匹配 `README_GLOB` 的多语言 README（勿只改英文 `README.md`）：
+   ```bash
+   # 发现需检查的文件
+   ls README.md README_*.md 2>/dev/null
+   ```
+   对每一个命中文件：
    - 若存在静态 shields 徽标 `version-X.Y.Z-orange`（或同类），升级为 `version-A.B.C-orange`。
-   - 若仅使用动态 `shields.io/pypi/v/octop-gateway` 徽标，**无需改徽标**（PyPI 发布后自动更新），但仍须检查 README 中是否有硬编码安装示例版本（如 `pip install octop-gateway==X.Y.Z`）并同步。
+   - 若仅使用动态 `shields.io/pypi/v/octop-gateway` 徽标，**无需改徽标**（PyPI 发布后自动更新），但仍须检查是否有硬编码安装示例版本（如 `pip install octop-gateway==X.Y.Z`）并同步。
    - 用户可见的发版说明若写在 README，按需补一行指向 `CHANGELOG.md` 对应版本。
-   - 文件不存在则跳过并提示（不中止）。
+   当前仓库至少包括 `README.md` 与 `README_CN.md`；某文件不存在则跳过该文件。全部未命中则提示并继续（不中止）。
 3. `INIT_VERSION_FILE` — 仅当文件内存在硬编码 `__version__ = "..."` 时升级；若通过 `importlib.metadata` / `_version.py` 读包元数据则跳过。
 
 **4c. 提交：**
@@ -317,7 +321,7 @@ git checkout {original_branch}
 **始终：**
 - 从最新 `{REMOTE}/{INTEGRATION_BRANCH}` 切 release
 - 先合入 `{TARGET_BRANCH}`，再由 Action 在 main tip 打 tag
-- 发版时同步更新 CHANGELOG，并检查/更新 README（及 README_CN）
+- 发版时同步更新 CHANGELOG，并检查/更新所有多语言 README（`README.md`、`README_CN.md` 等），勿只改英文
 - 发版后删除 `release/*`；`main → develop` 由 `sync-main-to-develop.yml` 自动同步（失败时再手动补）
 - 中止前展示完整错误输出
 - 插入新版本条目后保持 `[Unreleased]` 为空
