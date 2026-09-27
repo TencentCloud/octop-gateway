@@ -433,6 +433,44 @@ class TestQQChannelStream:
         assert sent == ["Hello"]
 
     @pytest.mark.asyncio
+    async def test_stream_failure_after_visible_prefix_sends_full_static_answer(self) -> None:
+        sent: list[str] = []
+
+        class _FailAfterPrefix(_FakeSession):
+            def post(self, url: str, **kwargs: Any) -> _FakeResp:
+                body = kwargs.get("json") or {}
+                self.posts.append({"url": url, "json": body, "headers": kwargs.get("headers")})
+                if (
+                    str(url).endswith("/stream_messages")
+                    and str(body.get("content_raw") or "").strip() == "Hello\n\nworld"
+                ):
+                    return _FakeResp(404, '{"code":40007,"message":"already committed"}')
+                return _FakeResp()
+
+        async def processor(_msg: InboundMessage):
+            yield MessageEvent.delta("Hello\n\n")
+            await asyncio.sleep(0.01)
+            yield MessageEvent.delta("world\n\n")
+            await asyncio.sleep(0.01)
+            yield MessageEvent.completed()
+
+        ch = QQChannel(processor=processor, config=_config())
+        http = _FailAfterPrefix()
+        ch._http = http  # type: ignore[assignment]
+        ch._access_token = "fake_token"
+        ch._token_expires_at = time.time() + 3600
+        ch._token_refresh_at = time.time() + 3600
+
+        async def capture(_subject: ChannelSubject, text: str) -> None:
+            sent.append(text)
+
+        ch._send_text = capture  # type: ignore[method-assign]
+        await ch.handle_inbound(_c2c_payload())
+        assert any(text.strip() == "Hello" for text in _stream_texts(http))
+        assert sent == ["Hello\n\nworld"]
+        assert not any(p["json"]["input_state"] == STREAM_DONE for p in _stream_posts(http))
+
+    @pytest.mark.asyncio
     async def test_http_200_with_qq_error_code_falls_back_to_static(self) -> None:
         sent: list[str] = []
 

@@ -205,7 +205,7 @@ class StreamSession:
             self.closing = True
             self.pending = None
         await self._wait_idle()
-        if self.sent_frames <= 0:
+        if self.failed or self.sent_frames <= 0:
             return
         payload = text if text else self.last_accepted
         for attempt in range(1, self.done_retries + 1):

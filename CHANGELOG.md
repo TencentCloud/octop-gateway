@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 修复
+
+- QQ 单聊流式帧在已有可见内容后失败时，静态补发完整回答并停止无效的 DONE 重试（Octop #1133）。
+
 ## [1.0.0] - 2026-09-24
 
 ### 新增
