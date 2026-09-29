@@ -64,12 +64,18 @@ class FeishuConfig(ChannelConfig):
         encrypt_key: Event encryption key (for HTTP event callbacks).
         channel_id: Optional explicit channel ID; auto-generated UUID if omitted.
         tenant_id: Optional tenant identifier for multi-tenant deployments.
+        probe_mode: ``"full"`` (default) opens the WebSocket connection;
+            ``"token"`` only verifies credentials via a tenant-token fetch —
+            used by credential probes, because a second full WS start rebinds
+            lark-oapi's module-global loop and leaves the live channel
+            silently deaf (#757).
     """
 
     app_id: str = ""
     app_secret: str = ""
     verification_token: str = ""
     encrypt_key: str = ""
+    probe_mode: str = "full"
 
     required_credentials = ("app_id", "app_secret")
 
@@ -132,6 +138,13 @@ class FeishuChannel(BaseChannel):
         self._running = True
         self._main_loop = asyncio.get_running_loop()
         await self._refresh_token()
+        if self._config.probe_mode == "token":
+            # Credential probe: the token fetch above is the whole check.
+            # Opening a second WS connection would rebind lark-oapi's
+            # module-global loop and leave the live channel silently deaf (#757).
+            logger.info("FeishuChannel probe ok (token verified, no WS connection)")
+            self._running = False
+            return
         await self._ensure_bot_open_id()
         await self._start_ws_client()
         self._ws_watchdog_task = asyncio.create_task(
@@ -279,7 +292,21 @@ class FeishuChannel(BaseChannel):
         try:
             import lark_oapi.ws.client as ws_client_module
 
-            ws_client_module.loop = loop
+            current = getattr(ws_client_module, "loop", None)
+            if current is not None and current is not loop and current.is_running():
+                # Another live Feishu connection still owns the SDK's
+                # module-global loop. Rebinding it would reroute that
+                # channel's scheduled callbacks onto a loop that never runs
+                # them — the "silently deaf while connected" state (#757).
+                # Keep the global where it is; this client's own loop still
+                # runs start() locally. The credential probe (probe_mode)
+                # exists so normal operations never hit this branch.
+                logger.error(
+                    "Feishu WS: another live connection owns the lark-oapi global loop; "
+                    "skipping loop rebind to keep that channel's message delivery alive"
+                )
+            else:
+                ws_client_module.loop = loop
         except (ImportError, AttributeError):
             pass
         try:
