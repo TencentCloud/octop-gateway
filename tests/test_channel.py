@@ -68,6 +68,28 @@ class PreprocessingEchoChannel(EchoChannel):
         message.metadata["bot_mentioned"] = True
 
 
+class FailingSendChannel(EchoChannel):
+    """Test channel whose outbound path always fails.
+
+    Used to verify the error-path contract: a delivery failure while handling
+    a processor error must never escape ``handle_inbound`` — the fallback
+    notification itself has to be best-effort (see reply-loss report P0).
+    """
+
+    fail_with: BaseException | None = RuntimeError("send failed")
+
+    async def _send_text(self, user: ChannelSubject, text: str) -> None:
+        if self.fail_with is not None:
+            raise self.fail_with
+        await super()._send_text(user, text)
+
+
+async def failing_processor(msg: InboundMessage) -> AsyncIterator[MessageEvent]:
+    """Test processor that raises mid-stream (after emitting one delta)."""
+    yield MessageEvent.delta("partial answer")
+    raise RuntimeError("processor exploded")
+
+
 # --- Tests ---
 
 
@@ -129,6 +151,30 @@ class TestBaseChannel:
         # Should have sent the echo reply as text
         assert len(ch.sent_messages) == 1
         assert "Echo: hi there" in ch.sent_messages[0][1]
+
+    @pytest.mark.asyncio
+    async def test_safe_send_swallows_exceptions(self) -> None:
+        ch = FailingSendChannel(processor=make_echo_processor)
+        user = ChannelSubject(subject_id="user1", first_seen=0, last_seen=0)
+        # Must not raise even though the underlying send fails.
+        await ch._safe_send(user, "fallback notice")
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_error_path_send_failure_does_not_escape(self) -> None:
+        """Regression (reply-loss report P0): when the processor fails AND the
+        outbound channel is down, the except-block fallback sends must not
+        raise — otherwise the exception escapes handle_inbound and the whole
+        reply for this message is silently dropped."""
+        ch = FailingSendChannel(processor=failing_processor)
+
+        # No exception may propagate out of handle_inbound: the fallback
+        # sends inside the except block are best-effort (_safe_send).
+        await ch.handle_inbound("trigger")
+
+        # Nothing was actually delivered (the outbound path is down), but the
+        # call completed — the manager worker survives and the reply-loss
+        # escalation path from the report is cut off.
+        assert ch.sent_messages == []
 
     @pytest.mark.asyncio
     async def test_platform_preprocessing_runs_before_shared_group_policy(self) -> None:

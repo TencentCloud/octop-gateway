@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 修复
+
+- 修复微信通道「单条消息回复丢失」：`_process_inbound` 错误兜底路径中的补发（flush delta 与错误提示）改用 `_safe_send`，发送失败只记日志不再抛出——原先兜底复用已失效的出站链路，二次异常从 except 块逃逸并中断该条消息的全部后续投递（上游 `ret=-2` 抖动时约 20% 概率丢回复）。
+- 微信发送对 `ret=-2/-14` 的重试移除 `context_token` 非空前置条件：无 context 的主动推送/工具提示现在也会重试一次，并加入 1 秒退避（与轮询退避策略精神一致），瞬时 `prepare failed` 可自愈；持续失败仍在一次重试后如实上抛。
+
 ## [1.0.0] - 2026-09-24
 
 ### 新增

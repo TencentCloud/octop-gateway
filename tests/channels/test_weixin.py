@@ -23,6 +23,7 @@ from octop_gateway.channels.weixin import (
     WeixinChannel,
     WeixinConfig,
 )
+from octop_gateway.channels.weixin import channel as weixin_channel
 from octop_gateway.channels.weixin.types import SendMessageResponse, WeixinAPIError
 from octop_gateway.media import FileSystemMediaBackend
 from octop_gateway.models import (
@@ -319,20 +320,138 @@ class TestWeixinChannelUnit:
         fake_api = SimpleNamespace(send_message=AsyncMock(side_effect=responses))
         ch._api = AsyncMock(return_value=fake_api)  # type: ignore[method-assign]
 
-        await ch._send_text(
-            ChannelSubject(
-                subject_id="wx_target_user",
-                metadata={
-                    "account_id": "acc_001",
-                    "from_user_id": "wx_target_user",
-                    "context_token": "ctx_stale",
-                },
-            ),
-            "cron ping",
-        )
+        with patch.object(weixin_channel, "_SEND_RETRY_BACKOFF_S", 0.0):
+            await ch._send_text(
+                ChannelSubject(
+                    subject_id="wx_target_user",
+                    metadata={
+                        "account_id": "acc_001",
+                        "from_user_id": "wx_target_user",
+                        "context_token": "ctx_stale",
+                    },
+                ),
+                "cron ping",
+            )
 
         assert fake_api.send_message.await_count == 2
         assert fake_api.send_message.await_args_list[1].kwargs["context_token"] == ""
+
+    @pytest.mark.asyncio
+    async def test_send_text_retries_on_ret_minus_2_without_any_context_token(self) -> None:
+        """Regression (reply-loss report): tool hints push without a
+        context_token; a transient -2 must still be retried once instead of
+        raising on the first attempt."""
+        ch = WeixinChannel(processor=_noop_processor, config=_make_config())
+        responses = [
+            WeixinAPIError(ret=-2, errcode=-2, errmsg="prepare failed"),
+            SendMessageResponse(ret=0, message_id=2),
+        ]
+
+        fake_api = SimpleNamespace(send_message=AsyncMock(side_effect=responses))
+        ch._api = AsyncMock(return_value=fake_api)  # type: ignore[method-assign]
+
+        with patch.object(weixin_channel, "_SEND_RETRY_BACKOFF_S", 0.0):
+            await ch._send_text(
+                ChannelSubject(
+                    subject_id="wx_target_user",
+                    metadata={
+                        "account_id": "acc_001",
+                        "from_user_id": "wx_target_user",
+                        # No context_token anywhere: not in metadata, not cached.
+                    },
+                ),
+                "tool hint",
+            )
+
+        assert fake_api.send_message.await_count == 2
+        assert fake_api.send_message.await_args_list[0].kwargs["context_token"] == ""
+        assert fake_api.send_message.await_args_list[1].kwargs["context_token"] == ""
+
+    @pytest.mark.asyncio
+    async def test_send_text_retry_applies_backoff(self) -> None:
+        ch = WeixinChannel(processor=_noop_processor, config=_make_config())
+        responses = [
+            WeixinAPIError(ret=-2, errcode=-2, errmsg="prepare failed"),
+            SendMessageResponse(ret=0, message_id=3),
+        ]
+
+        fake_api = SimpleNamespace(send_message=AsyncMock(side_effect=responses))
+        ch._api = AsyncMock(return_value=fake_api)  # type: ignore[method-assign]
+
+        sleeps: list[float] = []
+        with (
+            patch.object(
+                weixin_channel,
+                "_SEND_RETRY_BACKOFF_S",
+                1.5,
+            ),
+            patch.object(
+                weixin_channel.asyncio,
+                "sleep",
+                new=AsyncMock(side_effect=lambda s: sleeps.append(s)),
+            ),
+        ):
+            await ch._send_text(
+                ChannelSubject(
+                    subject_id="wx_target_user",
+                    metadata={
+                        "account_id": "acc_001",
+                        "from_user_id": "wx_target_user",
+                    },
+                ),
+                "hello",
+            )
+
+        assert sleeps == [1.5]
+
+    @pytest.mark.asyncio
+    async def test_send_text_raises_after_single_retry_on_persistent_minus_2(self) -> None:
+        """One retry only: a persistent -2 must still surface to the caller
+        (the channel-level fallback now handles it safely)."""
+        ch = WeixinChannel(processor=_noop_processor, config=_make_config())
+
+        fake_api = SimpleNamespace(
+            send_message=AsyncMock(side_effect=WeixinAPIError(ret=-2, errcode=-2, errmsg="prepare failed"))
+        )
+        ch._api = AsyncMock(return_value=fake_api)  # type: ignore[method-assign]
+
+        with patch.object(weixin_channel, "_SEND_RETRY_BACKOFF_S", 0.0), pytest.raises(WeixinAPIError):
+            await ch._send_text(
+                ChannelSubject(
+                    subject_id="wx_target_user",
+                    metadata={
+                        "account_id": "acc_001",
+                        "from_user_id": "wx_target_user",
+                    },
+                ),
+                "hello",
+            )
+
+        assert fake_api.send_message.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_send_text_does_not_retry_other_error_codes(self) -> None:
+        ch = WeixinChannel(processor=_noop_processor, config=_make_config())
+
+        fake_api = SimpleNamespace(
+            send_message=AsyncMock(side_effect=WeixinAPIError(ret=-3, errcode=-3, errmsg="other"))
+        )
+        ch._api = AsyncMock(return_value=fake_api)  # type: ignore[method-assign]
+
+        with pytest.raises(WeixinAPIError):
+            await ch._send_text(
+                ChannelSubject(
+                    subject_id="wx_target_user",
+                    metadata={
+                        "account_id": "acc_001",
+                        "from_user_id": "wx_target_user",
+                        "context_token": "ctx_stale",
+                    },
+                ),
+                "hello",
+            )
+
+        assert fake_api.send_message.await_count == 1
 
     @pytest.mark.asyncio
     async def test_send_file_uploads_weixin_media_item(self) -> None:

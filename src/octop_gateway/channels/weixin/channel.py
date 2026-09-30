@@ -69,6 +69,12 @@ _AUTH_FAILED_CODE = -2
 # failing; the channel reports "disconnected" to the dashboard meanwhile.
 _SESSION_PAUSE_S = 300.0
 
+# Backoff before the single send retry on -14/-2 (see _send_text). Mirrors the
+# poll loop's exponential strategy but capped low — a user is waiting on the
+# reply, so we trade a short delay for a chance to recover a transient
+# upstream "prepare failed" instead of dropping the message.
+_SEND_RETRY_BACKOFF_S = 1.0
+
 # Typing indicator status values
 _TYPING_START = 1
 
@@ -271,13 +277,29 @@ class WeixinChannel(BaseChannel):
                 return
             except WeixinAPIError as exc:
                 last_error = exc
-                if context_token and exc.ret in (_SESSION_EXPIRED_CODE, _AUTH_FAILED_CODE):
-                    logger.warning(
-                        "WeixinChannel send ret=%s for %s — retrying without context_token",
-                        exc.ret,
-                        to_user_id[:12],
-                    )
-                    context_token = ""
+                if exc.ret in (_SESSION_EXPIRED_CODE, _AUTH_FAILED_CODE):
+                    # Retry unconditionally on -14/-2 — including when the
+                    # first attempt already carried no context_token (tool
+                    # hints, proactive pushes): "prepare failed" (-2) is often
+                    # a transient upstream condition and one delayed retry
+                    # recovers replies that would otherwise be dropped.
+                    if context_token:
+                        logger.warning(
+                            "WeixinChannel send ret=%s for %s — retrying without context_token",
+                            exc.ret,
+                            to_user_id[:12],
+                        )
+                        context_token = ""
+                    else:
+                        logger.warning(
+                            "WeixinChannel send ret=%s for %s — retrying once after backoff",
+                            exc.ret,
+                            to_user_id[:12],
+                        )
+                    # Brief backoff before the retry, mirroring the poll
+                    # loop's exponential strategy but capped for the send
+                    # path (a user is waiting on this reply).
+                    await asyncio.sleep(_SEND_RETRY_BACKOFF_S)
                     continue
                 raise
             except Exception:  # pylint: disable=broad-except

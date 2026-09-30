@@ -900,11 +900,16 @@ class BaseChannel(ABC):
             )
             if timeout_guard:
                 timeout_guard.cancel()
-            # Flush anything accumulated before error
+            # Flush anything accumulated before error. These fallback sends
+            # must never raise: the original failure often comes from the
+            # outbound path itself (e.g. Weixin ret=-2), and an exception
+            # thrown from inside this except block would escape
+            # _process_inbound and abort the rest of the delivery for this
+            # message — silently dropping the user-facing reply.
             if delta_buffer:
                 full_text = "".join(delta_buffer)
-                await self._rate_limited_send(subject, full_text)
-            await self._rate_limited_send(
+                await self._safe_send(subject, full_text)
+            await self._safe_send(
                 subject,
                 "An error occurred while processing your message.",
             )
@@ -915,6 +920,24 @@ class BaseChannel(ABC):
             if typing_keepalive:
                 typing_keepalive.stop()
         return processing_succeeded
+
+    async def _safe_send(self, subject: ChannelSubject, text: str) -> None:
+        """Best-effort send for error paths. Never propagates exceptions.
+
+        Rationale: fallback notifications must never escalate a delivery
+        failure into a message-processing failure. If the outbound channel is
+        the reason the original message failed, retrying the send here would
+        raise from inside the caller's except block; swallow and log instead.
+        """
+        try:
+            await self._rate_limited_send(subject, text)
+        except Exception:  # pylint: disable=broad-except
+            logger.warning(
+                "Fallback send failed; message delivery degraded (channel=%s session=%s)",
+                self.channel_id,
+                subject.subject_id,
+                exc_info=True,
+            )
 
     async def _rate_limited_send(self, subject: ChannelSubject, text: str) -> None:
         """Clean output and dispatch via :meth:`reply_text`.
