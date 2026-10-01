@@ -272,6 +272,40 @@ in-memory buffer. Platforms that do not publish permission-change events cannot
 be detected perfectly, so `auto` remains mention-triggered and the TTL limits
 stale context.
 
+#### Feishu session scope
+
+Feishu supports `group_context.session_scope` independently of `enabled`
+(which controls passive group context). Other channels do not yet use this
+setting. For example, pass this fragment to `FeishuConfig.from_dict` alongside
+the app credentials to give each group member a separate agent session:
+
+```json
+{
+  "group_context": {
+    "session_scope": "group_sender"
+  }
+}
+```
+
+| Scope | Session subject |
+|-------|-----------------|
+| `group_topic` (default) | Topic ID when present, otherwise chat ID; preserves existing behavior |
+| `group` | Chat ID, shared across members and topics |
+| `group_sender` | Chat ID + sender ID, shared across that sender's topics |
+| `group_topic_sender` | Topic ID (or chat ID without a topic) + sender ID |
+
+Direct messages are unchanged. Omitted or unrecognized scopes use
+`group_topic`. The same setting can be overridden under `groups["*"]` or a
+native conversation ID (topic ID when present, otherwise chat ID), just like
+the existing group-context policy. Replies still use the original chat and
+message routing metadata; a scoped subject is not a Feishu send address.
+
+Changing scope selects different agent sessions; it does not migrate, delete,
+or split existing history. Switching back can resume the old sessions.
+This is not a privacy boundary: replies are visible in the group, and passive
+recent chatter remains group/topic context governed by `history`. Use
+`history: "none"` to omit passive chatter when group context is enabled.
+
 ### Development
 
 **Prerequisites:** Python 3.12+, [uv](https://docs.astral.sh/uv/)

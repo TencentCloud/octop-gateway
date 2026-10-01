@@ -21,6 +21,7 @@ from urllib.parse import quote
 import aiohttp
 
 from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor
+from octop_gateway.group_context import GroupSessionScope
 from octop_gateway.models import (
     AudioContent,
     ChannelSubject,
@@ -602,8 +603,8 @@ class FeishuChannel(BaseChannel):
         out = dict(meta)
         if subject.chat_type:
             out.setdefault("chat_type", subject.chat_type)
-        # subject_id may be a thread_id (omt_…), which is not a send target;
-        # prefer the chat/open id when backfilling the routing handle.
+        # A topic or sender-scoped subject is not a platform send target;
+        # prefer the native chat/open id when backfilling the routing handle.
         alias_subject_fields(out, str(out.get("chat_id") or "") or subject.subject_id, "to_handle")
         return out
 
@@ -1015,9 +1016,14 @@ class FeishuChannel(BaseChannel):
 
         # Build metadata for reply routing
         to_handle = chat_id if chat_type == "group" else sender_id
-        # A Feishu thread is its own conversation: keying the subject by
-        # thread_id gives one agent session per topic instead of one per chat.
-        subject_id = thread_id or to_handle
+        conversation_id = thread_id or to_handle
+        subject_id = conversation_id
+        if chat_type == "group":
+            scope = self._config.group_context.resolve(conversation_id).session_scope
+            if scope in (GroupSessionScope.GROUP, GroupSessionScope.GROUP_SENDER):
+                subject_id = chat_id
+            if scope in (GroupSessionScope.GROUP_SENDER, GroupSessionScope.GROUP_TOPIC_SENDER):
+                subject_id = f"{subject_id}#{sender_id}"
         # Subject chat_type uses the shared gateway vocabulary ("direct"/"group")
         # while metadata keeps the Feishu-native value for send routing.
         subject_chat_type = "group" if chat_type == "group" else "direct"
@@ -1033,6 +1039,10 @@ class FeishuChannel(BaseChannel):
         }
         if thread_id:
             metadata["thread_id"] = thread_id
+        if chat_type == "group":
+            # Passive history and policy overrides remain keyed by the native
+            # conversation, independently of the durable agent session scope.
+            metadata["conversation_id"] = conversation_id
 
         return InboundMessage(
             channel_id=self.channel_id,
