@@ -205,7 +205,7 @@ Normalized message from user to bot (parsed from the platform-native format by `
 | `metadata` | Platform-specific routing info (`msg_id`, `to_handle`, `sender_id`, …) |
 | `timestamp` | Message timestamp (default `time.time()`) |
 
-**`channel_subject` semantics — read this before touching group support.** `channel_subject` is the **reply/conversation target**: a user for direct messages, the **conversation ID** for group messages. The individual author of a group message stays in `metadata.sender_id` / `metadata.sender_name` so every member of the group shares one thread without losing attribution. The legacy `sender_id` field is gone — do not reintroduce it.
+**`channel_subject` semantics — read this before touching group support.** `channel_subject` is the **reply/conversation target**: a user for direct messages, the **conversation ID** for group messages by default. The individual author stays in `metadata.sender_id` / `metadata.sender_name`. Feishu can opt into sender-scoped subjects with `group_context.session_scope`; it keeps the native conversation in `metadata.conversation_id` for passive context and policy overrides, and the original reply destination in `metadata.chat_id` / `metadata.to_handle`. Never send a composite subject as a native platform address when routing metadata is available. The legacy `sender_id` field is gone — do not reintroduce it.
 
 ### ChannelSubject
 

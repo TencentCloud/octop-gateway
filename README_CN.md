@@ -197,6 +197,36 @@ MessageProcessor: InboundMessage → AsyncIterator[MessageEvent]
 
 每个 `BaseChannel` 管理自己的传输；管理器负责调度、媒体、约束与分发。你的处理器只看到归一化后的事件流。
 
+### 飞书群聊会话范围
+
+飞书支持通过 `group_context.session_scope` 为每位群成员分配独立的 Agent 会话。
+该设置不依赖 `enabled`（后者控制被动群聊上下文），其他通道暂不使用此设置。
+将以下配置与应用凭证一起传给 `FeishuConfig.from_dict`：
+
+```json
+{
+  "group_context": {
+    "session_scope": "group_sender"
+  }
+}
+```
+
+| 范围 | 会话标识 |
+|------|----------|
+| `group_topic`（默认） | 有话题时用话题 ID，否则用群 ID，保持原有行为 |
+| `group` | 群 ID，成员和话题之间共享会话 |
+| `group_sender` | 群 ID + 发送者 ID，同一成员在不同话题中共享会话 |
+| `group_topic_sender` | 话题 ID（无话题时用群 ID）+ 发送者 ID |
+
+私聊保持不变；省略或无法识别的值回退为 `group_topic`。
+与现有群聊策略一致，可在 `groups["*"]` 或原生会话 ID 下覆盖该设置：
+有话题时使用话题 ID，否则使用群 ID。回复仍使用原始群和消息路由信息，
+拼接后的会话标识不能作为飞书发送地址。
+
+切换范围会选择不同的 Agent 会话，不会迁移、删除或拆分已有历史；切回原范围可能恢复旧会话。
+这不是隐私隔离：回复仍在群内可见，被动群聊片段仍按原始群／话题收集并受 `history` 控制。
+启用群聊上下文时，可设置 `history: "none"`，避免附带这些被动消息。
+
 ### 开发
 
 **环境要求：** Python 3.12+、[uv](https://docs.astral.sh/uv/)

@@ -41,6 +41,15 @@ class GroupHistoryMode(StrEnum):
     NONE = "none"
 
 
+class GroupSessionScope(StrEnum):
+    """Agent session identity within a group (currently supported by Feishu)."""
+
+    GROUP = "group"
+    GROUP_SENDER = "group_sender"
+    GROUP_TOPIC = "group_topic"
+    GROUP_TOPIC_SENDER = "group_topic_sender"
+
+
 @dataclass(frozen=True)
 class GroupContextPolicy:
     """Effective policy for one group conversation."""
@@ -52,6 +61,7 @@ class GroupContextPolicy:
     history_limit: int = 10
     history_ttl_seconds: float = 300.0
     clear_after_reply: bool = True
+    session_scope: GroupSessionScope = GroupSessionScope.GROUP_TOPIC
 
 
 @dataclass
@@ -72,6 +82,7 @@ class GroupContextConfig:
     history_ttl_seconds: float = 300.0
     clear_after_reply: bool = True
     groups: dict[str, dict[str, object]] = field(default_factory=dict)
+    session_scope: str = GroupSessionScope.GROUP_TOPIC
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> GroupContextConfig:
@@ -90,6 +101,7 @@ class GroupContextConfig:
             history_ttl_seconds=float(str(data.get("history_ttl_seconds", 300.0))),
             clear_after_reply=bool(data.get("clear_after_reply", True)),
             groups=groups,
+            session_scope=str(data.get("session_scope", GroupSessionScope.GROUP_TOPIC)),
         )
 
     def resolve(self, conversation_id: str) -> GroupContextPolicy:
@@ -102,6 +114,7 @@ class GroupContextConfig:
                 "history_limit": self.history_limit,
                 "history_ttl_seconds": self.history_ttl_seconds,
                 "clear_after_reply": self.clear_after_reply,
+                "session_scope": self.session_scope,
             }
         )
         wildcard = self.groups.get("*")
@@ -122,6 +135,7 @@ class GroupContextConfig:
             history_limit=max(0, int(str(data.get("history_limit", 10)))),
             history_ttl_seconds=max(0.0, float(str(data.get("history_ttl_seconds", 300.0)))),
             clear_after_reply=bool(data.get("clear_after_reply", True)),
+            session_scope=_enum_value(GroupSessionScope, data.get("session_scope"), GroupSessionScope.GROUP_TOPIC),
         )
 
     @classmethod
@@ -134,6 +148,7 @@ class GroupContextConfig:
             "history_limit": values.get("history_limit", base.history_limit),
             "history_ttl_seconds": values.get("history_ttl_seconds", base.history_ttl_seconds),
             "clear_after_reply": values.get("clear_after_reply", base.clear_after_reply),
+            "session_scope": values.get("session_scope", base.session_scope),
         }
         return cls._policy_from_mapping(raw)
 

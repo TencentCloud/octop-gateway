@@ -22,6 +22,7 @@ from octop_gateway.group_context import (
     GroupContextConfig,
     GroupContextManager,
     GroupHistoryMode,
+    GroupSessionScope,
     GroupVisibility,
 )
 from octop_gateway.manager import ChannelManager
@@ -68,6 +69,7 @@ __all__ = [
     "GroupContextManager",
     "GroupContextMessage",
     "GroupHistoryMode",
+    "GroupSessionScope",
     "GroupVisibility",
     "ImageContent",
     "InboundMessage",
