@@ -11,6 +11,7 @@ import contextlib
 import json
 import logging
 import re
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -51,6 +52,24 @@ _WS_RECONNECT_STALE_SECONDS = 180.0
 _WS_ACTIVITY_STALE_SECONDS = 3600.0
 _WS_RESTART_BACKOFF_SECONDS = 5.0
 _WS_THREAD_JOIN_TIMEOUT = 10.0
+# A just-spawned WS thread needs a moment to reach its entry point (which owns
+# the ``_ws_loop`` assignment). Shutting down without waiting for it queues no
+# cancellation at all and orphans the thread — both #1392 production incidents
+# were the channel probe hitting exactly this race.
+_WS_THREAD_START_GRACE_SECONDS = 3.0
+# Orphaned WS threads defer watchdog restarts (EXCEED_CONN_LIMIT guard). After
+# this long, restart anyway: an indefinitely deferred restart is a permanently
+# deaf channel, which is worse than a contested connection slot (#1392).
+_WS_ORPHAN_ESCALATE_SECONDS = 300.0
+
+# lark-oapi's ``ws.Client`` schedules every callback through one module-global
+# event loop (``lark_oapi.ws.client.loop``) that each WS thread rebinds at
+# start. Track which channel instance currently owns the global so a restart
+# can tell "a live channel still needs it" (never steal — #757) apart from
+# "an orphaned generation whose instance is already stopped" (must reclaim —
+# otherwise every watchdog restart crashes on a running foreign loop, #1392).
+_ws_global_loop_owner: "FeishuChannel | None" = None
+_ws_global_loop_owner_lock = threading.Lock()
 
 
 @dataclass
@@ -64,12 +83,18 @@ class FeishuConfig(ChannelConfig):
         encrypt_key: Event encryption key (for HTTP event callbacks).
         channel_id: Optional explicit channel ID; auto-generated UUID if omitted.
         tenant_id: Optional tenant identifier for multi-tenant deployments.
+        probe_mode: ``"full"`` (default) opens the WebSocket connection;
+            ``"token"`` only verifies credentials via a tenant-token fetch —
+            used by credential probes, because a second full WS start rebinds
+            lark-oapi's module-global loop and leaves the live channel
+            silently deaf (#757).
     """
 
     app_id: str = ""
     app_secret: str = ""
     verification_token: str = ""
     encrypt_key: str = ""
+    probe_mode: str = "full"
 
     required_credentials = ("app_id", "app_secret")
 
@@ -114,6 +139,9 @@ class FeishuChannel(BaseChannel):
         self._ws_reconnecting_since: float | None = None
         self._last_ws_activity_at: float = 0.0
         self._ws_orphan_threads: list[Any] = []
+        # When the current orphans were first seen; drives the watchdog's
+        # escalate-after-deadline behaviour (#1392).
+        self._ws_orphans_since: float | None = None
         self._running = False
         self._main_loop: asyncio.AbstractEventLoop | None = None
         # WebSocket connection session ID (generated on each connect/reconnect)
@@ -132,6 +160,13 @@ class FeishuChannel(BaseChannel):
         self._running = True
         self._main_loop = asyncio.get_running_loop()
         await self._refresh_token()
+        if self._config.probe_mode == "token":
+            # Credential probe: the token fetch above is the whole check.
+            # Opening a second WS connection would rebind lark-oapi's
+            # module-global loop and leave the live channel silently deaf (#757).
+            logger.info("FeishuChannel probe ok (token verified, no WS connection)")
+            self._running = False
+            return
         await self._ensure_bot_open_id()
         await self._start_ws_client()
         self._ws_watchdog_task = asyncio.create_task(
@@ -226,8 +261,6 @@ class FeishuChannel(BaseChannel):
 
     async def _start_ws_client(self) -> None:
         """Start the lark-oapi WebSocket event client in a background thread."""
-        import threading
-
         try:
             import lark_oapi as lark
         except ImportError as e:
@@ -270,6 +303,8 @@ class FeishuChannel(BaseChannel):
 
     def _run_ws_thread(self) -> None:
         """WebSocket client thread entry point."""
+        global _ws_global_loop_owner
+
         import asyncio as _asyncio
 
         # Create a new event loop for this thread (lark-oapi needs it)
@@ -279,12 +314,42 @@ class FeishuChannel(BaseChannel):
         try:
             import lark_oapi.ws.client as ws_client_module
 
-            ws_client_module.loop = loop
+            current = getattr(ws_client_module, "loop", None)
+            rebind = True
+            if current is not None and current is not loop and current.is_running():
+                owner = _ws_global_loop_owner
+                if owner is not None and owner is not self and owner._running:
+                    # A live channel instance still owns the SDK's module-global
+                    # loop. Rebinding it would reroute that channel's scheduled
+                    # callbacks onto a loop that never runs them — the "silently
+                    # deaf while connected" state (#757).
+                    logger.error(
+                        "Feishu WS: another live connection owns the lark-oapi global loop; "
+                        "skipping loop rebind to keep that channel's message delivery alive"
+                    )
+                    rebind = False
+                else:
+                    # The previous owner is gone (stopped instance or orphaned
+                    # generation, #1392). Reclaim the global — otherwise this
+                    # thread's ``start()`` would run on a foreign running loop
+                    # and die immediately, and no watchdog restart could ever
+                    # recover the channel.
+                    logger.warning(
+                        "Feishu WS: reclaiming the lark-oapi global loop from a stopped previous owner"
+                    )
+            if rebind:
+                with _ws_global_loop_owner_lock:
+                    ws_client_module.loop = loop
+                    _ws_global_loop_owner = self
         except (ImportError, AttributeError):
             pass
         try:
             if self._ws_client:
                 self._ws_client.start()
+        except asyncio.CancelledError:
+            # Cancelled by ``_request_ws_thread_shutdown`` — the expected way
+            # this thread exits; keep shutdown logs quiet.
+            logger.info("Feishu WebSocket thread cancelled (shutdown complete)")
         except Exception:  # pylint: disable=broad-except
             # The SDK owns this thread boundary and does not publish an exception contract.
             logger.exception("Feishu WebSocket thread failed")
@@ -343,13 +408,29 @@ class FeishuChannel(BaseChannel):
                 break
             self._prune_ws_orphans()
             if self._ws_orphan_threads:
-                # Do not open another connection while an old one may still
-                # hold a Feishu endpoint slot (EXCEED_CONN_LIMIT risk).
-                logger.warning(
-                    "Feishu WebSocket deferring health restart: %d orphan thread(s) still alive",
-                    len(self._ws_orphan_threads),
+                now = time.time()
+                if self._ws_orphans_since is None:
+                    self._ws_orphans_since = now
+                waited = now - self._ws_orphans_since
+                if waited < _WS_ORPHAN_ESCALATE_SECONDS:
+                    # Do not open another connection while an old one may still
+                    # hold a Feishu endpoint slot (EXCEED_CONN_LIMIT risk).
+                    logger.warning(
+                        "Feishu WebSocket deferring health restart: %d orphan thread(s) still alive (%.0fs)",
+                        len(self._ws_orphan_threads),
+                        waited,
+                    )
+                    continue
+                # Orphans that never exit must not defer recovery forever: an
+                # indefinitely deferred restart is a permanently deaf channel,
+                # which is worse than a contested connection slot (#1392).
+                logger.error(
+                    "Feishu WebSocket orphan thread(s) alive for %.0fs; restarting despite the "
+                    "EXCEED_CONN_LIMIT risk",
+                    waited,
                 )
-                continue
+            elif self._ws_orphans_since is not None:
+                self._ws_orphans_since = None
             if not self._ws_is_unhealthy():
                 continue
             reason = self._ws_unhealthy_reason()
@@ -441,6 +522,17 @@ class FeishuChannel(BaseChannel):
         Returns:
             True if there is no live WS thread left owned by this channel.
         """
+        thread = self._ws_thread
+        if thread is not None and thread.is_alive() and self._ws_loop is None:
+            # A just-spawned thread may not have reached its entry point yet
+            # (``_run_ws_thread`` assigns ``_ws_loop`` first thing). Requesting
+            # a shutdown now would early-return without queueing any cancel
+            # and orphan the thread (#1392: both production incidents were the
+            # channel probe hitting exactly this race). Give the thread a
+            # bounded moment to come up before asking it to stop.
+            deadline = time.time() + _WS_THREAD_START_GRACE_SECONDS
+            while self._ws_loop is None and thread.is_alive() and time.time() < deadline:
+                await asyncio.sleep(0.01)
         self._request_ws_thread_shutdown()
         thread = self._ws_thread
         if thread is not None:

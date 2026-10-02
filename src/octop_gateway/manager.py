@@ -607,6 +607,12 @@ class ChannelManager:
             # Opening a second full connection for a UI probe can kick the live
             # channel offline, so probe credentials via sign-token only.
             probe_config["probe_mode"] = "sign_token"
+        if channel_type == "feishu" and not probe_config.get("probe_mode"):
+            # lark-oapi's ws.Client schedules every callback through one
+            # module-global event loop that each full WS start rebinds — a
+            # probe while a live Feishu channel is connected would leave it
+            # silently deaf (#757). Probe credentials via token fetch only.
+            probe_config["probe_mode"] = "token"
 
         channel_config = self._build_config(BUILTIN_CHANNELS[channel_type], probe_config)
         if isinstance(channel_config, _ChannelConfig):
