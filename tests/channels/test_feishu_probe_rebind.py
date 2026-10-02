@@ -124,10 +124,7 @@ class TestGlobalLoopRebindGuard:
         try:
             ws_client_module.loop = None
 
-            async def _noop_start() -> None:
-                return None
-
-            client = type("C", (), {"start": staticmethod(_noop_start)})()
+            client = type("C", (), {"start": lambda self: None})()
             ch = FeishuChannel(processor=_noop_processor, config=_config())
             ch._ws_client = client
 
@@ -137,11 +134,54 @@ class TestGlobalLoopRebindGuard:
         finally:
             ws_client_module.loop = previous
 
-    def test_skips_rebind_while_another_loop_is_live(self) -> None:
-        """A live foreign loop keeps ownership of the global; no deafening."""
+    def test_rebinds_on_first_start_when_global_is_unowned(self) -> None:
+        """An unowned running global (import-time main loop) must be rebound.
+
+        At the first channel start the SDK global still holds the import-time
+        loop with no owner recorded. Refusing to rebind there would crash the
+        very first WS thread on a running foreign loop (#1392).
+        """
         import lark_oapi.ws.client as ws_client_module
+        import octop_gateway.channels.feishu as feishu_module
 
         previous = getattr(ws_client_module, "loop", None)
+        previous_owner = feishu_module._ws_global_loop_owner
+        foreign = asyncio.new_event_loop()
+        thread = threading.Thread(target=foreign.run_forever, daemon=True)
+        thread.start()
+        try:
+            assert foreign.is_running()
+            ws_client_module.loop = foreign
+            feishu_module._ws_global_loop_owner = None  # nobody recorded yet
+
+            client = type("C", (), {"start": lambda self: None})()
+            ch = FeishuChannel(processor=_noop_processor, config=_config())
+            ch._ws_client = client
+
+            self._run_ws_thread_with(ch)
+            assert ws_client_module.loop is not foreign, (
+                "an unowned running global must be rebound on first start"
+            )
+        finally:
+            foreign.call_soon_threadsafe(foreign.stop)
+            thread.join(timeout=5)
+            foreign.close()
+            ws_client_module.loop = previous
+            feishu_module._ws_global_loop_owner = previous_owner
+
+    def test_reclaims_global_from_stopped_owner(self) -> None:
+        """A stopped/orphaned previous owner must not block recovery (#1392).
+
+        After a force stop the previous generation's thread can linger as an
+        orphan with its loop still running while the instance is already
+        stopped. The watchdog's replacement thread must reclaim the global,
+        otherwise every restart crashes on a running foreign loop.
+        """
+        import lark_oapi.ws.client as ws_client_module
+        import octop_gateway.channels.feishu as feishu_module
+
+        previous = getattr(ws_client_module, "loop", None)
+        previous_owner = feishu_module._ws_global_loop_owner
         foreign = asyncio.new_event_loop()
         thread = threading.Thread(target=foreign.run_forever, daemon=True)
         thread.start()
@@ -149,10 +189,43 @@ class TestGlobalLoopRebindGuard:
             assert foreign.is_running()
             ws_client_module.loop = foreign
 
-            async def _noop_start() -> None:
-                return None
+            old_owner = FeishuChannel(processor=_noop_processor, config=_config())
+            old_owner._running = False  # stopped instance, orphaned thread
+            feishu_module._ws_global_loop_owner = old_owner
 
-            client = type("C", (), {"start": staticmethod(_noop_start)})()
+            client = type("C", (), {"start": lambda self: None})()
+            ch = FeishuChannel(processor=_noop_processor, config=_config())
+            ch._ws_client = client
+
+            self._run_ws_thread_with(ch)
+            assert ws_client_module.loop is not foreign
+            assert feishu_module._ws_global_loop_owner is ch
+        finally:
+            foreign.call_soon_threadsafe(foreign.stop)
+            thread.join(timeout=5)
+            foreign.close()
+            ws_client_module.loop = previous
+            feishu_module._ws_global_loop_owner = previous_owner
+
+    def test_skips_rebind_while_another_loop_is_live(self) -> None:
+        """A live channel's loop keeps ownership of the global; no deafening."""
+        import lark_oapi.ws.client as ws_client_module
+        import octop_gateway.channels.feishu as feishu_module
+
+        previous = getattr(ws_client_module, "loop", None)
+        previous_owner = feishu_module._ws_global_loop_owner
+        foreign = asyncio.new_event_loop()
+        thread = threading.Thread(target=foreign.run_forever, daemon=True)
+        thread.start()
+        try:
+            assert foreign.is_running()
+            ws_client_module.loop = foreign
+
+            live_owner = FeishuChannel(processor=_noop_processor, config=_config())
+            live_owner._running = True  # a live channel owns the global
+            feishu_module._ws_global_loop_owner = live_owner
+
+            client = type("C", (), {"start": lambda self: None})()
             ch = FeishuChannel(processor=_noop_processor, config=_config())
             ch._ws_client = client
 
@@ -165,3 +238,4 @@ class TestGlobalLoopRebindGuard:
             thread.join(timeout=5)
             foreign.close()
             ws_client_module.loop = previous
+            feishu_module._ws_global_loop_owner = previous_owner
