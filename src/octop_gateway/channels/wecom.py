@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import logging
 import mimetypes
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -36,6 +37,11 @@ from octop_gateway.models import (
 )
 from octop_gateway.push_routing import alias_subject_fields
 
+# PATCHED (see PATCHES.md): merged resilience layer (originally shipped
+# as a separate mywecom channel) - dual stream-dead errcodes
+# (846608/846604), 6000 benign-conflict, 330s stream-age finalize
+# guard, 10s heartbeat (tool progress + retry), instant first-frame
+# ack, ZWSP anti-drop on identical final frames.
 logger = logging.getLogger(__name__)
 
 # Stream reply timeout
@@ -346,6 +352,53 @@ class WeComChannel(BaseChannel):
                     exc_info=True,
                 )
 
+    # --- stream-expiry resilience (WeCom errcode=846608) --------------------
+    # WeCom stream updates expire after 10 minutes; afterwards every
+    # reply_stream raises and would otherwise abort handle_inbound mid-loop
+    # and lose the final reply (user stuck on "calling tool..."). A dead
+    # stream short-circuits further updates; the final text falls back to a
+    # proactive send_message.
+    _WECOM_EXPIRED_RE = re.compile(r"errcode=(\d+)")
+
+    # Hermes: 流窗口 ~6 分钟（连接 ping 不续期）；846608=流窗死 / 846604=req_id 窗死 /
+    # 6000=版本冲突（气泡已被新帧覆盖，良性）。
+    _STREAM_DEAD_ERRCODES = {"846608", "846604"}
+    _STREAM_CONFLICT_ERRCODE = "6000"
+    STREAM_SAFE_DURATION_SECONDS = 330.0
+
+    def _is_stream_expired(self, exc: BaseException) -> bool:
+        m = self._WECOM_EXPIRED_RE.search(str(exc))
+        return bool(m) and m.group(1) in self._STREAM_DEAD_ERRCODES
+
+    def _is_stream_conflict(self, exc: BaseException) -> bool:
+        m = self._WECOM_EXPIRED_RE.search(str(exc))
+        return bool(m) and m.group(1) == self._STREAM_CONFLICT_ERRCODE
+
+    async def _safe_reply_stream(self, ws_client, frame, stream_id, content: str, finish: bool) -> bool:
+        """reply_stream that survives stream expiry; returns True when delivered."""
+        try:
+            await ws_client.reply_stream(frame=frame, stream_id=stream_id, content=content, finish=finish)
+            return True
+        except Exception as exc:  # pylint: disable=broad-except
+            if self._is_stream_conflict(exc):
+                logger.info("WeCom finalize hit errcode 6000 (bubble already replaced); treating as delivered")
+                return True
+            if self._is_stream_expired(exc):
+                logger.warning("WeCom stream expired (846608/846604); suppressing further stream updates")
+                return False
+            raise
+
+    async def _fallback_send_text(self, message, meta: dict, text: str) -> None:
+        """Proactively deliver final text after the stream is unrecoverable."""
+        try:
+            subject = ChannelSubject(
+                subject_id=message.channel_subject.subject_id if message.channel_subject else "",
+                metadata={"chat_id": meta.get("chat_id", "")},
+            )
+            await self._send_text(subject, text)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("WeCom fallback send_message after stream expiry failed")
+
     async def handle_inbound(self, raw_payload: Any) -> None:
         """Override: stream deltas progressively via WeCom reply_stream.
 
@@ -392,6 +445,7 @@ class WeComChannel(BaseChannel):
         thinking_buffer: list[str] = []
         media_buffer: list[ContentPart] = []
         stream_open = False
+        stream_dead = False  # set when the WeCom stream expired (846608)
 
         # First-token timeout handling: if reply_timeout is configured and
         # the first event does not arrive in (timeout * 0.8) seconds, emit
@@ -403,31 +457,83 @@ class WeComChannel(BaseChannel):
         iterator = self._processor(message)
         first_event = None
         if self._constraints.reply_timeout > 0 and self._constraints.timeout_strategy == "placeholder":
+            # 立即发首帧确认（"🤔 让我想想…"），不等首 token：
+            # 用户消息到达即回执，消除首字延迟感知。processor 同时启动，
+            # 首个事件到达后由 DELTA 全量快照覆盖本确认帧。
+            placeholder = self._constraints.placeholder_text
             first_task: asyncio.Task[Any] = asyncio.create_task(iterator.__anext__())  # type: ignore[arg-type]
-            done, _pending = await asyncio.wait(
-                [first_task],
-                timeout=self._constraints.reply_timeout * 0.8,
-            )
-            if not done:
-                # Timeout fired — stream a placeholder, then keep waiting.
-                placeholder = self._constraints.placeholder_text
-                if placeholder:
-                    try:
-                        await ws_client.reply_stream(
-                            frame=frame,
-                            stream_id=stream_id,
-                            content=placeholder,
-                            finish=False,
-                        )
-                        stream_open = True
-                    except Exception:  # pylint: disable=broad-except
-                        # A placeholder failure must not cancel the underlying processor.
-                        logger.debug("WeCom placeholder reply_stream failed", exc_info=True)
+            if placeholder:
+                try:
+                    await self._safe_reply_stream(
+                        ws_client,
+                        frame=frame,
+                        stream_id=stream_id,
+                        content=placeholder,
+                        finish=False,
+                    )
+                    stream_open = True
+                except Exception:  # pylint: disable=broad-except
+                    # A placeholder failure must not cancel the underlying processor.
+                    logger.debug("WeCom placeholder reply_stream failed", exc_info=True)
             try:
                 first_event = await first_task
             except StopAsyncIteration:
                 # Processor produced no events at all — nothing to stream.
                 return
+
+        async def _heartbeat() -> None:
+            """Keep the WeCom stream alive during long tool calls (10min expiry).
+
+            每 10s 刷新一次流内容：
+            - 工具执行中 → "🔧 正在调用 {tool}…（已运行 N 秒）"，让用户知道没挂
+            - 有正文 → 重发全文（全量快照语义，幂等）
+            - 正文超长 → 字数占位 + 会话计时
+
+            韧性策略：单次发送异常只跳过本轮、继续下一轮重试；只有明确
+            识别到 846608（流永久过期）或流已由事件路径标记 stream_dead
+            时才退出。瞬时网络错误不再杀死心跳。
+            """
+            consecutive_failures = 0
+            while not stream_alive.is_set() and not stream_dead:
+                full_text = "".join(content_buffer)
+                tool_name = tool_state["name"]
+                if not full_text and tool_name:
+                    elapsed = int(time.monotonic() - tool_state["since"])
+                    payload = f"🔧 正在调用 {tool_name}…（已运行 {elapsed} 秒）"
+                elif full_text:
+                    if len(full_text.encode()) < 3500:
+                        payload = full_text
+                        if tool_name:
+                            elapsed = int(time.monotonic() - tool_state["since"])
+                            payload = f"{full_text}\n\n🔧 正在调用 {tool_name}…（已运行 {elapsed} 秒）"
+                    else:
+                        payload = f"⏳ 生成中，已输出 {len(full_text)} 字…"
+                else:
+                    payload = None  # 无正文无工具：保持原样，避免无意义刷屏
+                if payload:
+                    try:
+                        if not await self._safe_reply_stream(ws_client, frame, stream_id, payload, finish=False):
+                            return  # 846608 — stream permanently dead, stop beating
+                        consecutive_failures = 0
+                    except Exception as exc:  # pylint: disable=broad-except
+                        # 瞬时错误：不退出，跳过本轮继续重试。
+                        consecutive_failures += 1
+                        logger.warning(
+                            "WeCom heartbeat send failed (%d in a row): %s",
+                            consecutive_failures, exc,
+                        )
+                try:
+                    await asyncio.wait_for(stream_alive.wait(), timeout=10.0)
+                    return  # set = stream finished, stop beating
+                except TimeoutError:
+                    continue
+
+        tool_state: dict[str, Any] = {"name": None, "since": None}
+        turn_start = time.monotonic()   # Layer 2 时钟兜底（Hermes: 流窗口 ~6 分钟）
+        last_sent: str | None = None    # 上一帧实际内容（ZWSP 防吞比对用）
+
+        stream_alive = asyncio.Event()
+        heartbeat_task: asyncio.Task[Any] | None = None
 
         async def _events() -> Any:
             if first_event is not None:
@@ -435,6 +541,19 @@ class WeComChannel(BaseChannel):
             async for ev in iterator:
                 yield ev
 
+        async def _update(content: str, finish: bool) -> bool:
+            """Send one stream update; returns False once the stream is dead."""
+            nonlocal stream_dead, last_sent
+            if stream_dead:
+                return False
+            ok = await self._safe_reply_stream(ws_client, frame, stream_id, content, finish)
+            if ok:
+                last_sent = content
+            else:
+                stream_dead = True
+            return ok
+
+        heartbeat_task = asyncio.create_task(_heartbeat())
         try:
             async for event in _events():
                 if event.type == MessageEventType.TYPING:
@@ -448,13 +567,8 @@ class WeComChannel(BaseChannel):
                         thinking_text = self._constraints.thinking_template.format(
                             content="".join(thinking_buffer).strip()
                         )
-                        await ws_client.reply_stream(
-                            frame=frame,
-                            stream_id=stream_id,
-                            content=thinking_text,
-                            finish=False,
-                        )
-                        stream_open = True
+                        if await _update(thinking_text, finish=False):
+                            stream_open = True
 
                 elif event.type == MessageEventType.FLUSH:
                     thinking_buffer.clear()
@@ -465,40 +579,31 @@ class WeComChannel(BaseChannel):
                             content_buffer.append(part.text)
                     full_text = "".join(content_buffer)
                     if full_text:
-                        await ws_client.reply_stream(
-                            frame=frame,
-                            stream_id=stream_id,
-                            content=full_text,
-                            finish=False,
-                        )
-                        stream_open = True
+                        if await _update(full_text, finish=False):
+                            stream_open = True
 
                 elif event.type == MessageEventType.TOOL_START:
+                    tool_state["name"] = (event.metadata or {}).get("tool_name", "tool")
+                    tool_state["since"] = time.monotonic()
                     if self._constraints.show_tool_hints:
                         hint = tool_hint_message(
                             event.metadata,
                             self._constraints,
                             phase="start",
                         )
-                        await ws_client.reply_stream(
-                            frame=frame,
-                            stream_id=stream_id,
-                            content=hint,
-                            finish=False,
-                        )
-                        stream_open = True
+                        if await _update(hint, finish=False):
+                            stream_open = True
 
                 elif event.type == MessageEventType.TOOL_END:
-                    pass
+                    tool_state["name"] = None
+                    tool_state["since"] = None
 
                 elif event.type == MessageEventType.ERROR:
                     error_text = event.error or "An unexpected error occurred."
-                    await ws_client.reply_stream(
-                        frame=frame,
-                        stream_id=stream_id,
-                        content=error_text,
-                        finish=True,
-                    )
+                    stream_alive.set()
+                    if not await _update(error_text, finish=True):
+                        await self._fallback_send_text(message, meta, error_text)
+                    heartbeat_task.cancel()
                     return
 
                 elif event.type == MessageEventType.MESSAGE:
@@ -516,23 +621,45 @@ class WeComChannel(BaseChannel):
             # The processor and SDK stream are independent extension boundaries.
             logger.exception("WeComChannel streaming error")
             error_text = self._constraints.placeholder_text or "An unexpected error occurred."
-            await ws_client.reply_stream(
-                frame=frame,
-                stream_id=stream_id,
-                content=error_text,
-                finish=True,
-            )
+            stream_alive.set()
+            try:
+                if not await _update(error_text, finish=True):
+                    await self._fallback_send_text(message, meta, error_text)
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("WeComChannel error-path fallback failed")
+            heartbeat_task.cancel()
             return
 
         # Close a text stream before replying with native media messages.
+        stream_alive.set()  # stop the heartbeat
         final_text = "".join(content_buffer)
         if final_text or stream_open or not media_buffer:
-            await ws_client.reply_stream(
-                frame=frame,
-                stream_id=stream_id,
-                content=final_text or "✅",
-                finish=True,
-            )
+            # Layer 2（Hermes）: 流年龄超 330s 时 finish=true 必报 846604/846608——
+            # 主动放弃流式转主动发送，不等死流报错。
+            stream_age = time.monotonic() - turn_start
+            if stream_age >= self.STREAM_SAFE_DURATION_SECONDS and final_text:
+                logger.info(
+                    "WeCom stream age %.0fs >= %.0fs — declining finalize, falling back to proactive send",
+                    stream_age, self.STREAM_SAFE_DURATION_SECONDS,
+                )
+                await self._fallback_send_text(message, meta, final_text)
+            else:
+                # ZWSP 防吞（Hermes）: final 帧与上一中间帧相同会被企微静默丢弃。
+                if not final_text:
+                    final_text = "✅"
+                elif final_text == last_sent:
+                    final_text = final_text + "\u200b"
+                ok = await _update(final_text, finish=True)
+                if not ok and "".join(content_buffer):
+                    # Stream expired mid-turn — deliver the final answer proactively
+                    # so the user is not left stuck on the last rendered frame.
+                    await self._fallback_send_text(message, meta, "".join(content_buffer))
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except (asyncio.CancelledError, Exception):  # pylint: disable=broad-except
+                pass
 
         if media_buffer:
             subject_id = message.channel_subject.subject_id if message.channel_subject else ""
