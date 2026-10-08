@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 修复
+
+- 元宝：群聊启用共享 @ 提及策略（`group_context` 默认 `enabled` + `activation=mention`），不再对每条群消息都回；解析 `TIMCustomElem`（`elem_type=1002`）写入 `bot_mentioned` / `mentioned_user_ids` / `at_elems` / `at_all`，并支持 `@所有人`。私聊无 @ 语义，不受影响。
+- 元宝：群聊中机器人账号（含自己）的消息默认丢弃（`ignore_bot_senders`），避免同群两个机器人互答刷屏。
+- `GroupContextManager.will_trigger()`：只读预判，通道据此跳过未触发消息的 typing 心跳。
+
 ## [1.0.0] - 2026-09-24
 
 ### 新增
