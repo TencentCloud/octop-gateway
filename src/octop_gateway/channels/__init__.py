@@ -126,8 +126,47 @@ class _LazyBuiltinDict(dict):  # type: ignore[type-arg]
 BUILTIN_CHANNELS: dict[str, type[BaseChannel]] = _LazyBuiltinDict()
 
 
+def register_channel_kind(kind: str, channel_cls: type[BaseChannel]) -> None:
+    """Register an additional channel kind at runtime.
+
+    Hosts (e.g. octop) call this while applying plugin-contributed channel
+    implementations, before any channel of that kind is built. The kind must
+    not clash with a builtin kind; registering an already-registered plugin
+    kind is a no-op (idempotent), so host code can apply the plugin registry
+    on every boot/reload without special-casing.
+
+    Args:
+        kind: Channel-type string persisted in the control-plane database
+            and passed to :meth:`~octop_gateway.manager.ChannelManager`.
+        channel_cls: The channel class to construct for this kind. It must
+            expose a ``Config`` dataclass attribute (like builtin channels)
+            so ``ChannelManager._build_config`` can normalize dicts.
+
+    Raises:
+        ValueError: If *kind* is empty or clashes with a builtin kind.
+        TypeError: If *channel_cls* is not a class.
+    """
+    normalized = str(kind).strip().lower()
+    if not normalized:
+        raise ValueError("channel kind must not be empty")
+    if normalized in _CHANNEL_MAP:
+        raise ValueError(
+            f"channel kind {normalized!r} is a builtin kind and cannot be overridden"
+        )
+    if not isinstance(channel_cls, type):
+        raise TypeError("channel_cls must be a class")
+    if normalized in BUILTIN_CHANNELS:
+        # Already registered by the host (idempotent re-apply); keep the
+        # first registration to stay stable across reloads.
+        return
+    BUILTIN_CHANNELS[normalized] = channel_cls
+    if normalized not in _CLASS_NAMES:
+        _CLASS_NAMES[normalized] = channel_cls.__name__
+
+
 __all__ = [
     "BUILTIN_CHANNELS",
     "SUPPORTED_CHANNEL_KINDS",
     "ChannelKind",
+    "register_channel_kind",
 ]

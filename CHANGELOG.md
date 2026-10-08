@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 新增
+
+- 新增公开 API `register_channel_kind(kind, channel_cls)`：宿主进程可在运行时扩展可用渠道类型（拒绝覆盖内置类型，幂等先注册者优先），为插件贡献渠道提供注册通道。
+
+
 ## [1.0.0] - 2026-09-24
 
 ### 新增
