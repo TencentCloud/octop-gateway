@@ -930,3 +930,207 @@ async def test_send_local_media_failure_emits_visible_text_marker(monkeypatch: p
 
 def time_left() -> float:
     return asyncio.get_event_loop().time() + 600
+
+
+# ---------------------------------------------------------------------------
+# Group mention policy and bot-sender filtering
+# ---------------------------------------------------------------------------
+
+
+def _mention_elem(user_id: str, text: str = "@指挥中枢") -> dict[str, Any]:
+    return {
+        "msg_type": "TIMCustomElem",
+        "msg_content": {"data": json.dumps({"elem_type": 1002, "text": text, "user_id": user_id, "content": ""})},
+    }
+
+
+def _group_channel(**overrides: Any) -> YuanbaoChannel:
+    channel = YuanbaoChannel(
+        processor=_noop_processor,
+        config=YuanbaoConfig(app_key="app-key", app_secret="app-secret", **overrides),
+    )
+    channel._bot_id = "bot-self"
+    return channel
+
+
+def _group_payload(*bodies: dict[str, Any], from_account: str = "user-1") -> dict[str, Any]:
+    return {
+        "callback_command": proto.CALLBACK_GROUP_SEND_MSG,
+        "from_account": from_account,
+        "group_code": "group-9",
+        "msg_id": "msg-1",
+        "sender_nickname": "万里",
+        "msg_body": list(bodies),
+    }
+
+
+def _text_body(text: str) -> dict[str, Any]:
+    return {"msg_type": proto.MSG_TYPE_TEXT, "msg_content": {"text": text}}
+
+
+def test_config_defaults_to_mention_activation_in_groups() -> None:
+    config = YuanbaoConfig.from_dict({})
+    assert config.group_context.enabled is True
+    assert config.group_context.activation == "mention"
+
+
+def test_partial_group_context_override_keeps_policy_enabled() -> None:
+    config = YuanbaoConfig.from_dict({"group_context": {"history_limit": 5}})
+    assert config.group_context.enabled is True
+    assert config.group_context.history_limit == 5
+
+    disabled = YuanbaoConfig.from_dict({"group_context": {"enabled": False}})
+    assert disabled.group_context.enabled is False
+
+
+def test_parse_group_mention_sets_bot_mentioned() -> None:
+    channel = _group_channel()
+    mentioned = channel.parse_inbound(_group_payload(_text_body("@指挥中枢 你好"), _mention_elem("bot-self")))
+    assert mentioned.metadata["bot_mentioned"] is True
+    assert mentioned.metadata["mentioned_user_ids"] == ["bot-self"]
+    assert mentioned.metadata["at_elems"] == [{"user_id": "bot-self", "text": "@指挥中枢"}]
+
+
+def test_parse_group_mention_of_another_account_is_not_bot_mentioned() -> None:
+    channel = _group_channel()
+    other = channel.parse_inbound(_group_payload(_text_body("hi"), _mention_elem("bot-other")))
+    assert other.metadata["bot_mentioned"] is False
+    assert other.metadata["mentioned_user_ids"] == ["bot-other"]
+
+
+def test_parse_custom_elem_with_other_elem_type_is_ignored() -> None:
+    channel = _group_channel()
+    body = {
+        "msg_type": "TIMCustomElem",
+        "msg_content": {"data": json.dumps({"elem_type": 999, "text": "x", "user_id": "bot-self"})},
+    }
+    message = channel.parse_inbound(_group_payload(body))
+    assert message.metadata["bot_mentioned"] is False
+    assert message.metadata["at_elems"] == []
+
+
+def test_parse_malformed_custom_elem_does_not_raise() -> None:
+    channel = _group_channel()
+    body = {"msg_type": "TIMCustomElem", "msg_content": {"data": "not-json"}}
+    message = channel.parse_inbound(_group_payload(body))
+    assert message.metadata["bot_mentioned"] is False
+
+
+def test_parse_at_all_marks_bot_mentioned() -> None:
+    channel = _group_channel()
+    message = channel.parse_inbound(_group_payload(_text_body("@所有人 开会"), _mention_elem("0", "@全体成员")))
+    assert message.metadata["bot_mentioned"] is True
+    assert message.metadata["at_all"] is True
+
+
+def test_parse_direct_message_has_no_mention_metadata() -> None:
+    # Direct chat has no @ semantics; the mention filter must never apply.
+    channel = _group_channel()
+    message = channel.parse_inbound(
+        {
+            "callback_command": proto.CALLBACK_C2C_SEND_MSG,
+            "from_account": "user-1",
+            "msg_id": "msg-d1",
+            "msg_body": [_text_body("hello")],
+        }
+    )
+    assert message.channel_subject is not None
+    assert message.channel_subject.chat_type == "direct"
+    assert "bot_mentioned" not in message.metadata
+
+
+def test_unmentioned_group_message_is_dropped_by_default() -> None:
+    channel = _group_channel()
+    manager = channel.group_context_manager
+    chatter = channel.parse_inbound(_group_payload(_text_body("今天天气不错")))
+    assert manager.will_trigger(chatter) is False
+    assert manager.prepare(chatter) is None
+
+    mentioned = channel.parse_inbound(_group_payload(_text_body("@指挥中枢 在吗"), _mention_elem("bot-self")))
+    assert manager.will_trigger(mentioned) is True
+    assert manager.prepare(mentioned) is not None
+
+
+def test_always_activation_keeps_replying_to_all_group_messages() -> None:
+    from octop_gateway.group_context import GroupContextConfig
+
+    channel = _group_channel(
+        group_context=GroupContextConfig(enabled=True, activation="always", visibility="all"),
+    )
+    manager = channel.group_context_manager
+    chatter = channel.parse_inbound(_group_payload(_text_body("随便聊聊")))
+    assert manager.will_trigger(chatter) is True
+    assert manager.prepare(chatter) is not None
+
+
+def test_group_context_disabled_processes_every_message() -> None:
+    from octop_gateway.group_context import GroupContextConfig
+
+    channel = _group_channel(group_context=GroupContextConfig(enabled=False))
+    manager = channel.group_context_manager
+    chatter = channel.parse_inbound(_group_payload(_text_body("闲聊")))
+    assert manager.will_trigger(chatter) is True
+    assert manager.prepare(chatter) is not None
+
+
+def test_passive_chatter_is_buffered_as_context_for_next_mention() -> None:
+    channel = _group_channel()
+    manager = channel.group_context_manager
+    manager.prepare(channel.parse_inbound(_group_payload(_text_body("上一条闲聊"))))
+
+    mentioned = channel.parse_inbound(_group_payload(_text_body("@指挥中枢 接着说"), _mention_elem("bot-self")))
+    prepared = manager.prepare(mentioned)
+    assert prepared is not None
+    assert prepared.group_context is not None
+    assert [item.text for item in prepared.group_context.messages] == ["上一条闲聊"]
+
+
+def test_bot_sender_is_dropped_in_groups() -> None:
+    channel = _group_channel()
+    assert (
+        channel._should_drop_bot_sender(_group_payload(_text_body("我是另一个机器人"), from_account="bot_other"))
+        is True
+    )
+    assert channel._should_drop_bot_sender(_group_payload(_text_body("人"), from_account="user-1")) is False
+
+
+def test_own_bot_sender_is_dropped_in_groups() -> None:
+    channel = _group_channel()
+    assert channel._should_drop_bot_sender(_group_payload(_text_body("我的回复"), from_account="bot-self")) is True
+
+
+def test_bot_sender_direct_chat_is_not_dropped() -> None:
+    channel = _group_channel()
+    payload = {
+        "callback_command": proto.CALLBACK_C2C_SEND_MSG,
+        "from_account": "bot_other",
+        "msg_id": "msg-d2",
+        "msg_body": [_text_body("hello")],
+    }
+    assert channel._should_drop_bot_sender(payload) is False
+
+
+def test_bot_sender_filter_can_be_disabled() -> None:
+    channel = _group_channel(ignore_bot_senders=False)
+    assert channel._should_drop_bot_sender(_group_payload(_text_body("hi"), from_account="bot_other")) is False
+
+
+def test_ignore_bot_senders_accepts_string_false() -> None:
+    assert YuanbaoConfig.from_dict({"ignore_bot_senders": "false"}).ignore_bot_senders is False
+    assert YuanbaoConfig.from_dict({"ignore_bot_senders": "true"}).ignore_bot_senders is True
+    assert YuanbaoConfig.from_dict({}).ignore_bot_senders is True
+
+
+@pytest.mark.asyncio
+async def test_bot_authored_group_frame_is_not_enqueued() -> None:
+    enqueued: list[dict[str, Any]] = []
+    channel = _group_channel()
+    channel.set_enqueue_callback(enqueued.append)
+
+    await channel._handle_text_frame(
+        json.dumps(_group_payload(_text_body("另一个机器人的回复"), from_account="bot_other"))
+    )
+    assert enqueued == []
+
+    await channel._handle_text_frame(json.dumps(_group_payload(_text_body("人类发言"))))
+    assert len(enqueued) == 1
