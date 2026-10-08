@@ -206,6 +206,10 @@ class QQConfig(ChannelConfig):
     sandbox: bool = False
     intents: int | None = None
     c2c_streaming: bool = True
+    # Release a still-open trailing paragraph while it streams. Off by default
+    # because it changes the frame sequence: on, a reply that is a single long
+    # line streams token by token instead of waiting for ``finish``.
+    c2c_stream_partial_paragraph: bool = False
     show_tool_hints: bool = False
     stream_throttle_ms: int = 150
     stream_hold_keepalive_s: float = 3.0
@@ -237,6 +241,16 @@ class QQConfig(ChannelConfig):
             # Missing key (and legacy ``streaming``) defaults on. Explicit
             # ``c2c_streaming: false`` remains the only opt-out.
             config.c2c_streaming = True
+        raw_partial = data.get("c2c_stream_partial_paragraph")
+        if isinstance(raw_partial, str):
+            config.c2c_stream_partial_paragraph = raw_partial.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        elif raw_partial is not None:
+            config.c2c_stream_partial_paragraph = bool(raw_partial)
         raw_group_context = data.get("group_context")
         if isinstance(raw_group_context, dict) and "enabled" not in raw_group_context:
             config.group_context.enabled = True
@@ -691,7 +705,14 @@ class QQChannel(BaseChannel):
             text = _answer_text()
             if session.failed or session.closing:
                 return
-            payload = text if final else stable_markdown_prefix(text)
+            payload = (
+                text
+                if final
+                else stable_markdown_prefix(
+                    text,
+                    include_partial_paragraph=self._config.c2c_stream_partial_paragraph,
+                )
+            )
             if not payload:
                 return
             session.offer(_locked_stream_text(payload))
