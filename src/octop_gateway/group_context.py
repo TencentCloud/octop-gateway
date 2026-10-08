@@ -185,6 +185,20 @@ class GroupContextManager:
             and policy.history_limit > 0
         )
 
+    def will_trigger(self, message: InboundMessage) -> bool:
+        """Whether this message would start an agent turn under the active policy.
+
+        Read-only counterpart to :meth:`prepare`; channels use it to skip
+        speculative work (e.g. typing indicators) for passive group chatter.
+        """
+        conversation_id = self._conversation_id(message)
+        if not conversation_id:
+            return True
+        policy = self._config.resolve(conversation_id)
+        if not policy.enabled:
+            return True
+        return self._should_process(message, policy)
+
     def prepare(self, message: InboundMessage) -> InboundMessage | None:
         """Record passive chatter or enrich a message that should reach the agent."""
         conversation_id = self._conversation_id(message)
