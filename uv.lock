@@ -1548,7 +1548,7 @@ wheels = [
 
 [[package]]
 name = "octop-gateway"
-version = "0.9.9"
+version = "1.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
