@@ -127,6 +127,9 @@ class StreamSession:
         self.stream_msg_id: str | None = None
         self.sent_frames = 0
         self.failed = False
+        # A visible frame came back without a stream id, so later frames
+        # would be new QQ messages. Stop the replace chain.
+        self.unlinked = False
         self.last_sent_at = 0.0
         self._drain_task: asyncio.Task[None] | None = None
         self._inflight_text: str | None = None
@@ -140,19 +143,38 @@ class StreamSession:
         return locked
 
     def offer(self, text: str) -> None:
-        """Record the latest candidate full text and kick the drain loop."""
+        """Record the latest candidate full text and kick the drain loop.
+
+        Visible text that is already accepted, in flight, or queued is not
+        submitted again. A whitespace hold may still be re-offered so the
+        generating indicator stays alive before the first readable frame.
+        """
         if self.failed or self.closing:
             return
-        self.pending = reconcile_stream_text(self._prefix_base(), text)
+        merged = reconcile_stream_text(self._prefix_base(), text)
+        if self._same_visible(merged):
+            return
+        self.pending = merged
         self._kick_drain()
 
+    def _same_visible(self, merged: str) -> bool:
+        if not merged.strip():
+            return False
+        if merged == self.pending or merged == self._inflight_text:
+            return True
+        return merged == self.last_accepted and self.pending is None and self._inflight_text is None
+
     def discard_unsent(self) -> None:
-        """Drop queued visible text. Keep an unsent whitespace hold."""
+        """Drop queued text that has not been accepted yet.
+
+        An empty session must not invent a newline frame. Mobile QQ shows
+        that frame as a blank bubble.
+        """
         if self.failed or self.closing:
             return
         locked = self._inflight_text if self._inflight_text is not None else self.last_accepted
         if not locked.strip():
-            self.pending = locked or "\n"
+            self.pending = locked or None
             return
         self.pending = None
 
@@ -205,7 +227,7 @@ class StreamSession:
             self.closing = True
             self.pending = None
         await self._wait_idle()
-        if self.sent_frames <= 0:
+        if self.sent_frames <= 0 or self.unlinked:
             return
         payload = text if text else self.last_accepted
         for attempt in range(1, self.done_retries + 1):
@@ -224,6 +246,12 @@ class StreamSession:
             await self._sleep(0.05)
 
     async def _emit(self, text: str, state: StreamState) -> bool:
+        # The hold frame may leave without an id. Do not post visible text
+        # after that: QQ would show each frame as a new message.
+        if state == STREAM_GENERATING and text.strip() and self.sent_frames > 0 and not self.stream_msg_id:
+            self.unlinked = True
+            self.failed = True
+            return False
         frame = StreamFrame(
             user_id=self.user_id,
             msg_id=self.msg_id,
@@ -248,6 +276,9 @@ class StreamSession:
             self.sent_frames += 1
             if stream_msg_id and not self.stream_msg_id:
                 self.stream_msg_id = stream_msg_id
+            if state == STREAM_GENERATING and text.strip() and not self.stream_msg_id:
+                self.unlinked = True
+                self.failed = True
             return True
         finally:
             if self._inflight_text == text:
