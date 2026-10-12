@@ -145,8 +145,8 @@ def strip_think_tags(text: str) -> str:
     return cleaned
 
 
-# Open the C2C replace bubble immediately. A newline is an invisible hold so
-# QQ can show its native generating dots without locking visible text.
+# A previous generating frame may already have locked this prefix. Mobile QQ
+# paints a newline-only frame as an empty bubble, so new turns do not send it.
 _C2C_STREAM_HOLD = "\n"
 
 
@@ -622,10 +622,10 @@ class QQChannel(BaseChannel):
         """Stream raw answer tokens when the C2C switch is on.
 
         Off uses origin/main: one static ``msg_type=2`` with the model text
-        unchanged. On: queue an invisible newline hold and start the model
-        without waiting for that HTTP; offer only complete Markdown blocks
-        so splices do not start mid-table / mid-fence; ``finish`` still
-        flushes the tail.
+        unchanged. On: show C2C「正在输入」until a complete Markdown block is
+        ready, then open the replace bubble with that text. A newline-only
+        frame is a blank bubble on mobile QQ, so it is not sent. ``finish``
+        still flushes the tail.
         """
         if not self._should_stream_c2c(subject):
             return await super()._process_inbound(message, subject)
@@ -696,20 +696,21 @@ class QQChannel(BaseChannel):
                 return
             session.offer(_locked_stream_text(payload))
 
-        async def _hold_keepalive() -> None:
+        async def _typing_until_visible() -> None:
+            """Refresh「正在输入」until the first readable stream frame."""
             interval = float(self._config.stream_hold_keepalive_s)
             if interval <= 0:
                 return
             while not session.closing and not session.failed:
+                if session.last_accepted.strip() or (session.pending or "").strip():
+                    return
+                await self._send_typing_indicator(subject)
                 await asyncio.sleep(interval)
-                if session.closing or session.failed:
-                    return
-                if session.last_accepted.strip():
-                    return
-                session.offer(session.last_accepted or _C2C_STREAM_HOLD)
 
-        session.offer(_C2C_STREAM_HOLD)
-        hold_keepalive = asyncio.create_task(_hold_keepalive(), name="qq-c2c-stream-hold")
+        typing_until_visible = asyncio.create_task(
+            _typing_until_visible(),
+            name="qq-c2c-stream-typing",
+        )
 
         async def _deliver_static(text: str) -> None:
             cleaned = (text or "").strip()
@@ -802,8 +803,10 @@ class QQChannel(BaseChannel):
             await session.finish(locked)
             await _flush_thinking()
             # Hold-only frames are not visible. Fall back when nothing
-            # readable was accepted, even if sent_frames > 0.
-            if session.sent_frames <= 0 or not session.last_accepted.strip():
+            # readable was accepted, even if sent_frames > 0. An unlinked
+            # visible frame cannot be replaced, so the finished answer is
+            # delivered once as a normal message instead of more stream frames.
+            if session.unlinked or session.sent_frames <= 0 or not session.last_accepted.strip():
                 await _deliver_static(answer)
             for media in media_buffer:
                 await self.reply_media(subject, media)
@@ -823,14 +826,34 @@ class QQChannel(BaseChannel):
             )
             return False
         finally:
-            hold_keepalive.cancel()
+            typing_until_visible.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await hold_keepalive
+                await typing_until_visible
             if self._active_c2c_stream is session:
                 self._active_c2c_stream = None
             if not session.closing:
                 with contextlib.suppress(Exception):
                     await session.finish(session.last_accepted, discard_pending=True)
+
+    @staticmethod
+    def _extract_stream_id(payload: dict[str, Any]) -> str | None:
+        """Return the replace-chain id from a QQ stream response.
+
+        QQ has returned this as a top-level string, a nested ``data.id``, and
+        an integer. A missing id means the next frame would be a new message.
+        """
+        sources: list[dict[str, Any]] = [payload]
+        nested = payload.get("data")
+        if isinstance(nested, dict):
+            sources.append(nested)
+        for source in sources:
+            for key in ("stream_msg_id", "id"):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+                if isinstance(value, int) and not isinstance(value, bool):
+                    return str(value)
+        return None
 
     async def _send_stream_frame(self, frame: StreamFrame) -> str | None:
         """POST one replace-mode C2C stream frame. Returns QQ stream msg id."""
@@ -864,8 +887,7 @@ class QQChannel(BaseChannel):
         err = payload.get("code")
         if err not in (None, 0, "0"):
             raise RuntimeError(f"QQ stream frame failed: status={status} body={raw[:500]}")
-        stream_id = payload.get("id") or payload.get("stream_msg_id")
-        return stream_id if isinstance(stream_id, str) else None
+        return self._extract_stream_id(payload)
 
     @staticmethod
     def _classify_qq_file(media: ContentPart) -> tuple[int, str | None]:
