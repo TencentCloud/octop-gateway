@@ -118,9 +118,10 @@ class TestWeixinTyping:
             processor=_noop,
             config=WeixinConfig(accounts=[WeixinAccountConfig(account_id="a", token="t")]),
         )
-        # Constraints already pin the keepalive interval; locking it in
-        # here so we notice if anyone removes it accidentally.
-        assert ch._constraints.typing_keepalive_interval > 0
+        # BaseChannel must not also run its keepalive. WeixinChannel owns the
+        # thinking light so a late status=1 cannot land after the answer.
+        assert ch._constraints.typing_keepalive_interval == 0
+        assert ch._constraints.reply_timeout == 0
 
 
 # ---------------------------------------------------------------------------

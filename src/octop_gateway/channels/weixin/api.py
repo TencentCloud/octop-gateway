@@ -204,7 +204,27 @@ class WeixinAPIClient:
         body_str = json.dumps(data)
         headers["Content-Length"] = str(len(body_str.encode("utf-8")))
         async with self._session.post(
-            url, data=body_str, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+            url,
+            data=body_str,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=self._timeout_s or 10),
         ) as resp:
+            body = await resp.text()
             if resp.status != 200:
-                logger.debug("WeixinChannel sendtyping non-200: %d", resp.status)
+                raise WeixinAPIError(ret=resp.status, errcode=resp.status, errmsg=f"HTTP {resp.status}")
+            payload: dict[str, Any] = {}
+            if body:
+                try:
+                    parsed = json.loads(body)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    payload = parsed
+            ret = payload.get("ret")
+            errcode = payload.get("errcode")
+            if (errcode not in (None, 0)) or (ret not in (None, 0)):
+                raise WeixinAPIError(
+                    ret=int(ret or errcode or -1),
+                    errcode=int(errcode) if errcode is not None else None,
+                    errmsg=payload.get("errmsg"),
+                )

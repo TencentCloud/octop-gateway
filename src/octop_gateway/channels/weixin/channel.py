@@ -23,6 +23,7 @@ from typing import Any
 
 from octop_gateway.channel import BaseChannel, ChannelConfig, ChannelCredentialsError, MessageProcessor
 from octop_gateway.channels.weixin.api import WeixinAPIClient
+from octop_gateway.channels.weixin.text import split_weixin_text
 from octop_gateway.channels.weixin.types import GetUpdatesResponse, WeixinAPIError, WeixinMessage
 from octop_gateway.constraints import ChannelConstraints
 from octop_gateway.models import (
@@ -34,7 +35,7 @@ from octop_gateway.models import (
     TextContent,
     VideoContent,
 )
-from octop_gateway.push_routing import alias_subject_fields
+from octop_gateway.push_routing import WEIXIN_CONTEXT_TOKEN_KEY, alias_subject_fields
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +70,18 @@ _AUTH_FAILED_CODE = -2
 # failing; the channel reports "disconnected" to the dashboard meanwhile.
 _SESSION_PAUSE_S = 300.0
 
-# Typing indicator status values
+# Typing indicator status values. status=2 clears the WeChat "thinking" light.
 _TYPING_START = 1
+_TYPING_STOP = 2
+# How long to wait for the thinking light before sending one placeholder bubble.
+_PLACEHOLDER_WAIT_S = 4.0
+_PLACEHOLDER_TEXT = "⏳ 思考中..."
+_TYPING_KEEPALIVE_S = 5.0
+# Thinking-light calls must not hold up the answer. The shared client timeout
+# is 45s; this cap only applies to getconfig / sendtyping.
+_TYPING_HTTP_TIMEOUT_S = 3.0
+
+ContextTokenListener = Any
 
 
 @dataclass
@@ -150,6 +161,20 @@ class WeixinConfig(ChannelConfig):
         return [] if self.accounts else ["token"]
 
 
+@dataclass
+class _WeixinTurn:
+    """One inbound turn's thinking-light and placeholder state."""
+
+    stop: asyncio.Event = field(default_factory=asyncio.Event)
+    typing_ok: bool = False
+    typing_warned: bool = False
+    content_enqueued: bool = False
+    typing_stopped: bool = False
+    closed: bool = False
+    typing_task: asyncio.Task[None] | None = None
+    placeholder_task: asyncio.Task[None] | None = None
+
+
 class WeixinChannel(BaseChannel):
     """WeChat iLink Bot channel using HTTP long-poll.
 
@@ -182,18 +207,31 @@ class WeixinChannel(BaseChannel):
         self._poll_tasks: dict[str, asyncio.Task[None]] = {}
         self._sync_buffers: dict[str, str] = {}
         self._context_tokens: dict[str, str] = {}
+        self._send_locks: dict[str, asyncio.Lock] = {}
+        self._turns: dict[str, _WeixinTurn] = {}
+        self._context_token_listener: ContextTokenListener | None = None
+        # iLink has no 5-second passive-reply window. A placeholder sent on a
+        # side task races the real answer and shows up after it. Thinking is
+        # sendtyping; the fallback bubble is owned by this channel.
+        self._constraints.reply_timeout = 0
+        self._constraints.timeout_strategy = "none"
+        self._constraints.typing_keepalive_interval = 0
         # account_id → monotonic resume time while a session is paused (-14)
         self._session_pause_until: dict[str, float] = {}
 
+    def set_context_token_listener(self, listener: ContextTokenListener | None) -> None:
+        """Persist a refreshed token. The listener must not log the token."""
+        self._context_token_listener = listener
+
     def _default_constraints(self) -> ChannelConstraints:
         return ChannelConstraints(
-            reply_timeout=5.0,
-            timeout_strategy="placeholder",
+            reply_timeout=0,
+            timeout_strategy="none",
             send_rate_limit=(5, 60.0),
-            typing_keepalive_interval=5.0,
+            typing_keepalive_interval=0,
             show_thinking=False,
             show_tool_hints=False,
-            placeholder_texts=["⏳ 思考中...", "🤔 让我想想...", "💭 正在处理..."],
+            placeholder_texts=[_PLACEHOLDER_TEXT],
         )
 
     async def start(self) -> None:
@@ -224,11 +262,87 @@ class WeixinChannel(BaseChannel):
         return f"{account_id}:{user_id}"
 
     def _resolve_context_token(self, account_id: str, to_user_id: str, meta: dict[str, Any]) -> str:
-        """Prefer the live inbound cache over stale metadata on proactive sends."""
+        """Prefer the live cache, then the durable session copy, then this turn's token."""
         cached = self._context_tokens.get(self._context_cache_key(account_id, to_user_id), "")
         if cached:
             return cached
+        durable = str(meta.get(WEIXIN_CONTEXT_TOKEN_KEY) or "").strip()
+        if durable:
+            return durable
         return str(meta.get("context_token") or "")
+
+    def _remember_context_token(self, account_id: str, user_id: str, token: str) -> None:
+        cleaned = token.strip()
+        if not cleaned or not user_id:
+            return
+        self._context_tokens[self._context_cache_key(account_id, user_id)] = cleaned
+        listener = self._context_token_listener
+        if listener is None:
+            return
+        try:
+            listener(account_id, user_id, cleaned, int(time.time() * 1000))
+        except Exception:
+            logger.warning("WeixinChannel failed to persist context token for user=%s", user_id[:12])
+
+    def _user_key(self, subject: ChannelSubject) -> str:
+        meta = subject.metadata or {}
+        return str(meta.get("from_user_id") or subject.subject_id or "")
+
+    def _send_lock(self, user_id: str) -> asyncio.Lock:
+        lock = self._send_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._send_locks[user_id] = lock
+        return lock
+
+    async def _process_inbound(self, message: InboundMessage, subject: ChannelSubject) -> bool:
+        user_id = self._user_key(subject)
+        turn = _WeixinTurn()
+        if user_id:
+            self._turns[user_id] = turn
+            turn.typing_task = asyncio.create_task(
+                self._typing_loop(subject, turn), name=f"weixin-typing-{user_id[:12]}"
+            )
+            turn.placeholder_task = asyncio.create_task(
+                self._placeholder_after(subject, user_id, turn),
+                name=f"weixin-placeholder-{user_id[:12]}",
+            )
+        try:
+            return await super()._process_inbound(message, subject)
+        finally:
+            await self._finish_turn(user_id, subject, turn)
+
+    async def _finish_turn(self, user_id: str, subject: ChannelSubject, turn: _WeixinTurn) -> None:
+        turn.closed = True
+        turn.stop.set()
+        if turn.placeholder_task is not None:
+            turn.placeholder_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await turn.placeholder_task
+        async with self._send_lock(user_id or "_"):
+            await self._stop_typing(subject, turn)
+        if user_id and self._turns.get(user_id) is turn:
+            self._turns.pop(user_id, None)
+
+    async def _placeholder_after(self, subject: ChannelSubject, user_id: str, turn: _WeixinTurn) -> None:
+        """One bubble, only if the thinking light never came on and nothing was sent."""
+        try:
+            await asyncio.sleep(_PLACEHOLDER_WAIT_S)
+        except asyncio.CancelledError:
+            return
+        async with self._send_lock(user_id):
+            if turn.closed or turn.typing_ok or turn.content_enqueued:
+                return
+            turn.content_enqueued = True
+            await self._stop_typing(subject, turn)
+            await self._dispatch_text(subject, _PLACEHOLDER_TEXT, prepaid_first=False)
+
+    async def _mark_content(self, user_id: str, subject: ChannelSubject) -> None:
+        turn = self._turns.get(user_id)
+        if turn is None:
+            return
+        turn.content_enqueued = True
+        await self._stop_typing(subject, turn)
 
     def _enrich_push_metadata(self, subject: ChannelSubject, meta: dict[str, Any]) -> dict[str, Any]:
         out = dict(meta)
@@ -239,50 +353,69 @@ class WeixinChannel(BaseChannel):
 
     async def _send_text(self, subject: ChannelSubject, text: str) -> None:
         """Send a text message via the iLink sendMessage API."""
+        user_id = self._user_key(subject)
+        async with self._send_lock(user_id or "_"):
+            await self._mark_content(user_id, subject)
+            await self._dispatch_text(subject, text, prepaid_first=True)
+
+    async def _dispatch_text(self, subject: ChannelSubject, text: str, *, prepaid_first: bool) -> None:
+        parts = split_weixin_text(text)
+        total = len(parts)
+        for index, part in enumerate(parts):
+            if not (prepaid_first and index == 0):
+                await self._acquire_rate_slot()
+            await self._post_text(subject, part, index=index, total=total)
+
+    async def _post_text(self, subject: ChannelSubject, text: str, *, index: int, total: int) -> None:
         meta = subject.metadata
         account_id = str(meta.get("account_id", ""))
         account = self._get_account(account_id)
+        user_id = str(meta.get("from_user_id") or subject.subject_id)
         if not account:
             logger.warning("WeixinChannel: no account for send (account_id=%s)", account_id)
             return
 
-        to_user_id = str(meta.get("from_user_id") or subject.subject_id)
-        context_token = self._resolve_context_token(account.account_id, to_user_id, meta)
-
+        context_token = self._resolve_context_token(account.account_id, user_id, meta)
         api = await self._api(account)
         last_error: Exception | None = None
         for _attempt in range(2):
             try:
                 resp = await api.send_message(
-                    to_user_id=to_user_id,
+                    to_user_id=user_id,
                     text=text,
                     context_token=context_token,
                 )
-                refreshed_context = resp.context_token or resp.data.get("context_token") or ""
-                if refreshed_context:
-                    self._context_tokens[self._context_cache_key(account.account_id, to_user_id)] = str(
-                        refreshed_context
-                    )
-                logger.debug(
-                    "WeixinChannel send ok: user=%s message_id=%s",
-                    to_user_id[:12],
+                refreshed = str(resp.context_token or resp.data.get("context_token") or "")
+                if refreshed:
+                    self._remember_context_token(account.account_id, user_id, refreshed)
+                logger.info(
+                    "WeixinChannel send ok: user=%s chars=%d part=%d/%d message_id=%s ret=%s",
+                    user_id[:12],
+                    len(text),
+                    index + 1,
+                    total,
                     resp.message_id,
+                    resp.ret,
                 )
                 return
             except WeixinAPIError as exc:
                 last_error = exc
+                logger.warning(
+                    "WeixinChannel send failed: user=%s chars=%d part=%d/%d ret=%s errcode=%s errmsg=%s",
+                    user_id[:12],
+                    len(text),
+                    index + 1,
+                    total,
+                    exc.ret,
+                    exc.errcode,
+                    exc.errmsg,
+                )
                 if context_token and exc.ret in (_SESSION_EXPIRED_CODE, _AUTH_FAILED_CODE):
-                    logger.warning(
-                        "WeixinChannel send ret=%s for %s — retrying without context_token",
-                        exc.ret,
-                        to_user_id[:12],
-                    )
                     context_token = ""
                     continue
                 raise
-            except Exception:  # pylint: disable=broad-except
-                # Preserve account failover across transport-specific send failures.
-                logger.exception("WeixinChannel send error (account=%s)", account.account_id)
+            except Exception:
+                logger.exception("WeixinChannel send error (account=%s user=%s)", account.account_id, user_id[:12])
                 raise
         if last_error is not None:
             raise last_error
@@ -297,9 +430,12 @@ class WeixinChannel(BaseChannel):
 
     async def _send_media(self, subject: ChannelSubject, media: ContentPart) -> None:
         """Send a single media item to WeChat iLink."""
-        sent = await self._deliver_media(subject, media)
-        if not sent:
-            await self._send_media_fallback(subject, media)
+        user_id = self._user_key(subject)
+        async with self._send_lock(user_id or "_"):
+            await self._mark_content(user_id, subject)
+            sent = await self._deliver_media(subject, media)
+            if not sent:
+                await self._send_media_fallback_unlocked(subject, media)
 
     async def _deliver_media(self, subject: ChannelSubject, media: ContentPart) -> bool:
         meta = subject.metadata
@@ -453,13 +589,13 @@ class WeixinChannel(BaseChannel):
             inner["rawfilemd5"] = raw_md5
         return {"type": item_type, item_key: inner}
 
-    async def _send_media_fallback(self, subject: ChannelSubject, media: ContentPart) -> None:
+    async def _send_media_fallback_unlocked(self, subject: ChannelSubject, media: ContentPart) -> None:
         url = self._get_media_url(media)
         label = self._get_media_label(media)
         if url:
-            await self._send_text(subject, f"[{label}: {url}]")
+            await self._dispatch_text(subject, f"[{label}: {url}]", prepaid_first=True)
         elif getattr(media, "data", None) or getattr(media, "local_path", None):
-            await self._send_text(subject, f"[{label} (local file)]")
+            await self._dispatch_text(subject, f"[{label} (local file)]", prepaid_first=True)
 
     async def fetch_remote_media(self, url: str) -> tuple[bytes, str]:
         """Download media URLs, attaching iLink bot auth headers when available."""
@@ -475,32 +611,87 @@ class WeixinChannel(BaseChannel):
             return await resp.read(), content_type
 
     async def _send_typing_indicator(self, subject: ChannelSubject) -> None:
-        """Refresh the iLink typing indicator for the active conversation.
+        """One thinking-light refresh. Failures are warned without the ticket."""
+        await self._typing_once(subject, status=_TYPING_START)
 
-        Fetches a fresh ``typing_ticket`` via getConfig, then issues a single
-        sendTyping(start). Called periodically by ``TypingKeepalive``; silent
-        on failure — a dropped ping must not derail the reply pipeline.
-        """
-        account_id = subject.metadata.get("account_id", "")
-        account = self._get_account(account_id)
-        if not account:
-            return
-        ilink_user_id = (
-            subject.metadata.get("from_user_id") or subject.subject_id or account.user_uin or account.bot_uin
-        )
-        if not ilink_user_id:
-            return
-        context_token = subject.metadata.get("context_token", "")
+    async def _typing_loop(self, subject: ChannelSubject, turn: _WeixinTurn) -> None:
+        while not turn.stop.is_set():
+            ok = await self._typing_once(
+                subject,
+                status=_TYPING_START,
+                warn=not turn.typing_warned,
+                turn=turn,
+            )
+            if ok:
+                turn.typing_ok = True
+            else:
+                turn.typing_warned = True
+            try:
+                await asyncio.wait_for(turn.stop.wait(), timeout=_TYPING_KEEPALIVE_S)
+            except TimeoutError:
+                continue
 
+    async def _stop_typing(self, subject: ChannelSubject, turn: _WeixinTurn) -> None:
+        """Wait out an in-flight status=1, then send status=2 once."""
+        if turn.typing_stopped:
+            return
+        turn.stop.set()
+        task = turn.typing_task
+        current = asyncio.current_task()
+        if task is not None and task is not current and not task.done():
+            await task
+        if turn.typing_stopped:
+            return
+        turn.typing_stopped = True
+        if not turn.typing_ok:
+            return
+        if await self._typing_once(subject, status=_TYPING_STOP):
+            return
+        await self._typing_once(subject, status=_TYPING_STOP)
+
+    async def _typing_once(
+        self,
+        subject: ChannelSubject,
+        *,
+        status: int,
+        warn: bool = True,
+        turn: _WeixinTurn | None = None,
+    ) -> bool:
+        meta = subject.metadata or {}
+        account = self._get_account(str(meta.get("account_id", "")))
+        user_id = str(meta.get("from_user_id") or subject.subject_id or "")
+        if account is None or not user_id:
+            return False
+        context_token = self._resolve_context_token(account.account_id, user_id, meta)
         try:
-            api = await self._api(account)
-            config_resp = await api.get_config(ilink_user_id=ilink_user_id, context_token=context_token)
+            api = await self._api(account, timeout_s=_TYPING_HTTP_TIMEOUT_S)
+            config_resp = await api.get_config(ilink_user_id=user_id, context_token=context_token)
+            if turn is not None and turn.stop.is_set() and status == _TYPING_START:
+                return False
             ticket = config_resp.typing_ticket or ""
-            if ticket:
-                await api.send_typing(ilink_user_id=ilink_user_id, typing_ticket=ticket, status=_TYPING_START)
-        except Exception:  # pylint: disable=broad-except
-            # Typing is best-effort and must not affect message delivery.
-            logger.debug("WeixinChannel sendtyping failed", exc_info=True)
+            if not ticket:
+                raise WeixinAPIError(ret=-1, errcode=-1, errmsg="missing typing_ticket")
+            await api.send_typing(ilink_user_id=user_id, typing_ticket=ticket, status=status)
+            return True
+        except WeixinAPIError as exc:
+            if warn:
+                logger.warning(
+                    "WeixinChannel typing status=%s failed: user=%s ret=%s errcode=%s errmsg=%s",
+                    status,
+                    user_id[:12],
+                    exc.ret,
+                    exc.errcode,
+                    exc.errmsg,
+                )
+            return False
+        except Exception:
+            if warn:
+                logger.warning(
+                    "WeixinChannel typing status=%s failed: user=%s",
+                    status,
+                    user_id[:12],
+                )
+            return False
 
     def parse_inbound(self, raw_payload: Any) -> InboundMessage:
         """Parse an iLink getUpdates message into an InboundMessage."""
