@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from octop_gateway.channels.discord import DiscordConfig
     from octop_gateway.channels.feishu import FeishuConfig
     from octop_gateway.channels.mqtt import MQTTConfig
+    from octop_gateway.channels.nats import NATSConfig
     from octop_gateway.channels.qq import QQConfig
     from octop_gateway.channels.telegram import TelegramConfig
     from octop_gateway.channels.wecom import WeComConfig
@@ -1034,6 +1035,16 @@ class ChannelManager:
     ) -> str:
         """Add an MQTT channel for IoT / robot messaging."""
         return await self.add_channel("mqtt", config, processor=processor, **kwargs)
+
+    async def add_nats_channel(
+        self,
+        config: NATSConfig,
+        *,
+        processor: MessageProcessor | None = None,
+        **kwargs: Any,
+    ) -> str:
+        """Add a NATS channel for IoT / robot / service messaging."""
+        return await self.add_channel("nats", config, processor=processor, **kwargs)
 
     async def add_telegram_channel(
         self,
