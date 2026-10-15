@@ -313,6 +313,250 @@ class TestDingTalkChannelUnit:
             "fileType": "pdf",
         }
 
+    def test_group_message_subject_is_the_conversation(self) -> None:
+        """Group chats share one thread: the conversation id is the subject."""
+        config = DingTalkConfig(app_key="test_key", app_secret="test_secret")
+        ch = DingTalkChannel(processor=_noop_processor, config=config)
+
+        msg = ch.parse_inbound(
+            {
+                "msgtype": "text",
+                "text": {"content": "@bot ping"},
+                "sender_id": "staff_zhang",
+                "sender_nick": "Zhang",
+                "conversation_id": "cid_GROUP_A",
+                "conversation_type": "2",
+                "msg_id": "msg_dt_group",
+            }
+        )
+
+        assert msg.channel_subject is not None
+        assert msg.channel_subject.subject_id == "cid_GROUP_A"
+        assert msg.channel_subject.chat_type == "group"
+        assert msg.channel_subject.display_name == ""
+        assert msg.metadata["chat_type"] == "group"
+        assert msg.metadata["is_group"] is True
+        assert msg.metadata["to_handle"] == "cid_GROUP_A"
+        # Group author stays in metadata so every member keeps attribution.
+        assert msg.metadata["sender_id"] == "staff_zhang"
+        assert msg.metadata["sender_name"] == "Zhang"
+        # Stream chatbots only receive group messages that @ the bot.
+        assert msg.metadata["bot_mentioned"] is True
+
+    def test_group_members_share_a_thread_and_groups_stay_isolated(self) -> None:
+        config = DingTalkConfig(app_key="test_key", app_secret="test_secret")
+        ch = DingTalkChannel(processor=_noop_processor, config=config)
+
+        def subject_id(sender_id: str, conversation_id: str) -> str:
+            msg = ch.parse_inbound(
+                {
+                    "msgtype": "text",
+                    "text": {"content": "@bot ping"},
+                    "sender_id": sender_id,
+                    "conversation_id": conversation_id,
+                    "conversation_type": "2",
+                    "msg_id": f"msg_{sender_id}_{conversation_id}",
+                }
+            )
+            assert msg.channel_subject is not None
+            return msg.channel_subject.subject_id
+
+        same_group = subject_id("staff_li", "cid_GROUP_A")
+        assert subject_id("staff_zhang", "cid_GROUP_A") == same_group
+        assert subject_id("staff_zhang", "cid_GROUP_B") != same_group
+
+    def test_direct_message_subject_stays_the_sender(self) -> None:
+        config = DingTalkConfig(app_key="test_key", app_secret="test_secret")
+        ch = DingTalkChannel(processor=_noop_processor, config=config)
+
+        msg = ch.parse_inbound(
+            {
+                "msgtype": "text",
+                "text": {"content": "hi"},
+                "sender_id": "staff_zhang",
+                "sender_nick": "Zhang",
+                "conversation_id": "cid_DM",
+                "conversation_type": "1",
+                "msg_id": "msg_dt_dm",
+            }
+        )
+
+        assert msg.channel_subject is not None
+        assert msg.channel_subject.subject_id == "staff_zhang"
+        assert msg.channel_subject.chat_type == "direct"
+        assert msg.metadata["chat_type"] == "dm"
+        assert msg.metadata["is_group"] is False
+        assert "bot_mentioned" not in msg.metadata
+
+    def test_group_without_conversation_id_falls_back_to_sender(self) -> None:
+        """No conversation id means no shared thread — fall back to per-sender."""
+        config = DingTalkConfig(app_key="test_key", app_secret="test_secret")
+        ch = DingTalkChannel(processor=_noop_processor, config=config)
+
+        msg = ch.parse_inbound(
+            {
+                "msgtype": "text",
+                "text": {"content": "@bot ping"},
+                "sender_id": "staff_zhang",
+                "conversation_id": "",
+                "conversation_type": "2",
+                "msg_id": "msg_dt_group_no_cid",
+            }
+        )
+
+        assert msg.channel_subject is not None
+        assert msg.channel_subject.subject_id == "staff_zhang"
+        assert msg.channel_subject.chat_type == "group"
+
+    @pytest.mark.asyncio
+    async def test_group_without_conversation_id_sends_to_the_sender(self) -> None:
+        """Without a conversation id there is no group target — fall back to DM."""
+
+        class FakeResponse:
+            async def __aenter__(self) -> FakeResponse:
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def json(self) -> dict[str, str]:
+                return {"processQueryKey": "query-fallback-001"}
+
+        class FakeHttp:
+            def __init__(self) -> None:
+                self.closed = False
+                self.post_calls: list[dict[str, Any]] = []
+
+            def post(self, url: str, **kwargs: Any) -> FakeResponse:
+                self.post_calls.append({"url": url, **kwargs})
+                return FakeResponse()
+
+        config = DingTalkConfig(app_key="test_key", app_secret="test_secret", robot_code="robot_001")
+        ch = DingTalkChannel(processor=_noop_processor, config=config)
+        ch._access_token = "access-token"
+        ch._token_expires_at = float("inf")
+        http = FakeHttp()
+        ch._http = http
+
+        msg = ch.parse_inbound(
+            {
+                "msgtype": "text",
+                "text": {"content": "@bot ping"},
+                "sender_id": "staff_zhang",
+                "conversation_id": "",
+                "conversation_type": "2",
+                "msg_id": "msg_dt_group_no_cid",
+            }
+        )
+        assert msg.channel_subject is not None
+
+        await ch._send_text(msg.channel_subject, "hello")
+
+        # A staffId is not an openConversationId; the group endpoint would misroute.
+        assert [call["url"] for call in http.post_calls] == [
+            "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
+        ]
+        assert http.post_calls[0]["json"]["userIds"] == ["staff_zhang"]
+
+    @pytest.mark.asyncio
+    async def test_group_send_without_webhook_uses_group_endpoint(self) -> None:
+        """Proactive group sends address the conversation, not the sender."""
+
+        class FakeResponse:
+            async def __aenter__(self) -> FakeResponse:
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def json(self) -> dict[str, str]:
+                return {"processQueryKey": "query-group-001"}
+
+        class FakeHttp:
+            def __init__(self) -> None:
+                self.closed = False
+                self.post_calls: list[dict[str, Any]] = []
+
+            def post(self, url: str, **kwargs: Any) -> FakeResponse:
+                self.post_calls.append({"url": url, **kwargs})
+                return FakeResponse()
+
+        config = DingTalkConfig(app_key="test_key", app_secret="test_secret", robot_code="robot_001")
+        ch = DingTalkChannel(processor=_noop_processor, config=config)
+        ch._access_token = "access-token"
+        ch._token_expires_at = float("inf")
+        http = FakeHttp()
+        ch._http = http
+        subject = ChannelSubject(
+            subject_id="cid_GROUP_A",
+            chat_type="group",
+            metadata={
+                "conversation_id": "cid_GROUP_A",
+                "conversation_type": "2",
+                "chat_type": "group",
+                "is_group": True,
+                "sender_id": "staff_zhang",
+                "to_handle": "cid_GROUP_A",
+            },
+        )
+
+        await ch._send_text(subject, "hello group")
+
+        assert [call["url"] for call in http.post_calls] == [
+            "https://api.dingtalk.com/v1.0/robot/groupMessages/send",
+        ]
+        payload = http.post_calls[0]["json"]
+        assert payload["openConversationId"] == "cid_GROUP_A"
+        assert payload["robotCode"] == "robot_001"
+        assert "userIds" not in payload
+
+    @pytest.mark.asyncio
+    async def test_direct_send_without_webhook_still_targets_the_sender(self) -> None:
+        class FakeResponse:
+            async def __aenter__(self) -> FakeResponse:
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def json(self) -> dict[str, str]:
+                return {"processQueryKey": "query-dm-001"}
+
+        class FakeHttp:
+            def __init__(self) -> None:
+                self.closed = False
+                self.post_calls: list[dict[str, Any]] = []
+
+            def post(self, url: str, **kwargs: Any) -> FakeResponse:
+                self.post_calls.append({"url": url, **kwargs})
+                return FakeResponse()
+
+        config = DingTalkConfig(app_key="test_key", app_secret="test_secret", robot_code="robot_001")
+        ch = DingTalkChannel(processor=_noop_processor, config=config)
+        ch._access_token = "access-token"
+        ch._token_expires_at = float("inf")
+        http = FakeHttp()
+        ch._http = http
+        subject = ChannelSubject(
+            subject_id="staff_zhang",
+            chat_type="direct",
+            metadata={
+                "conversation_id": "cid_DM",
+                "conversation_type": "1",
+                "chat_type": "dm",
+                "is_group": False,
+                "sender_id": "staff_zhang",
+                "to_handle": "staff_zhang",
+            },
+        )
+
+        await ch._send_text(subject, "hello dm")
+
+        assert [call["url"] for call in http.post_calls] == [
+            "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
+        ]
+        assert http.post_calls[0]["json"]["userIds"] == ["staff_zhang"]
+
     def test_stream_handler_has_pre_start(self) -> None:
         """SDK DingTalkStreamClient.pre_start() calls handler.pre_start()."""
         import dingtalk_stream
