@@ -388,6 +388,95 @@ class TestDingTalkChannelUnit:
         assert msg.metadata["is_group"] is False
         assert "bot_mentioned" not in msg.metadata
 
+    def test_group_context_is_enabled_by_default(self) -> None:
+        """DingTalk opts into the shared group policy, like QQ and Feishu."""
+        config = DingTalkConfig(app_key="test_key", app_secret="test_secret")
+        assert config.group_context.enabled is True
+        assert config.group_context.activation == "mention"
+
+    def test_config_from_dict_keeps_group_context_opted_in(self) -> None:
+        config = DingTalkConfig.from_dict({"app_key": "k", "app_secret": "s", "group_context": {"visibility": "all"}})
+        assert config.group_context.enabled is True
+        assert config.group_context.visibility == "all"
+
+    def test_config_from_dict_honours_explicit_opt_out(self) -> None:
+        config = DingTalkConfig.from_dict({"app_key": "k", "app_secret": "s", "group_context": {"enabled": False}})
+        assert config.group_context.enabled is False
+
+    def test_direct_message_carries_no_conversation_id(self) -> None:
+        """A DM keyed by conversation id would be read as a group and dropped."""
+        config = DingTalkConfig(app_key="test_key", app_secret="test_secret")
+        ch = DingTalkChannel(processor=_noop_processor, config=config)
+
+        msg = ch.parse_inbound(
+            {
+                "msgtype": "text",
+                "text": {"content": "hi"},
+                "sender_id": "staff_zhang",
+                "conversation_id": "cid_DM",
+                "conversation_type": "1",
+                "msg_id": "msg_dt_dm_cid",
+            }
+        )
+
+        assert "conversation_id" not in msg.metadata
+        assert ch.group_context_manager.handles(msg) is False
+
+    def test_group_mention_is_derived_from_is_in_at_list(self) -> None:
+        config = DingTalkConfig(app_key="test_key", app_secret="test_secret")
+        ch = DingTalkChannel(processor=_noop_processor, config=config)
+
+        def parse(is_in_at_list: bool | None) -> InboundMessage:
+            payload: dict[str, Any] = {
+                "msgtype": "text",
+                "text": {"content": "hello"},
+                "sender_id": "staff_zhang",
+                "conversation_id": "cid_GROUP_A",
+                "conversation_type": "2",
+                "msg_id": "msg_dt_mention",
+            }
+            if is_in_at_list is not None:
+                payload["is_in_at_list"] = is_in_at_list
+            return ch.parse_inbound(payload)
+
+        assert parse(True).metadata["bot_mentioned"] is True
+        # DingTalk reports the bot was not addressed; do not claim otherwise.
+        assert parse(False).metadata["bot_mentioned"] is False
+        # Marker absent: stream chatbots only receive addressed group messages.
+        assert parse(None).metadata["bot_mentioned"] is True
+
+    def test_group_activation_follows_group_context_policy(self) -> None:
+        """The base-class policy decides: unmentioned group chatter is buffered."""
+        config = DingTalkConfig(app_key="test_key", app_secret="test_secret")
+        ch = DingTalkChannel(processor=_noop_processor, config=config)
+
+        def group_msg(msg_id: str, mentioned: bool) -> InboundMessage:
+            return ch.parse_inbound(
+                {
+                    "msgtype": "text",
+                    "text": {"content": "@bot ping" if mentioned else "chatter"},
+                    "sender_id": "staff_zhang",
+                    "sender_nick": "Zhang",
+                    "conversation_id": "cid_GROUP_A",
+                    "conversation_type": "2",
+                    "msg_id": msg_id,
+                    "is_in_at_list": mentioned,
+                }
+            )
+
+        manager = ch.group_context_manager
+        assert manager.handles(group_msg("m1", True)) is True
+
+        # Not addressed: buffered as passive context, not sent to the agent.
+        assert manager.prepare(group_msg("m2", False)) is None
+
+        prepared = manager.prepare(group_msg("m3", True))
+        assert prepared is not None
+        assert prepared.group_context is not None
+        assert prepared.group_context.conversation_id == "cid_GROUP_A"
+        # The earlier unmentioned message is now available as background.
+        assert [item.text for item in prepared.group_context.messages] == ["chatter"]
+
     def test_group_without_conversation_id_falls_back_to_sender(self) -> None:
         """No conversation id means no shared thread — fall back to per-sender."""
         config = DingTalkConfig(app_key="test_key", app_secret="test_secret")

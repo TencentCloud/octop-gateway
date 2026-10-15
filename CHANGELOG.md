@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### 修复
 
 - 钉钉群聊会话边界改为「群」而不是「发送者」：同一群内所有成员共用一条会话线，群与群、群聊与私聊互相隔离；群内发言者保留在 `metadata.sender_id` / `sender_name`，回复按 `conversation_id` 走 `robot/groupMessages/send`。
+- 钉钉通道接入基类群聊上下文策略（`group_context`，默认开启）：群内未 @ 机器人的消息不再直接进入 Agent，而是按 `GroupContextManager` 的规则缓存为被动上下文；`bot_mentioned` 改为读取钉钉返回的 `isInAtList`，不再无条件置为 `true`。
 
 ## [1.0.2] - 2026-10-14
 
