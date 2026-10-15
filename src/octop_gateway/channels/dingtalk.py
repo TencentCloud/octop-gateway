@@ -271,13 +271,15 @@ class DingTalkChannel(BaseChannel):
         """Send a text message to a DingTalk subject or group.
 
         Uses the webhook URL if available in metadata, otherwise falls back to
-        the OpenAPI robot/oToMessages endpoint for DM.
+        the robot OpenAPI — oToMessages for DMs, groupMessages for groups.
         """
         meta = subject.metadata
         webhook_url = meta.get("webhook_url")
 
         if webhook_url:
             await self._send_via_webhook(webhook_url, text)
+        elif _is_group_subject(subject):
+            await self._send_via_group_openapi(subject.subject_id, text)
         else:
             await self._send_via_openapi(subject.subject_id, text, meta)
 
@@ -384,12 +386,7 @@ class DingTalkChannel(BaseChannel):
         headers = await self._get_auth_headers()
         url = f"{_API_BASE}/v1.0/robot/oToMessages/batchSend"
 
-        if len(text) > 3500:
-            msg_key = "sampleText"
-            msg_param = {"content": text}
-        else:
-            msg_key = "sampleMarkdown"
-            msg_param = {"title": "Octop", "text": text}
+        msg_key, msg_param = _text_message(text)
 
         payload = {
             "robotCode": self._config.effective_robot_code,
@@ -405,6 +402,33 @@ class DingTalkChannel(BaseChannel):
                     logger.error("DingTalk OpenAPI send failed: %s", data)
         except (aiohttp.ClientError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError):
             logger.exception("HTTP error sending DingTalk OpenAPI message")
+
+    async def _send_via_group_openapi(self, conversation_id: str, text: str) -> None:
+        """Send a message to a group via robot/groupMessages/send.
+
+        Group sends address ``openConversationId``; ``userIds`` is DM-only and
+        would target the wrong conversation.
+        """
+        http = await self._ensure_http()
+        headers = await self._get_auth_headers()
+        url = f"{_API_BASE}/v1.0/robot/groupMessages/send"
+
+        msg_key, msg_param = _text_message(text)
+
+        payload = {
+            "robotCode": self._config.effective_robot_code,
+            "openConversationId": conversation_id,
+            "msgKey": msg_key,
+            "msgParam": json.dumps(msg_param),
+        }
+
+        try:
+            async with http.post(url, headers=headers, json=payload) as resp:
+                data = await resp.json()
+                if "processQueryKey" not in data and "requestId" not in data:
+                    logger.error("DingTalk group OpenAPI send failed: %s", data)
+        except (aiohttp.ClientError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError):
+            logger.exception("HTTP error sending DingTalk group OpenAPI message")
 
     async def _send_media_message(
         self,
@@ -449,8 +473,9 @@ class DingTalkChannel(BaseChannel):
         # Session webhooks support text/Markdown replies but not uploaded media.
         # Direct chats still include a sessionWebhook, so media must use the
         # robot OpenAPI instead of following the text-message routing path.
-        if str(meta.get("conversation_type", "1")) != "1":
-            raise RuntimeError("DingTalk group session webhooks do not support uploaded media")
+        # Group subjects carry the conversation id, which is not a valid userId.
+        if meta.get("is_group") or str(meta.get("conversation_type", "1")) != "1":
+            raise RuntimeError("DingTalk group subjects do not support uploaded media")
 
         # DM via OpenAPI
         payload_dm = {
@@ -572,6 +597,12 @@ class DingTalkChannel(BaseChannel):
         msgtype = raw_payload.get("msgtype", "text")
         msg_id = raw_payload.get("msg_id", "")
 
+        # "1" = DM, "2" = group.
+        is_group = conversation_type == "2"
+        # Groups are threaded by conversation so all members share one thread;
+        # without a conversation id fall back to the sender.
+        subject_id = conversation_id if is_group and conversation_id else sender_id
+
         # Build session key
         session_id = self._stream_session_id or "dingtalk-unconnected"
 
@@ -590,9 +621,17 @@ class DingTalkChannel(BaseChannel):
             "msg_id": msg_id,
             "conversation_id": conversation_id,
             "conversation_type": conversation_type,
+            "chat_type": "group" if is_group else "dm",
+            "is_group": is_group,
+            # Keep the author: group threads are shared across members.
+            "sender_id": sender_id,
+            "sender_name": sender_nick,
             "sender_nick": sender_nick,
-            "to_handle": sender_id,
+            "to_handle": subject_id,
         }
+        if is_group:
+            # Stream chatbots only receive group messages that @ the bot.
+            metadata["bot_mentioned"] = True
 
         # Include webhook URL for reply-mode sending
         webhook_url = raw_payload.get("webhook_url", "")
@@ -603,7 +642,12 @@ class DingTalkChannel(BaseChannel):
             channel_id=self.channel_id,
             channel_type=self.channel_type,
             tenant_id=self._tenant_id,
-            channel_subject=ChannelSubject(subject_id=sender_id, metadata=metadata),
+            channel_subject=ChannelSubject(
+                subject_id=subject_id,
+                display_name="" if is_group else sender_nick,
+                chat_type="group" if is_group else "direct",
+                metadata=metadata,
+            ),
             channel_session_id=session_id,
             content=parts,
             metadata=metadata,
@@ -782,6 +826,29 @@ class _DingTalkMessageHandler(_ChatbotHandlerBase):  # type: ignore[misc]
 # =============================================================================
 # Module-level helpers
 # =============================================================================
+
+
+def _is_group_subject(subject: ChannelSubject) -> bool:
+    """Return whether *subject* addresses a group conversation.
+
+    Requires a conversation id: a group without one falls back to the sender
+    in ``parse_inbound``, and a staffId is not a valid ``openConversationId``.
+    """
+    meta = subject.metadata or {}
+    if not meta.get("conversation_id"):
+        return False
+    if meta.get("is_group") is not None:
+        return bool(meta.get("is_group"))
+    if str(meta.get("conversation_type", "")) == "2":
+        return True
+    return subject.chat_type == "group"
+
+
+def _text_message(text: str) -> tuple[str, dict[str, str]]:
+    """Pick the DingTalk msgKey/msgParam pair for a text reply."""
+    if len(text) > 3500:
+        return "sampleText", {"content": text}
+    return "sampleMarkdown", {"title": "Octop", "text": text}
 
 
 def _extension_for_type(media_type: str) -> str:
