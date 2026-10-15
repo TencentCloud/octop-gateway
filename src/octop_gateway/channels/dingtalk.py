@@ -12,12 +12,13 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Self
 
 import aiohttp
 
 from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor
+from octop_gateway.group_context import GroupContextConfig
 from octop_gateway.models import (
     AudioContent,
     ChannelSubject,
@@ -53,11 +54,28 @@ class DingTalkConfig(ChannelConfig):
     app_key: str = ""
     app_secret: str = ""
     robot_code: str = ""
+    group_context: GroupContextConfig = field(
+        default_factory=lambda: GroupContextConfig(
+            enabled=True,
+            visibility="auto",
+            activation="mention",
+            history="recent",
+            history_limit=10,
+        )
+    )
 
     @property
     def effective_robot_code(self) -> str:
         """Return robot_code if set, otherwise fall back to app_key."""
         return self.robot_code or self.app_key
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        config = super().from_dict(data)
+        raw_group_context = data.get("group_context")
+        if isinstance(raw_group_context, dict) and "enabled" not in raw_group_context:
+            config.group_context.enabled = True
+        return config
 
 
 DingTalkConfig.field_aliases = {"client_id": "app_key", "client_secret": "app_secret"}  # type: ignore[attr-defined]
@@ -619,7 +637,6 @@ class DingTalkChannel(BaseChannel):
         # Build metadata for routing
         metadata: dict[str, Any] = {
             "msg_id": msg_id,
-            "conversation_id": conversation_id,
             "conversation_type": conversation_type,
             "chat_type": "group" if is_group else "dm",
             "is_group": is_group,
@@ -630,8 +647,12 @@ class DingTalkChannel(BaseChannel):
             "to_handle": subject_id,
         }
         if is_group:
-            # Stream chatbots only receive group messages that @ the bot.
-            metadata["bot_mentioned"] = True
+            # GroupContextManager keys passive context on the conversation id.
+            # Only groups carry it: a DM that did would be read as a group
+            # thread and dropped whenever it is not marked as a mention.
+            if conversation_id:
+                metadata["conversation_id"] = conversation_id
+            metadata["bot_mentioned"] = _is_bot_mentioned(raw_payload)
 
         # Include webhook URL for reply-mode sending
         webhook_url = raw_payload.get("webhook_url", "")
@@ -797,6 +818,7 @@ class _DingTalkMessageHandler(_ChatbotHandlerBase):  # type: ignore[misc]
                 "conversation_id": data.get("conversationId", ""),
                 "conversation_type": data.get("conversationType", "1"),
                 "msg_id": data.get("msgId", ""),
+                "is_in_at_list": data.get("isInAtList"),
                 "msgtype": data.get("msgtype", "text"),
                 "text": data.get("text", {}),
                 "content": data.get("content", {}),
@@ -842,6 +864,19 @@ def _is_group_subject(subject: ChannelSubject) -> bool:
     if str(meta.get("conversation_type", "")) == "2":
         return True
     return subject.chat_type == "group"
+
+
+def _is_bot_mentioned(raw_payload: dict[str, Any]) -> bool:
+    """Return whether the bot was addressed by a group message.
+
+    ``isInAtList`` is DingTalk's own answer and is preferred when present.
+    Stream chatbots only receive group messages that address them, so a payload
+    without the marker still counts as addressed.
+    """
+    is_in_at_list = raw_payload.get("is_in_at_list")
+    if is_in_at_list is not None:
+        return bool(is_in_at_list)
+    return True
 
 
 def _text_message(text: str) -> tuple[str, dict[str, str]]:
