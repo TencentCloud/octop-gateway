@@ -87,3 +87,78 @@ class TestStableMarkdownPrefix:
             seen = prefix
         assert seen.startswith("## 五\n\n| 能力 | 说明 |\n| --- | --- |\n| 意图路由 | 一 |\n")
         assert "| 问答" not in seen
+
+
+class TestPartialParagraphStreaming:
+    """Opt-in mode: an open paragraph streams instead of being held."""
+
+    def test_default_mode_is_unchanged(self) -> None:
+        text = "你好，我是助手，很高兴为你服务。"
+        assert stable_markdown_prefix(text) == ""
+        assert stable_markdown_prefix(text, include_partial_paragraph=False) == ""
+
+    def test_single_line_reply_streams(self) -> None:
+        text = "你好，我是助手，很高兴为你服务。"
+        assert stable_markdown_prefix(text, include_partial_paragraph=True) == text
+
+    def test_single_line_grows_monotonically(self) -> None:
+        text = "你好，我是助手，很高兴为你服务。"
+        seen = ""
+        for index in range(1, len(text) + 1):
+            prefix = stable_markdown_prefix(text[:index], include_partial_paragraph=True)
+            assert prefix.startswith(seen), f"prefix shrank at {text[:index]!r}"
+            seen = prefix
+        assert seen == text
+
+    def test_open_paragraph_releases_finished_lines(self) -> None:
+        text = "第一行\n第二行还在写"
+        assert stable_markdown_prefix(text, include_partial_paragraph=True) == text
+
+    def test_final_paragraph_after_closed_block(self) -> None:
+        text = "## 标题\n\n正文还在写"
+        assert stable_markdown_prefix(text, include_partial_paragraph=True) == text
+
+    def test_block_heads_are_still_withheld(self) -> None:
+        for text in (
+            "```python\nprint(1)\n",
+            "## 一、通",
+            "- **写作",
+            "> 引用还在",
+            "| 能力 |",
+            "    缩进代码",
+        ):
+            assert stable_markdown_prefix(text, include_partial_paragraph=True) == "", text
+
+    def test_growing_table_releases_row_by_row_monotonically(self) -> None:
+        chunks = [
+            "你好|",
+            "你好|\n---|",
+            "你好|\n---|\n| 1",
+            "你好|\n---|\n| 1 |\n",
+        ]
+        seen = ""
+        for chunk in chunks:
+            prefix = stable_markdown_prefix(chunk, include_partial_paragraph=True)
+            assert prefix.startswith(seen), f"{chunk!r} shrank the prefix"
+            seen = prefix
+        assert seen == "你好|\n---|\n| 1 |\n"
+
+    def test_prose_never_shrinks_when_a_pipe_appears(self) -> None:
+        chunks = [
+            "你好",
+            "你好，我是",
+            "你好，我是助手",
+            "你好，我是助手 |",
+            "你好，我是助手 | 后面还有",
+            "你好，我是助手 | 后面还有\n换行了",
+        ]
+        seen = ""
+        for chunk in chunks:
+            prefix = stable_markdown_prefix(chunk, include_partial_paragraph=True)
+            assert prefix.startswith(seen), f"{chunk!r} shrank the prefix"
+            seen = prefix
+        assert seen == chunks[-1]
+
+    def test_closed_table_is_released_in_full(self) -> None:
+        text = "| a | b |\n| --- | --- |\n| 1 | 2 |\n"
+        assert stable_markdown_prefix(text, include_partial_paragraph=True) == text
