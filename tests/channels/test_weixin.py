@@ -12,6 +12,7 @@ No network calls — aiohttp.ClientSession is mocked where needed.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -23,6 +24,8 @@ from octop_gateway.channels.weixin import (
     WeixinChannel,
     WeixinConfig,
 )
+from octop_gateway.channels.weixin.channel import _WeixinTurn
+from octop_gateway.channels.weixin.text import split_weixin_text
 from octop_gateway.channels.weixin.types import SendMessageResponse, WeixinAPIError
 from octop_gateway.media import FileSystemMediaBackend
 from octop_gateway.models import (
@@ -32,6 +35,7 @@ from octop_gateway.models import (
     MessageEvent,
     TextContent,
 )
+from octop_gateway.push_routing import WEIXIN_CONTEXT_TOKEN_KEY
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -86,7 +90,7 @@ class TestWeixinChannelUnit:
 
         custom = ChannelConstraints(reply_timeout=15.0)
         ch = WeixinChannel(processor=_noop_processor, config=_make_config(), constraints=custom)
-        assert ch._constraints.reply_timeout == 15.0
+        assert ch._constraints.reply_timeout == 0
 
     def test_resolve_push_subject_enriches_sparse_metadata(self) -> None:
         ch = WeixinChannel(processor=_noop_processor, config=_make_config())
@@ -196,8 +200,8 @@ class TestWeixinChannelUnit:
     def test_default_constraints(self) -> None:
         ch = WeixinChannel(processor=_noop_processor, config=_make_config())
         defaults = ch._default_constraints()
-        assert defaults.reply_timeout == 5.0
-        assert defaults.timeout_strategy == "placeholder"
+        assert defaults.reply_timeout == 0
+        assert defaults.timeout_strategy == "none"
         assert defaults.show_thinking is False
 
     @pytest.mark.asyncio
@@ -417,3 +421,122 @@ class TestWeixinChannelUnit:
         body = json.loads(mock_session.post.call_args.kwargs["data"])
         assert body["longpolling_timeout_ms"] == 35000
         assert body["get_updates_buf"] == "cursor0"
+
+
+def test_split_weixin_text_prefers_a_line_break() -> None:
+    first = "a" * 10
+    second = "b" * 10
+    parts = split_weixin_text(f"{first}\n{second}", limit=12)
+    assert parts == [first, second]
+
+
+def _subject() -> ChannelSubject:
+    return ChannelSubject(
+        subject_id="wx_target_user",
+        metadata={"account_id": "acc_001", "from_user_id": "wx_target_user"},
+    )
+
+
+def _api(ch: WeixinChannel) -> AsyncMock:
+    send = AsyncMock(return_value=SendMessageResponse(ret=0, message_id=1))
+    ch._api = AsyncMock(return_value=SimpleNamespace(send_message=send))  # type: ignore[method-assign]
+    return send
+
+
+@pytest.mark.asyncio
+async def test_send_uses_durable_context_token_when_ephemeral_is_stripped() -> None:
+    ch = WeixinChannel(processor=_noop_processor, config=_make_config())
+    send = _api(ch)
+    await ch._send_text(
+        ChannelSubject(
+            subject_id="wx_target_user",
+            metadata={
+                "account_id": "acc_001",
+                "from_user_id": "wx_target_user",
+                WEIXIN_CONTEXT_TOKEN_KEY: "ctx_saved",
+            },
+        ),
+        "cron ping",
+    )
+    assert send.await_args.kwargs["context_token"] == "ctx_saved"
+
+
+@pytest.mark.asyncio
+async def test_long_text_is_split_across_sends() -> None:
+    ch = WeixinChannel(processor=_noop_processor, config=_make_config())
+    send = _api(ch)
+    await ch._send_text(_subject(), ("字" * 10) + "\n" + ("字" * 10))
+    with patch("octop_gateway.channels.weixin.channel.split_weixin_text", return_value=["甲", "乙"]):
+        await ch._send_text(_subject(), "ignored")
+    texts = [call.kwargs["text"] for call in send.await_args_list]
+    assert texts[-2:] == ["甲", "乙"]
+
+
+@pytest.mark.asyncio
+async def test_failed_thinking_light_placeholder_stays_before_the_answer() -> None:
+    async def processor(_msg: InboundMessage):
+        await asyncio.sleep(0.05)
+        yield MessageEvent.delta("答案")
+        yield MessageEvent.completed()
+
+    ch = WeixinChannel(processor=processor, config=_make_config())
+    send = _api(ch)
+    ch._typing_once = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    with patch("octop_gateway.channels.weixin.channel._PLACEHOLDER_WAIT_S", 0.01):
+        await ch._process_inbound(
+            InboundMessage(
+                channel_id="weixin",
+                channel_type="weixin",
+                channel_subject=_subject(),
+                content=[TextContent(text="hi")],
+            ),
+            _subject(),
+        )
+
+    texts = [call.kwargs["text"] for call in send.await_args_list]
+    assert texts[0] == "⏳ 思考中..."
+    assert texts[-1] == "答案"
+    assert texts.index("答案") > texts.index("⏳ 思考中...")
+
+
+@pytest.mark.asyncio
+async def test_fast_answer_is_not_followed_by_placeholder() -> None:
+    async def processor(_msg: InboundMessage):
+        yield MessageEvent.delta("答案")
+        yield MessageEvent.completed()
+
+    ch = WeixinChannel(processor=processor, config=_make_config())
+    send = _api(ch)
+    ch._typing_once = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    with patch("octop_gateway.channels.weixin.channel._PLACEHOLDER_WAIT_S", 5):
+        await ch._process_inbound(
+            InboundMessage(
+                channel_id="weixin",
+                channel_type="weixin",
+                channel_subject=_subject(),
+                content=[TextContent(text="hi")],
+            ),
+            _subject(),
+        )
+
+    texts = [call.kwargs["text"] for call in send.await_args_list]
+    assert texts == ["答案"]
+
+
+@pytest.mark.asyncio
+async def test_typing_start_is_not_sent_after_the_turn_stops() -> None:
+    ch = WeixinChannel(processor=_noop_processor, config=_make_config())
+    turn = _WeixinTurn()
+    turn.stop.set()
+    send_typing = AsyncMock()
+    ch._api = AsyncMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            get_config=AsyncMock(return_value=SimpleNamespace(typing_ticket="tkt")),
+            send_typing=send_typing,
+        )
+    )
+    ok = await ch._typing_once(_subject(), status=1, turn=turn)
+    assert ok is False
+    send_typing.assert_not_awaited()

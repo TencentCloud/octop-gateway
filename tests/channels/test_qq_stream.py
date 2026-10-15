@@ -353,8 +353,8 @@ class TestQQChannelStream:
             for p in _stream_posts(http)
             if p["json"].get("input_state") == STREAM_GENERATING
         ]
-        assert generating[0].startswith("\n")
-        assert _stream_texts(http)[-1].startswith("\n")
+        assert generating
+        assert all(frame.strip() for frame in generating)
         assert _stream_texts(http)[-1].strip() == "Hello"
         assert _stream_posts(http)[-1]["json"]["input_state"] == STREAM_DONE
         assert {p["json"]["content_type"] for p in _stream_posts(http)} == {"markdown"}
@@ -394,8 +394,8 @@ class TestQQChannelStream:
         await asyncio.wait_for(started.wait(), timeout=1.0)
         release_hold.set()
         await task
-        assert _stream_texts(http)[-1].startswith("\n")
         assert _stream_texts(http)[-1].strip() == "Hello"
+        assert all(text.strip() for text in _stream_texts(http))
 
     @pytest.mark.asyncio
     async def test_group_does_not_use_stream_messages(self) -> None:
@@ -484,7 +484,8 @@ class TestQQChannelStream:
         ch._send_text = capture  # type: ignore[method-assign]
         await ch.handle_inbound(_c2c_payload())
         assert sent == ["Hello"]
-        assert any(str(p["json"].get("content_raw") or "") == "\n" for p in _stream_posts(http))
+        assert _stream_posts(http)
+        assert all(str(p["json"].get("content_raw") or "").strip() for p in _stream_posts(http))
 
     @pytest.mark.asyncio
     async def test_one_rate_slot_for_the_text_stream(self) -> None:
@@ -547,14 +548,14 @@ class TestQQChannelStream:
         ch = QQChannel(processor=processor, config=_config())
         http = _wire_http(ch)
         await ch.handle_inbound(_c2c_payload())
-        assert _stream_texts(http)[0].startswith("\n")
-        assert _stream_texts(http)[-1].startswith("\n")
+        assert _stream_texts(http)
+        assert all(text.strip() for text in _stream_texts(http))
         assert _stream_texts(http)[-1].strip() == "下面是新闻"
         assert all("Let me search" not in text for text in _stream_texts(http))
         assert not _static_texts(http)
 
     @pytest.mark.asyncio
-    async def test_hold_keepalive_reoffers_empty_prefix(self) -> None:
+    async def test_wait_shows_typing_instead_of_a_blank_bubble(self) -> None:
         async def processor(_msg: InboundMessage):
             await asyncio.sleep(0.12)
             yield MessageEvent.delta("下面是新闻")
@@ -563,14 +564,9 @@ class TestQQChannelStream:
         ch = QQChannel(processor=processor, config=_config(stream_hold_keepalive_s=0.04))
         http = _wire_http(ch)
         await ch.handle_inbound(_c2c_payload())
-        generating = [
-            str(p["json"].get("content_raw") or "")
-            for p in _stream_posts(http)
-            if p["json"].get("input_state") == STREAM_GENERATING
-        ]
-        assert generating[0].startswith("\n")
-        assert generating.count("\n") >= 2
-        assert _stream_texts(http)[-1].startswith("\n")
+        typing = [p for p in http.posts if (p.get("json") or {}).get("msg_type") == 6]
+        assert len(typing) >= 2
+        assert all(str(p["json"].get("content_raw") or "").strip() for p in _stream_posts(http))
         assert _stream_texts(http)[-1].strip() == "下面是新闻"
 
     @pytest.mark.asyncio
@@ -597,7 +593,8 @@ class TestQQChannelStream:
             if p["json"].get("input_state") == STREAM_GENERATING
         ]
         visible = [frame for frame in generating if frame.strip()]
-        assert generating[0].startswith("\n")
+        assert generating
+        assert all(frame.strip() for frame in generating)
         assert visible
         assert visible[0].strip() == "## 五"
         assert all("| 能力 |" not in frame or "| 意图路由 |" in frame for frame in generating)
@@ -613,6 +610,84 @@ class TestQQChannelStream:
         ch = QQChannel(processor=processor, config=_config())
         http = _wire_http(ch)
         await ch.handle_inbound(_c2c_payload())
-        assert _stream_texts(http)[-1].startswith("\n")
+        assert all(text.strip() for text in _stream_texts(http))
         assert _stream_texts(http)[-1].strip() == "下面是新闻"
         assert all("内部推理" not in text for text in _stream_texts(http))
+
+
+class TestStreamDoesNotRepeat:
+    @pytest.mark.asyncio
+    async def test_identical_prefix_is_replaced_not_repeated(self) -> None:
+        """A stable table prefix must not be posted again on every token."""
+
+        async def processor(_msg: InboundMessage):
+            yield MessageEvent.delta("导语。\n\n| 指数 | 收盘 |\n| --- | --- |\n| 上证 | 3888 |\n")
+            for _ in range(30):
+                yield MessageEvent.delta("深")
+                await asyncio.sleep(0)
+            yield MessageEvent.delta("证 | 13316 |\n")
+            for _ in range(20):
+                yield MessageEvent.delta("还")
+                await asyncio.sleep(0)
+            yield MessageEvent.completed()
+
+        ch = QQChannel(processor=processor, config=_config())
+        http = _wire_http(ch)
+        await ch.handle_inbound(_c2c_payload())
+
+        generating = [
+            str(p["json"].get("content_raw") or "")
+            for p in _stream_posts(http)
+            if p["json"].get("input_state") == STREAM_GENERATING and str(p["json"].get("content_raw") or "").strip()
+        ]
+        assert len(generating) == len(set(generating))
+        assert len(generating) <= 3
+        assert sum("深证 | 13316 |" not in frame for frame in generating) == 1
+        assert any("深证 | 13316 |" in frame for frame in generating)
+        linked = [p["json"] for p in _stream_posts(http) if p["json"].get("stream_msg_id")]
+        assert linked
+        assert {body["stream_msg_id"] for body in linked} == {"stream-1"}
+        assert _stream_posts(http)[-1]["json"]["input_state"] == STREAM_DONE
+        assert not _static_texts(http)
+
+    @pytest.mark.asyncio
+    async def test_nested_stream_id_stays_on_one_chain(self) -> None:
+        ch = QQChannel(processor=_delta_processor, config=_config())
+        http = _wire_http(ch)
+        http.body = '{"code":0,"data":{"id":99}}'
+        await ch.handle_inbound(_c2c_payload())
+        assert not _static_texts(http)
+        assert _stream_texts(http)[-1].strip() == "Hello"
+        assert _stream_posts(http)[-1]["json"]["stream_msg_id"] == "99"
+
+    @pytest.mark.asyncio
+    async def test_missing_stream_id_sends_the_answer_once(self) -> None:
+        sent: list[str] = []
+
+        async def processor(_msg: InboundMessage):
+            yield MessageEvent.delta("导语。\n\n| 指数 | 收盘 |\n| --- | --- |\n| 上证 | 3888 |\n")
+            for _ in range(25):
+                yield MessageEvent.delta("深证还在写")
+                await asyncio.sleep(0)
+            yield MessageEvent.completed()
+
+        ch = QQChannel(processor=processor, config=_config())
+        http = _wire_http(ch)
+        http.body = '{"code":0}'
+
+        async def capture(_subject: ChannelSubject, text: str) -> None:
+            sent.append(text)
+
+        ch._send_text = capture  # type: ignore[method-assign]
+        await ch.handle_inbound(_c2c_payload())
+
+        visible = [
+            str(p["json"].get("content_raw") or "")
+            for p in _stream_posts(http)
+            if str(p["json"].get("content_raw") or "").strip()
+        ]
+        assert len(visible) == 1
+        assert "上证 | 3888 |" in visible[0]
+        assert "深证还在写" not in visible[0]
+        assert all(p["json"].get("input_state") != STREAM_DONE for p in _stream_posts(http))
+        assert sent == ["导语。\n\n| 指数 | 收盘 |\n| --- | --- |\n| 上证 | 3888 |\n" + "深证还在写" * 25]
