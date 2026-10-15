@@ -312,3 +312,75 @@ Thanks to all contributors:
 <a href="https://github.com/TencentCloud/octop-gateway/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=TencentCloud/octop-gateway" />
 </a>
+
+
+## Telegram configuration and safe upgrades
+
+`TelegramConfig` accepts the following exact adapter fields (Python names, also
+accepted by `from_dict`). Boolean options use booleans, not environment strings.
+
+| Field | Default | Behavior |
+|---|---|---|
+| `bot_token` | `""` | Required BotFather credential. |
+| `http_proxy` | `""` | Proxy for Bot API and polling. |
+| `show_typing` | `True` | Typing keepalive every four seconds. |
+| `group_activation` | `"always"` | `always`, `mention`, or `mention_or_reply`. |
+| `allowed_user_ids` | `[]` | Sender allowlist; empty allows all otherwise eligible users. |
+| `allowed_chat_ids` | `[]` | Chat allowlist; negative group IDs accepted. |
+| `allow_unaddressed_commands` | `True` | Allow commands without `@botname`; commands addressed to other bots are rejected. |
+| `topic_isolation` | `False` | Separate subject per forum topic; topic routing is always preserved. |
+| `reply_to_message` | `True` | Anchor replies to the source message, allowing delivery if it was deleted. |
+| `edited_messages` | `False` | Opt in to unseen non-command edits; processed sources never run twice. |
+| `streaming_mode` | `"off"` | `off`, `edit`, `draft`, `auto`; draft is attempted only in private chats with SDK support, with edit fallback after explicit rejection. |
+| `status_reactions` | `False` | Best-effort processing/success/failure reactions. |
+| `disable_notification` | `False` | Silent outbound messages. |
+| `protect_content` | `False` | Telegram content protection on sends. |
+| `link_preview` | `True` | Link previews for text. |
+| `command_menu` | `False` | Install `/help` and `/stop` menu entries at startup. |
+| `albums` | `False` | Coalesce inbound albums and batch compatible outbound media in groups of up to ten. |
+| `audio_as_voice` | `False` | Send audio as voice instead of music/audio attachments. |
+
+Inherited fields are `channel_id=None`, `tenant_id=None`,
+`group_context=GroupContextConfig()`, `show_thinking=False` and
+`show_tool_hints=True`. Standard `ChannelConstraints` overrides still apply.
+
+Upgrade behavior changes are intentional: edited messages are now disabled by
+default as a security-safe choice. Previously unseen edits can initiate processing
+only after explicitly enabling `edited_messages=True`; edited commands remain
+rejected. Replies now default to `reply_to_message=True`; set it to `False` for
+unanchored replies. Start upgrades with streaming and albums disabled, validate
+allowlists and group activation, then enable optional features as needed. Bot API
+privacy mode still controls which group messages Telegram exposes to the bot.
+
+Text uses escaped Telegram HTML and UTF-16-aware chunking. Pending deltas are
+replaced by an authoritative textual MESSAGE final, even when revised; attachments
+remain deliverable. FLUSH commits a segment, so a later MESSAGE starts a new one.
+Preview drafts are cleared and edit previews finalized on completion. Ambiguous
+network failures are never automatically resent; only explicit 429 rejections
+receive bounded retries (three total attempts, at most 30 seconds per delay).
+
+Each SDK delivery attempt, including previews, buttons, chunks, album requests,
+retries and cleanup, uses an independent per-channel bot/chat scheduler (30
+requests/second bot-wide, one/second per chat, at most 1000 chat reservations).
+This does not acquire another BaseChannel logical-message rate slot. A full table
+waits for a reservation to expire. Run one polling instance per bot token; separate
+instances do not share request limits. Polling and SDK initialization retain SDK
+transport behavior. Telegram may impose additional limits, reported through 429.
+
+Inbound albums use a fixed 350 ms collection window from the first member, with
+at most 100 pending album tasks and ten buffered members per album. Excess members
+are dropped with a warning. Once the window closes, a late unseen member opens a
+new window and may produce a separate turn; duplicate source IDs remain ignored
+within the bounded dedup cache. Admission is checked before buffering and for every
+member, with chat, topic and sender isolated. Pending album tasks are cancelled on
+shutdown. Deduplication and callback capabilities are in-memory and reset on restart.
+
+Native buttons are exposed through `send_buttons(subject, text, actions, ttl=300)`
+and `register_callback(subject, action, ttl=300)` for the existing Octop bridge's
+model/agent menus, approvals, and cancellation. The host must authorize each action
+before registering it. Opaque, single-use callbacks bind user, chat and topic,
+expire after their TTL, and retain at most 1000 entries; Telegram admin identity
+does not grant application permissions. `/help` and `/stop` work without menu
+installation. Media references remain credential-free; cloud downloads are limited
+to 20 MB and local uploads to 50 MB. SDK errors are redacted without suppressing
+cancellation or changing error types.
