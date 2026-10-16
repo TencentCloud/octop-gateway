@@ -45,7 +45,7 @@ from octop_gateway.models import (
     VideoContent,
 )
 from octop_gateway.push_routing import strip_ephemeral_push_meta
-from octop_gateway.utils import Debouncer, extract_media, extract_text, merge_messages
+from octop_gateway.utils import Debouncer, close_event_stream, extract_media, extract_text, merge_messages
 
 logger = logging.getLogger(__name__)
 
@@ -827,8 +827,10 @@ class BaseChannel(ABC):
             typing_keepalive.start()
 
         processing_succeeded = False
+        events: AsyncIterator[MessageEvent] | None = None
         try:
-            async for event in self._processor(message):
+            events = self._processor(message)
+            async for event in events:
                 if event.type == MessageEventType.DELTA:
                     # Accumulate delta text
                     for part in event.content:
@@ -888,8 +890,14 @@ class BaseChannel(ABC):
                         await self._rate_limited_send(subject, full_text)
                     # Send complete message immediately
                     await self._deliver_event(subject, event)
+                elif event.type == MessageEventType.ERROR:
+                    if delta_buffer:
+                        await self._rate_limited_send(subject, "".join(delta_buffer))
+                        delta_buffer.clear()
+                    await self._deliver_event(subject, event)
+                    break
                 else:
-                    # TYPING, TOOL_START, TOOL_END, ERROR
+                    # TYPING, TOOL_START, TOOL_END
                     await self._deliver_event(subject, event)
         except Exception:  # pylint: disable=broad-except
             # The processor is host-provided; one failed message must not stop the worker.
@@ -914,6 +922,8 @@ class BaseChannel(ABC):
                 timeout_guard.cancel()
             if typing_keepalive:
                 typing_keepalive.stop()
+            if events is not None:
+                await close_event_stream(events)
         return processing_succeeded
 
     async def _rate_limited_send(self, subject: ChannelSubject, text: str) -> None:

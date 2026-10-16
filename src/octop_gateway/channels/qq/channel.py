@@ -43,7 +43,7 @@ from octop_gateway.models import (
     TextContent,
     VideoContent,
 )
-from octop_gateway.utils import extract_media, extract_text
+from octop_gateway.utils import close_event_stream, extract_media, extract_text
 
 logger = logging.getLogger(__name__)
 
@@ -737,8 +737,10 @@ class QQChannel(BaseChannel):
             if text:
                 await _deliver_static(text)
 
+        events = None
         try:
-            async for event in self._processor(message):
+            events = self._processor(message)
+            async for event in events:
                 if event.type == MessageEventType.DELTA:
                     await _flush_thinking()
                     for part in event.content:
@@ -839,6 +841,8 @@ class QQChannel(BaseChannel):
             if not session.closing:
                 with contextlib.suppress(Exception):
                     await session.finish(session.last_accepted, discard_pending=True)
+            if events is not None:
+                await close_event_stream(events)
 
     @staticmethod
     def _extract_stream_id(payload: dict[str, Any]) -> str | None:
