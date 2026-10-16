@@ -330,7 +330,7 @@ accepted by `from_dict`). Boolean options use booleans, not environment strings.
 | `allow_unaddressed_commands` | `True` | Allow commands without `@botname`; commands addressed to other bots are rejected. |
 | `topic_isolation` | `False` | Separate subject per forum topic; topic routing is always preserved. |
 | `reply_to_message` | `True` | Anchor replies to the source message, allowing delivery if it was deleted. |
-| `edited_messages` | `False` | Opt in to unseen non-command edits; processed sources never run twice. |
+| `edited_messages` | `False` | Opt in to unseen non-command edits; suppress processed sources within the bounded message-ID cache. |
 | `streaming_mode` | `"off"` | `off`, `edit`, `draft`, `auto`; draft is attempted only in private chats with SDK support, with edit fallback after explicit rejection. |
 | `status_reactions` | `False` | Best-effort processing/success/failure reactions. |
 | `disable_notification` | `False` | Silent outbound messages. |
@@ -367,18 +367,29 @@ waits for a reservation to expire. Run one polling instance per bot token; separ
 instances do not share request limits. Polling and SDK initialization retain SDK
 transport behavior. Telegram may impose additional limits, reported through 429.
 
-Inbound albums use a fixed 350 ms collection window from the first member, with
-at most 100 pending album tasks and ten buffered members per album. Excess members
+Inbound albums use a fixed 350 ms collection window from the first buffered member,
+with at most 100 activated album tasks and ten members per album. Unactivated
+albums use a separate FIFO buffer of at most 100 albums and ten members each,
+without creating tasks. Expired passive entries are pruned on subsequent album
+arrivals; activation promotes retained members without extending their window. Excess members
 are dropped with a warning. Once the window closes, a late unseen member opens a
 new window and may produce a separate turn; duplicate source IDs remain ignored
 within the bounded dedup cache. Admission is checked before buffering and for every
 member, with chat, topic and sender isolated. Pending album tasks are cancelled on
-shutdown. Deduplication and callback capabilities are in-memory and reset on restart.
+shutdown. Update-ID and message-ID suppression use independent FIFO caches of
+1000 entries each; update churn cannot evict message IDs. A source can run again
+after its message ID is evicted. Deduplication and callback capabilities are
+in-memory and reset on restart. Upload retries preserve PTB cached bytes and
+rewind retained handles, including album media and thumbnails; unrecoverable
+handles prevent retries after an explicit 429.
 
 Native buttons are exposed through `send_buttons(subject, text, actions, ttl=300)`
 and `register_callback(subject, action, ttl=300)` for the existing Octop bridge's
 model/agent menus, approvals, and cancellation. The host must authorize each action
-before registering it. Opaque, single-use callbacks bind user, chat and topic,
+before registering it. Actions execute inline in the serial SDK handler and must
+return after short state changes or enqueueing normal inbound work with
+`channel.enqueue(native_payload)`. Awaiting an entire agent turn blocks later
+updates, including Stop; hosts must not do this. Opaque, single-use callbacks bind user, chat and topic,
 expire after their TTL, and retain at most 1000 entries; Telegram admin identity
 does not grant application permissions. `/help` and `/stop` work without menu
 installation. Media references remain credential-free; cloud downloads are limited

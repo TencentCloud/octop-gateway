@@ -127,7 +127,9 @@ class TelegramChannel(BaseChannel):
         )
         self._bot_id: int | None = None
         self._bot_username: str | None = None
-        self._seen: OrderedDict[str, None] = OrderedDict()
+        self._seen_updates: OrderedDict[str, None] = OrderedDict()
+        self._seen_messages: OrderedDict[str, None] = OrderedDict()
+        self._passive_albums: OrderedDict[tuple[str, str, str, str], tuple[float, list[Any]]] = OrderedDict()
         self._files: OrderedDict[str, tuple[str, str]] = OrderedDict()
         self._albums: dict[tuple[str, str, str, str], list[Any]] = {}
         self._album_tasks: set[asyncio.Task[None]] = set()
@@ -212,7 +214,9 @@ class TelegramChannel(BaseChannel):
         await asyncio.gather(*self._album_tasks, *self._active.values(), return_exceptions=True)
         self._albums.clear()
         self._files.clear()
-        self._seen.clear()
+        self._seen_updates.clear()
+        self._seen_messages.clear()
+        self._passive_albums.clear()
         self.interactions.pending.clear()
         if self._app:
             if self._app.updater and self._app.updater.running:
@@ -224,11 +228,13 @@ class TelegramChannel(BaseChannel):
         logger.info("TelegramChannel stopped")
 
     def _is_duplicate(self, key: str) -> bool:
-        if key in self._seen:
+        # Independent FIFO windows: update churn cannot evict source IDs.
+        seen = self._seen_messages if key.startswith("message:") else self._seen_updates
+        if key in seen:
             return True
-        self._seen[key] = None
-        while len(self._seen) > 1000:
-            self._seen.popitem(last=False)
+        seen[key] = None
+        while len(seen) > 1000:
+            seen.popitem(last=False)
         return False
 
     def _is_allowed_sender(self, message: Any) -> bool:
@@ -261,11 +267,11 @@ class TelegramChannel(BaseChannel):
         if not message:
             return
         if getattr(update, "edited_message", None):
-            # Edits of a processed source never execute a second turn. Commands on
-            # previously unseen edited messages are rejected too.
+            # Suppress edits while the source ID remains in its bounded cache.
+            # Commands on previously unseen edited messages are rejected too.
             if not self._config.edited_messages or (message.text or message.caption or "").lstrip().startswith("/"):
                 return
-            if f"message:{message.chat.id}:{message.message_id}" in self._seen:
+            if f"message:{message.chat.id}:{message.message_id}" in self._seen_messages:
                 return
         group = getattr(message, "media_group_id", None)
         if group and self._config.albums:
@@ -288,12 +294,26 @@ class TelegramChannel(BaseChannel):
                     message.sender_chat.id if message.sender_chat else message.from_user.id if message.from_user else ""
                 ),
             )
+            now = time.monotonic()
+            while self._passive_albums and next(iter(self._passive_albums.values()))[0] <= now:
+                self._passive_albums.popitem(last=False)
             if key not in self._albums:
+                if not self._accept(message):
+                    if key not in self._passive_albums:
+                        self._passive_albums[key] = (now + 0.35, [])
+                        while len(self._passive_albums) > 100:
+                            self._passive_albums.popitem(last=False)
+                    buffered = self._passive_albums[key][1]
+                    if len(buffered) < 10:
+                        buffered.append(message)
+                    return
                 if len(self._album_tasks) >= 100:
                     logger.warning("Telegram pending album limit reached; dropping member")
                     return
-                self._albums[key] = []
-                task = asyncio.create_task(self._flush_album(key))
+                expires, buffered = self._passive_albums.pop(key, (now + 0.35, []))
+                # Keep room for the activating caption even at the member cap.
+                self._albums[key] = buffered[:9]
+                task = asyncio.create_task(self._flush_album(key, delay=max(0, expires - now)))
                 self._album_tasks.add(task)
                 task.add_done_callback(self._album_tasks.discard)
             if len(self._albums[key]) < 10:
@@ -319,8 +339,8 @@ class TelegramChannel(BaseChannel):
                 return
             self.enqueue(native)
 
-    async def _flush_album(self, key: tuple[str, str, str, str]) -> None:
-        await asyncio.sleep(0.35)
+    async def _flush_album(self, key: tuple[str, str, str, str], *, delay: float = 0.35) -> None:
+        await asyncio.sleep(delay)
         messages = sorted(self._albums.pop(key, []), key=lambda item: item.message_id)
         if not any(self._accept(item) for item in messages):
             return
@@ -692,6 +712,9 @@ class TelegramChannel(BaseChannel):
 
         The host must enforce its own application permissions before registering
         an action. Telegram identity or administrator status grants no privilege.
+        Actions run inline in the serial SDK update handler: apply short state
+        changes or enqueue work and return. Never await a whole agent turn here;
+        use enqueue() so later updates, including Stop, remain responsive.
         """
         return self.interactions.register(
             str(subject.metadata.get("user_id", "")),

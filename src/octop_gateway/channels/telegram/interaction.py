@@ -29,7 +29,7 @@ class Interactions:
     def register(
         self, user: str, chat: str, topic: int | None, action: Callable[[], Awaitable[None]], *, ttl: float = 300
     ) -> str:
-        """Register a host-authorized option, confirmation, or cancellation."""
+        """Register a short host action; long work must be queued by the host."""
         token = secrets.token_urlsafe(18)
         self.pending[token] = Callback(user, chat, topic, time.monotonic() + ttl, action)
         while len(self.pending) > 1000:

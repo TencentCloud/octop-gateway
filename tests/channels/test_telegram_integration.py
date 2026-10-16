@@ -122,7 +122,30 @@ async def test_dedup_edits_and_bounded_cache():
     assert ch.enqueue.call_args.args[0]["edited"]
     for index in range(1500):
         ch._is_duplicate(str(index))
-    assert len(ch._seen) == 1000
+    assert len(ch._seen_updates) == 1000
+    assert len(ch._seen_messages) <= 1000
+
+
+async def test_update_churn_cannot_evict_processed_message():
+    ch = channel(edited_messages=True)
+    ch.enqueue = MagicMock()
+    await ch._handle_update(Update(1, message=sdk_message()))
+    for index in range(2, 1200):
+        await ch._handle_update(Update(index))
+    await ch._handle_update(Update(1200, edited_message=sdk_message(text="changed")))
+    ch.enqueue.assert_called_once()
+
+
+async def test_message_dedup_has_independent_bounded_retention():
+    ch = channel(edited_messages=True)
+    ch.enqueue = MagicMock()
+    for index in range(1, 1002):
+        await ch._handle_update(Update(index, message=sdk_message(index)))
+    assert len(ch._seen_messages) == 1000
+    await ch._handle_update(Update(1002, edited_message=sdk_message(2, text="retained")))
+    assert ch.enqueue.call_count == 1001
+    await ch._handle_update(Update(1003, edited_message=sdk_message(1, text="evicted")))
+    assert ch.enqueue.call_count == 1002
 
 
 async def test_edits_disabled():
@@ -175,6 +198,50 @@ async def test_album_activation_and_sender_isolation():
     result = ch.enqueue.call_args.args[0]
     assert len(result["media"]) == 2
     assert result["user_id"] == "7"
+
+
+async def test_passive_albums_do_not_reserve_active_slots():
+    ch = channel(albums=True, group_activation="mention")
+    ch.enqueue = MagicMock()
+    photo = [{"file_id": "f", "file_unique_id": "u", "width": 1, "height": 1}]
+    for index in range(1, 121):
+        await ch._handle_update(
+            Update(index, message=sdk_message(index, text=None, photo=photo, media_group_id=str(index)))
+        )
+    assert not ch._album_tasks
+    assert len(ch._passive_albums) <= 100
+    await ch._handle_update(
+        Update(
+            121,
+            message=sdk_message(
+                121,
+                text=None,
+                photo=photo,
+                media_group_id="120",
+                caption="@OurBot",
+                caption_entities=[{"type": "mention", "offset": 0, "length": 7}],
+            ),
+        )
+    )
+    assert len(ch._album_tasks) == 1
+    await asyncio.gather(*ch._album_tasks)
+    ch.enqueue.assert_called_once()
+    assert len(ch.enqueue.call_args.args[0]["media"]) == 2
+
+
+async def test_passive_album_expiry_and_member_bounds():
+    ch = channel(albums=True, group_activation="mention")
+    photo = [{"file_id": "f", "file_unique_id": "u", "width": 1, "height": 1}]
+    with patch("octop_gateway.channels.telegram.channel.time.monotonic", return_value=100):
+        for index in range(1, 14):
+            await ch._handle_update(
+                Update(index, message=sdk_message(index, text=None, photo=photo, media_group_id="passive"))
+            )
+    assert max(len(items) for _, items in ch._passive_albums.values()) == 10
+    with patch("octop_gateway.channels.telegram.channel.time.monotonic", return_value=101):
+        await ch._handle_update(Update(14, message=sdk_message(14, text=None, photo=photo, media_group_id="new")))
+    assert len(ch._passive_albums) == 1
+    assert not ch._album_tasks
 
 
 async def test_topic_subject_and_reply_options():
@@ -244,6 +311,72 @@ async def test_retry_after_rewinds_upload_stream():
     with patch("octop_gateway.channels.telegram.delivery.asyncio.sleep", new_callable=AsyncMock):
         await request(send, photo=upload)
     assert received == [b"photo bytes", b"photo bytes"]
+
+
+@pytest.mark.parametrize("handles", [False, True])
+async def test_real_sdk_album_retry_preserves_multipart_bytes(handles):
+    from io import BytesIO
+
+    from telegram import Bot, InputFile, InputMediaPhoto, InputMediaVideo
+    from telegram.request import HTTPXRequest
+
+    uploads = [BytesIO(b"photo bytes"), BytesIO(b"video bytes"), BytesIO(b"thumbnail bytes")]
+    files = [InputFile(stream, read_file_handle=not handles, attach=True) for stream in uploads]
+    media = [InputMediaPhoto(files[0]), InputMediaVideo(files[1], thumbnail=files[2])]
+    received = []
+
+    async def consume(**kwargs):
+        payload = kwargs["request_data"].multipart_data
+        received.append([value.read() if hasattr(value, "read") else value for _, value, _ in payload.values()])
+        return 429, b'{"ok":false,"error_code":429,"description":"Flood","parameters":{"retry_after":1}}'
+
+    async with HTTPXRequest() as transport:
+        bot = Bot("123456:fake-token", request=transport)
+        with (
+            patch.object(transport, "do_request", side_effect=consume),
+            patch("octop_gateway.channels.telegram.delivery.asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(RetryAfter),
+        ):
+            await request(bot.send_media_group, chat_id=42, media=media)
+    assert received == [[b"photo bytes", b"video bytes", b"thumbnail bytes"]] * 3
+
+
+async def test_unrecoverable_album_handle_is_not_retried():
+    from io import BytesIO
+
+    from telegram import InputFile, InputMediaPhoto
+
+    class Unseekable(BytesIO):
+        def tell(self):
+            raise OSError("not seekable")
+
+        def seek(self, *args):
+            raise OSError("not seekable")
+
+    media = [InputMediaPhoto(InputFile(Unseekable(b"bytes"), read_file_handle=False))]
+    method = AsyncMock(side_effect=RetryAfter(0))
+    with pytest.raises(RetryAfter):
+        await request(method, media=media)
+    method.assert_awaited_once()
+
+
+async def test_handle_closed_by_first_attempt_prevents_retry():
+    from io import BytesIO
+
+    from telegram import InputFile, InputMediaPhoto
+
+    stream = BytesIO(b"photo")
+    media = [InputMediaPhoto(InputFile(stream, read_file_handle=False))]
+
+    async def consume(**_kwargs):
+        assert stream.read() == b"photo"
+        stream.close()
+        raise RetryAfter(0)
+
+    method = AsyncMock(side_effect=consume)
+    with pytest.raises(RetryAfter):
+        await request(method, media=media)
+    method.assert_awaited_once()
 
 
 async def test_outbound_album_batches_and_voice():
@@ -339,6 +472,57 @@ async def test_stop_callback_scoped_and_worker_survives():
     assert not worker.cancelled() and not ch._active and not ch.interactions.pending
     ch._original_processor = noop
     assert await ch._process_inbound(msg, msg.channel_subject)
+
+
+@pytest.mark.parametrize("stop_button", [False, True])
+async def test_queued_host_callback_returns_before_turn_and_stop_remains_responsive(stop_button):
+    entered = asyncio.Event()
+
+    async def processor(_message):
+        yield MessageEvent.delta("working")
+        entered.set()
+        await asyncio.Event().wait()
+        yield MessageEvent.completed()
+
+    ch = channel(processor, streaming_mode="edit")
+    queue = asyncio.Queue()
+    ch.set_enqueue_callback(queue.put_nowait)
+    native = {"chat_id": "42", "user_id": "7", "message_id": "1", "content": [TextContent(text="choice")]}
+
+    async def action():
+        ch.enqueue(native)
+
+    token = ch.register_callback(subject(), action)
+
+    def query_update(data):
+        return SimpleNamespace(
+            callback_query=SimpleNamespace(
+                answer=AsyncMock(),
+                data=data,
+                from_user=SimpleNamespace(id=7),
+                message=SimpleNamespace(chat=SimpleNamespace(id=42), message_thread_id=None),
+            )
+        )
+
+    update = query_update(token)
+    await asyncio.wait_for(ch._handle_callback(update), timeout=1)
+    update.callback_query.answer.assert_awaited_once()
+    assert not entered.is_set()
+    msg = ch.parse_inbound(await queue.get())
+    worker = asyncio.create_task(ch._process_inbound(msg, msg.channel_subject))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        if stop_button:
+            stop_token = next(iter(ch.interactions.pending))
+            await asyncio.wait_for(ch._handle_callback(query_update(stop_token)), timeout=1)
+        else:
+            await asyncio.wait_for(ch._handle_update(Update(2, message=sdk_message(2, private=True, text="/stop"))), 1)
+        assert await asyncio.wait_for(worker, timeout=1) is False
+        await ch._handle_callback(update)
+        assert queue.empty()
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
 
 
 async def test_external_worker_cancellation_propagates():

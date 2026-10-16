@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Telegram: isolate bounded update/message dedup caches; reserve album task slots only after activation while retaining bounded passive members; recover nested PTB upload handles for explicit 429 retries and refuse unrecoverable retries. Document short callback actions that enqueue agent work so Stop remains responsive.
+
 ## [1.0.2] - 2026-10-14
 
 ### 修复
