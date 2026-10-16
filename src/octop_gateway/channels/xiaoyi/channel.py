@@ -426,20 +426,23 @@ class XiaoyiChannel(BaseChannel):
         task_id = message.metadata.get("task_id", "")
         message_id = message.metadata.get("message_id", str(uuid.uuid4()))
         processing_succeeded = False
+        processing_failed = False
 
         try:
             async for event in self._processor(message):
                 if event.type == MessageEventType.COMPLETED:
                     await self._deliver_a2a_event(subject, event, session_id, task_id, message_id)
-                    processing_succeeded = True
+                    processing_succeeded = not processing_failed
                     break
                 await self._deliver_a2a_event(subject, event, session_id, task_id, message_id)
+                if event.type == MessageEventType.ERROR:
+                    processing_failed = True
         except Exception:  # pylint: disable=broad-except
             # The processor is host-provided; one failed turn must not break A2A delivery.
             logger.exception("Xiaoyi processing error session=%s", session_id)
             await self._send_text_chunk(session_id, task_id, message_id, "An error occurred.")
         finally:
-            await self._send_final_message(session_id, task_id, message_id)
+            await self._send_final_message(session_id, task_id, message_id, failed=not processing_succeeded)
         return processing_succeeded
 
     async def _deliver_a2a_event(
@@ -594,7 +597,9 @@ class XiaoyiChannel(BaseChannel):
         msg = self._build_artifact_msg(session_id, task_id, message_id, [artifact], final=True)
         await self._send_to_session(session_id, msg)
 
-    async def _send_final_message(self, session_id: str, task_id: str, message_id: str) -> None:
+    async def _send_final_message(
+        self, session_id: str, task_id: str, message_id: str, *, failed: bool = False
+    ) -> None:
         if not self._connected or not task_id:
             return
         status_msg = {
@@ -612,7 +617,7 @@ class XiaoyiChannel(BaseChannel):
                         "final": False,
                         "status": {
                             "message": {"role": "agent", "parts": [{"kind": "text", "text": ""}]},
-                            "state": "completed",
+                            "state": "failed" if failed else "completed",
                         },
                     },
                 }

@@ -827,6 +827,7 @@ class BaseChannel(ABC):
             typing_keepalive.start()
 
         processing_succeeded = False
+        processing_failed = False
         try:
             async for event in self._processor(message):
                 if event.type == MessageEventType.DELTA:
@@ -869,7 +870,7 @@ class BaseChannel(ABC):
                         full_text = "".join(delta_buffer)
                         delta_buffer.clear()
                         await self._rate_limited_send(subject, full_text)
-                    processing_succeeded = True
+                    processing_succeeded = not processing_failed
                     break
                 elif event.type == MessageEventType.MESSAGE:
                     # Cancel timeout guard on first real message
@@ -888,8 +889,15 @@ class BaseChannel(ABC):
                         await self._rate_limited_send(subject, full_text)
                     # Send complete message immediately
                     await self._deliver_event(subject, event)
+                elif event.type == MessageEventType.ERROR:
+                    if delta_buffer:
+                        await self._rate_limited_send(subject, "".join(delta_buffer))
+                        delta_buffer.clear()
+                    await self._deliver_event(subject, event)
+                    # Consume host cleanup before COMPLETED, but retain failure.
+                    processing_failed = True
                 else:
-                    # TYPING, TOOL_START, TOOL_END, ERROR
+                    # TYPING, TOOL_START, TOOL_END
                     await self._deliver_event(subject, event)
         except Exception:  # pylint: disable=broad-except
             # The processor is host-provided; one failed message must not stop the worker.
