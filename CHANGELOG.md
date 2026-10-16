@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 修复
+
+- QQ 私聊流式回复在工具调用前已有正文发出或正在发送时，保留该段正文作为固定前缀，避免工具调用后的回答随流式更新反复追加。
+
 ## [1.0.2] - 2026-10-14
 
 ### 修复

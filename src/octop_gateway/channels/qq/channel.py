@@ -647,6 +647,7 @@ class QQChannel(BaseChannel):
         )
         self._active_c2c_stream = session
         text_parts: list[str] = []
+        answer_prefix = ""
         thinking_parts: list[str] = []
         media_buffer: list[ContentPart] = []
         processing_succeeded = False
@@ -682,6 +683,7 @@ class QQChannel(BaseChannel):
                 text_parts.append(visible)
 
         def _locked_stream_text(text: str) -> str:
+            text = answer_prefix + text
             accepted = session._prefix_base()
             if accepted.startswith(_C2C_STREAM_HOLD) and not text.startswith(_C2C_STREAM_HOLD):
                 text = _C2C_STREAM_HOLD + text
@@ -779,6 +781,9 @@ class QQChannel(BaseChannel):
                     await _flush_thinking()
                     text_parts.clear()
                     session.discard_unsent()
+                    # QQ cannot remove accepted or in-flight narration. Freeze
+                    # that prefix once so each new answer snapshot extends it.
+                    answer_prefix = session._prefix_base()
                     if show_tool_hints:
                         hint = tool_hint_message(event.metadata, self._constraints, phase="start")
                         if hint:
