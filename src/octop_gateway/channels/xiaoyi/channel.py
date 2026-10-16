@@ -427,9 +427,10 @@ class XiaoyiChannel(BaseChannel):
         task_id = message.metadata.get("task_id", "")
         message_id = message.metadata.get("message_id", str(uuid.uuid4()))
         processing_succeeded = False
-        events = self._processor(message)
+        events = None
 
         try:
+            events = self._processor(message)
             async for event in events:
                 if event.type == MessageEventType.COMPLETED:
                     await self._deliver_a2a_event(subject, event, session_id, task_id, message_id)
@@ -446,7 +447,8 @@ class XiaoyiChannel(BaseChannel):
             try:
                 await self._send_final_message(session_id, task_id, message_id, failed=not processing_succeeded)
             finally:
-                await close_event_stream(events)
+                if events is not None:
+                    await close_event_stream(events)
         return processing_succeeded
 
     async def _deliver_a2a_event(

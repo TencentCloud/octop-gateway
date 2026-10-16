@@ -737,8 +737,9 @@ class QQChannel(BaseChannel):
             if text:
                 await _deliver_static(text)
 
-        events = self._processor(message)
+        events = None
         try:
+            events = self._processor(message)
             async for event in events:
                 if event.type == MessageEventType.DELTA:
                     await _flush_thinking()
@@ -840,7 +841,8 @@ class QQChannel(BaseChannel):
             if not session.closing:
                 with contextlib.suppress(Exception):
                     await session.finish(session.last_accepted, discard_pending=True)
-            await close_event_stream(events)
+            if events is not None:
+                await close_event_stream(events)
 
     @staticmethod
     def _extract_stream_id(payload: dict[str, Any]) -> str | None:
