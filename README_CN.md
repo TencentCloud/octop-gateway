@@ -197,6 +197,10 @@ MessageProcessor: InboundMessage → AsyncIterator[MessageEvent]
 
 每个 `BaseChannel` 管理自己的传输；管理器负责调度、媒体、约束与分发。你的处理器只看到归一化后的事件流。
 
+### 自定义通道
+
+Gateway 不会扫描或自动发现通道：内置通道是一张固定映射表，自定义通道（如 Synology Chat）由你的代码构造——继承 `BaseChannel`，把实例传给 `ChannelManager.add_channel()` 即可。最小可运行示例、方法契约，以及驱动会话与群策略的 metadata 键说明，见[自定义通道指南](docs/custom_channel.md)；规范性定义在 [AGENTS.md §8](AGENTS.md)。
+
 ### 开发
 
 **环境要求：** Python 3.12+、[uv](https://docs.astral.sh/uv/)

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 文档
+
+- 新增自定义通道指南 `docs/custom_channel.md`：说明通道不会自动扫描、如何继承 `BaseChannel` 并把实例传给 `ChannelManager.add_channel()` 注册，附 Synology Chat 风格的最小示例，以及驱动会话身份与群策略的 metadata 键约定（#27）。README / README_CN 增加「自定义通道」小节入口。
+
 ## [1.0.2] - 2026-10-14
 
 ### 修复
