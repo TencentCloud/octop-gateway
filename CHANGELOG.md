@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Telegram: isolate bounded update/message dedup caches; reserve album task slots only after activation while retaining bounded passive members; recover nested PTB upload handles for explicit 429 retries and refuse unrecoverable retries. Document short callback actions that enqueue agent work so Stop remains responsive.
+### 新增
+
+- 提供带插件所有权的动态通道注册、更新和注销接口。
+### 修复
+
+- `ERROR` 作为失败终态，不再等待后续完成事件；各通道显式关闭处理器执行清理，清理超过 5 秒取消并记录诊断，防止报错后继续挂起。
+- 通道收到错误事件后结束本轮，避免后续完成事件将失败误标为成功；小艺任务同步发送 `failed` 状态，并保留错误展示。
+- QQ 私聊流式回复在工具调用前已有正文发出或正在发送时，保留该段正文作为固定前缀，避免工具调用后的回答随流式更新反复追加。
 
 ## [1.0.2] - 2026-10-14
 
