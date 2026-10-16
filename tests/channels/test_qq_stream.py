@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from itertools import pairwise
 from typing import Any
 
 import pytest
@@ -552,6 +553,54 @@ class TestQQChannelStream:
         assert all(text.strip() for text in _stream_texts(http))
         assert _stream_texts(http)[-1].strip() == "下面是新闻"
         assert all("Let me search" not in text for text in _stream_texts(http))
+        assert not _static_texts(http)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("in_flight", [False, True], ids=["accepted", "in-flight"])
+    async def test_answer_after_visible_tool_narration_is_not_repeated(self, in_flight: bool) -> None:
+        narration = "正在开票。\n\n"
+        answer_parts = ["## 开票完成\n\n", "### 抬头 / 主体\n\n", "- 主体：测试公司\n", "- 票种：普通发票\n"]
+        narration_started = asyncio.Event()
+        release_narration = asyncio.Event()
+
+        class _NarrationResp(_FakeResp):
+            async def text(self) -> str:
+                narration_started.set()
+                if in_flight:
+                    await release_narration.wait()
+                return await super().text()
+
+        class _NarrationSession(_FakeSession):
+            def post(self, url: str, **kwargs: Any) -> _FakeResp:
+                response = super().post(url, **kwargs)
+                if (kwargs.get("json") or {}).get("content_raw") == narration:
+                    return _NarrationResp()
+                return response
+
+        async def processor(_msg: InboundMessage):
+            yield MessageEvent.delta(narration)
+            await narration_started.wait()
+            yield MessageEvent.tool_start("invoice")
+            yield MessageEvent.tool_end("invoice")
+            for part in answer_parts:
+                yield MessageEvent.delta(part)
+                await asyncio.sleep(0)
+            release_narration.set()
+            yield MessageEvent.completed()
+
+        ch = QQChannel(processor=processor, config=_config())
+        http = _NarrationSession()
+        ch._http = http  # type: ignore[assignment]
+        ch._access_token = "fake_token"
+        ch._token_expires_at = time.time() + 3600
+        ch._token_refresh_at = time.time() + 3600
+        await asyncio.wait_for(ch.handle_inbound(_c2c_payload()), timeout=1.0)
+
+        texts = _stream_texts(http)
+        assert texts[-1] == narration + "".join(answer_parts)
+        assert all(text.count("## 开票完成") <= 1 for text in texts)
+        assert all(text.count("### 抬头 / 主体") <= 1 for text in texts)
+        assert all(current.startswith(previous) for previous, current in pairwise(texts))
         assert not _static_texts(http)
 
     @pytest.mark.asyncio
