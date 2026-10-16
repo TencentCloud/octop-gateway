@@ -70,6 +70,12 @@ _AUTH_FAILED_CODE = -2
 # failing; the channel reports "disconnected" to the dashboard meanwhile.
 _SESSION_PAUSE_S = 300.0
 
+# Backoff before the single send retry on -14/-2 (see _post_text). Mirrors the
+# poll loop's exponential strategy but capped low — a user is waiting on the
+# reply, so we trade a short delay for a chance to recover a transient
+# upstream "prepare failed" instead of dropping the message.
+_SEND_RETRY_BACKOFF_S = 1.0
+
 # Typing indicator status values. status=2 clears the WeChat "thinking" light.
 _TYPING_START = 1
 _TYPING_STOP = 2
@@ -410,8 +416,26 @@ class WeixinChannel(BaseChannel):
                     exc.errcode,
                     exc.errmsg,
                 )
-                if context_token and exc.ret in (_SESSION_EXPIRED_CODE, _AUTH_FAILED_CODE):
-                    context_token = ""
+                if exc.ret in (_SESSION_EXPIRED_CODE, _AUTH_FAILED_CODE):
+                    # Retry unconditionally on -14/-2 — including when the first
+                    # attempt already carried no context_token (tool hints,
+                    # proactive pushes): "prepare failed" (-2) is often a
+                    # transient upstream condition, and one delayed retry
+                    # recovers replies that would otherwise be dropped.
+                    if context_token:
+                        logger.warning(
+                            "WeixinChannel send ret=%s for %s — retrying without context_token",
+                            exc.ret,
+                            user_id[:12],
+                        )
+                        context_token = ""
+                    else:
+                        logger.warning(
+                            "WeixinChannel send ret=%s for %s — retrying once after backoff",
+                            exc.ret,
+                            user_id[:12],
+                        )
+                    await asyncio.sleep(_SEND_RETRY_BACKOFF_S)
                     continue
                 raise
             except Exception:
