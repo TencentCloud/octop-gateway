@@ -7,15 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+## [1.0.3] - 2026-10-16
 
-- Telegram: isolate bounded update/message dedup caches; reserve album task slots only after activation while retaining bounded passive members; recover nested PTB upload handles for explicit 429 retries and refuse unrecoverable retries. Document short callback actions that enqueue agent work so Stop remains responsive.
 ### 新增
 
-- 提供带插件所有权的动态通道注册、更新和注销接口。
+- 提供带插件所有权的动态通道注册、更新和注销。宿主可通过 `register_channel_kind()` 在运行时注册自定义通道，重复注册保持首次结果。
+- Telegram 支持按会话范围激活（群聊 `always` / `mention` / `mention_or_reply`、会话白名单），以及原生交互投递（回复引用、话题隔离、流式模式、回调按钮）。
+
 ### 修复
 
-- `ERROR` 作为失败终态，不再等待后续完成事件；各通道显式关闭处理器执行清理，清理超过 5 秒取消并记录诊断，防止报错后继续挂起。
+- Telegram 入站图片在落盘前识别实际格式，并保留 JPEG 的 MIME。
+- Telegram 隔离并限制 update 与消息去重缓存；相册任务槽在激活后才占用，被动成员数量有上限；显式 429 重试能恢复嵌套上传句柄，无法恢复的重试直接拒绝。会排队 Agent 工作的短回调保持 Stop 可响应。
+- `ERROR` 作为失败终态，不再等待后续完成事件；各通道显式关闭处理器执行清理，清理超过 5 秒取消并记录诊断。Telegram 预览流停止时同时关闭宿主 processor，避免错误回合跳过清理。
 - 通道收到错误事件后结束本轮，避免后续完成事件将失败误标为成功；小艺任务同步发送 `failed` 状态，并保留错误展示。
 - QQ 私聊流式回复在工具调用前已有正文发出或正在发送时，保留该段正文作为固定前缀，避免工具调用后的回答随流式更新反复追加。
 
