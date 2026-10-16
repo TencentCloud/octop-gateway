@@ -273,6 +273,15 @@ in-memory buffer. Platforms that do not publish permission-change events cannot
 be detected perfectly, so `auto` remains mention-triggered and the TTL limits
 stale context.
 
+### Custom channels
+
+The gateway does not scan or auto-discover channels: built-ins are a fixed map,
+and custom channels (e.g. Synology Chat) are constructed by your code — subclass
+`BaseChannel` and pass the instance to `ChannelManager.add_channel()`. See the
+[custom channel guide](docs/custom_channel.md) for a minimal working example,
+the method contract, and the metadata keys that drive session and group
+behaviour. The normative specification is [AGENTS.md §8](AGENTS.md).
+
 ### Development
 
 **Prerequisites:** Python 3.12+, [uv](https://docs.astral.sh/uv/)

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 文档
+
+- 新增自定义通道指南 `docs/custom_channel.md`：说明通道不会自动扫描、如何继承 `BaseChannel` 并把实例传给 `ChannelManager.add_channel()` 注册，附 Synology Chat 风格的最小示例，以及驱动会话身份与群策略的 metadata 键约定（#27）。README / README_CN 增加「自定义通道」小节入口。
+
 ### 修复
 
 - Telegram 非论坛群里的回复线程不再被当作话题：只有 `is_topic_message` 为真时才取 `message_thread_id`。此前机器人按钮消息（对用户消息的回复）会带上线程 id，与注册时的 `None` 不一致，导致按钮点击被回调校验拒绝，且开启话题隔离时会把一次回复误当作独立话题。
