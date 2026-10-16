@@ -40,6 +40,7 @@ from octop_gateway.models import (
     TextContent,
     VideoContent,
 )
+from octop_gateway.utils import close_event_stream
 
 logger = logging.getLogger(__name__)
 
@@ -426,23 +427,26 @@ class XiaoyiChannel(BaseChannel):
         task_id = message.metadata.get("task_id", "")
         message_id = message.metadata.get("message_id", str(uuid.uuid4()))
         processing_succeeded = False
-        processing_failed = False
+        events = self._processor(message)
 
         try:
-            async for event in self._processor(message):
+            async for event in events:
                 if event.type == MessageEventType.COMPLETED:
                     await self._deliver_a2a_event(subject, event, session_id, task_id, message_id)
-                    processing_succeeded = not processing_failed
+                    processing_succeeded = True
                     break
                 await self._deliver_a2a_event(subject, event, session_id, task_id, message_id)
                 if event.type == MessageEventType.ERROR:
-                    processing_failed = True
+                    break
         except Exception:  # pylint: disable=broad-except
             # The processor is host-provided; one failed turn must not break A2A delivery.
             logger.exception("Xiaoyi processing error session=%s", session_id)
             await self._send_text_chunk(session_id, task_id, message_id, "An error occurred.")
         finally:
-            await self._send_final_message(session_id, task_id, message_id, failed=not processing_succeeded)
+            try:
+                await self._send_final_message(session_id, task_id, message_id, failed=not processing_succeeded)
+            finally:
+                await close_event_stream(events)
         return processing_succeeded
 
     async def _deliver_a2a_event(

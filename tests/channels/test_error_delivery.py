@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from octop_gateway.channels import _CLASS_NAMES, SUPPORTED_CHANNEL_KINDS, _load_channel
-from octop_gateway.constraints import ChannelConstraints
+from octop_gateway.constraints import ChannelConstraints, TypingKeepalive
 from octop_gateway.models import ChannelSubject, InboundMessage, MessageEvent, TextContent
 
 ERROR = "模型服务鉴权失败。请检查 API Key 是否正确、是否过期。"
@@ -27,17 +27,20 @@ TIMEOUT_ERROR = "请求超时，请稍后重试。"
 @pytest.mark.parametrize("kind", [*sorted(SUPPORTED_CHANNEL_KINDS), "qq-stream"])
 @pytest.mark.parametrize("partial", [False, True], ids=["before-output", "after-partial-output"])
 @pytest.mark.parametrize("mode", ["auth", "timeout"])
+@pytest.mark.parametrize("ending", ["completed", "eof", "hang", "cleanup-hang"])
 async def test_error_is_visible_terminal_and_next_turn_recovers(
-    kind: str, partial: bool, mode: str, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    kind: str, partial: bool, mode: str, ending: str, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     failed = True
     host_finalized = False
+    tail_entered = False
+    keepalives: list[TypingKeepalive] = []
     streaming = kind == "qq-stream"
     kind = kind.removesuffix("-stream")
     error = ERROR if mode == "auth" else TIMEOUT_ERROR
 
     async def processor(_message: InboundMessage) -> AsyncIterator[MessageEvent]:
-        nonlocal host_finalized
+        nonlocal host_finalized, tail_entered
         if failed:
             if partial:
                 yield MessageEvent.delta("处理到一半。\n\n")
@@ -48,9 +51,18 @@ async def test_error_is_visible_terminal_and_next_turn_recovers(
             except (PermissionError, TimeoutError):
                 # The host maps provider exceptions to ERROR then COMPLETED.
                 yield MessageEvent.error_event(error)
+                tail_entered = True
+                if ending == "hang":
+                    await asyncio.Event().wait()
             finally:
-                # Mirrors host archive/lock cleanup before its COMPLETED event.
-                host_finalized = True
+                try:
+                    if ending == "cleanup-hang":
+                        await asyncio.Event().wait()
+                finally:
+                    assert all(keepalive._task is None for keepalive in keepalives)
+                    host_finalized = True
+            if ending == "eof":
+                return
         else:
             yield MessageEvent.text("恢复成功。")
         yield MessageEvent.completed()
@@ -72,9 +84,16 @@ async def test_error_is_visible_terminal_and_next_turn_recovers(
         processor=processor,
         config=config,
         constraints=ChannelConstraints(
-            reply_timeout=0, typing_keepalive_interval=0, show_thinking=False, show_tool_hints=False
+            reply_timeout=0, typing_keepalive_interval=0.001, show_thinking=False, show_tool_hints=False
         ),
     )
+
+    def track_keepalive(**kwargs: Any) -> TypingKeepalive:
+        keepalive = TypingKeepalive(**kwargs)
+        keepalives.append(keepalive)
+        return keepalive
+
+    monkeypatch.setattr("octop_gateway.channel.TypingKeepalive", track_keepalive)
     sent = AsyncMock()
     monkeypatch.setattr(channel, "_send_text", sent)
     monkeypatch.setattr(channel, "_acquire_rate_slot", AsyncMock())
@@ -115,7 +134,8 @@ async def test_error_is_visible_terminal_and_next_turn_recovers(
         channel._connected = True
         monkeypatch.setattr(channel, "_send_to_session", a2a)
 
-    await asyncio.wait_for(channel.handle_inbound(message), timeout=3)
+    monkeypatch.setattr("octop_gateway.utils.STREAM_CLOSE_TIMEOUT", 0.02, raising=False)
+    await asyncio.wait_for(channel.handle_inbound(message), timeout=0.5)
     if kind == "wecom":
         assert ws.reply_stream.await_args.kwargs["finish"] is True
         assert ws.reply_stream.await_args.kwargs["content"] == error
@@ -128,8 +148,8 @@ async def test_error_is_visible_terminal_and_next_turn_recovers(
         assert sent.await_args.args[1] == error
     if kind != "wecom":
         assert finalized.call_args.kwargs["processing_succeeded"] is False
-    if kind != "wecom" and not streaming:
-        assert host_finalized
+    assert host_finalized
+    assert not tail_entered
     if kind == "qq":
         assert channel._active_c2c_stream is None
         if streaming:
@@ -156,6 +176,7 @@ async def test_error_is_visible_terminal_and_next_turn_recovers(
                 "streaming": streaming,
                 "partial": partial,
                 "mode": mode,
+                "ending": ending,
                 "error": error,
                 "failure_visible": True,
                 "failure_terminated": True,
