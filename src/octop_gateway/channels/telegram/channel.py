@@ -401,7 +401,7 @@ class TelegramChannel(BaseChannel):
                     }
                 )
             if attr == "photo":
-                content_parts.append(ImageContent(url=url, alt_text=filename, mime_type="image/jpeg"))
+                content_parts.append(ImageContent(url=url, alt_text=filename))
             elif attr == "video":
                 content_parts.append(VideoContent(url=url))
             elif attr in ("voice", "audio"):
@@ -441,7 +441,17 @@ class TelegramChannel(BaseChannel):
             remote = await self._app.bot.get_file(file_id)
             if getattr(remote, "file_size", 0) and remote.file_size > 20 * 1024 * 1024:
                 raise ValueError("Telegram cloud download exceeds 20 MB")
-            return bytes(await remote.download_as_bytearray()), mime
+            data = bytes(await remote.download_as_bytearray())
+            # Content signatures override missing or incorrect Telegram metadata.
+            if data.startswith(b"\xff\xd8\xff"):
+                mime = "image/jpeg"
+            elif data.startswith(b"\x89PNG\r\n\x1a\n"):
+                mime = "image/png"
+            elif data.startswith((b"GIF87a", b"GIF89a")):
+                mime = "image/gif"
+            elif len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+                mime = "image/webp"
+            return data, mime
         except TelegramError:
             # SDK exceptions can contain credential-bearing URLs.
             raise RuntimeError("Telegram media download failed") from None

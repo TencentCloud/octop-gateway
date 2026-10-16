@@ -585,15 +585,19 @@ class BaseChannel(ABC):
         if not url:
             return
 
-        filename = self._resolve_media_filename(part, index, timestamp)
-        key = f"{self.channel_type}/{self._channel_id}/{filename}"
-
         try:
             data, mime = await self.fetch_remote_media(url)
+            # Image downloaders may identify the actual format from file bytes.
+            # Resolve the storage extension only after applying that information.
+            if isinstance(part, ImageContent) and mime.startswith("image/"):
+                part.mime_type = mime
+            else:
+                part.mime_type = part.mime_type or mime
+            filename = self._resolve_media_filename(part, index, timestamp)
+            key = f"{self.channel_type}/{self._channel_id}/{filename}"
             await self._media_backend.save(data, key)
             part.local_path = key
             part.size = len(data)
-            part.mime_type = part.mime_type or mime
             logger.info(
                 "Media persisted: %s (%d bytes) -> key=%s",
                 type(part).__name__,
