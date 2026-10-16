@@ -380,7 +380,12 @@ class TelegramChannel(BaseChannel):
             url = ""
             if file_id:
                 reference = uuid.uuid4().hex
-                mime = getattr(file_obj, "mime_type", None) or "application/octet-stream"
+                # Telegram PhotoSize has no mime_type; Bot API photos are JPEG.
+                mime = (
+                    "image/jpeg"
+                    if attr == "photo"
+                    else (getattr(file_obj, "mime_type", None) or "application/octet-stream")
+                )
                 self._files[reference] = (file_id, mime)
                 while len(self._files) > 2000:
                     self._files.popitem(last=False)
@@ -396,7 +401,7 @@ class TelegramChannel(BaseChannel):
                     }
                 )
             if attr == "photo":
-                content_parts.append(ImageContent(url=url, alt_text=filename))
+                content_parts.append(ImageContent(url=url, alt_text=filename, mime_type="image/jpeg"))
             elif attr == "video":
                 content_parts.append(VideoContent(url=url))
             elif attr in ("voice", "audio"):
