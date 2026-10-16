@@ -35,6 +35,7 @@ from octop_gateway.models import (
     TextContent,
     VideoContent,
 )
+from octop_gateway.utils import close_event_stream
 
 logger = logging.getLogger(__name__)
 
@@ -845,34 +846,41 @@ class TelegramChannel(BaseChannel):
 
     async def _stream_events(self, message: InboundMessage) -> AsyncIterator[MessageEvent]:
         state = self._stream.get()
-        async for event in self._original_processor(message):
-            if state is not None:
-                if event.type == MessageEventType.DELTA:
-                    state["text"] += "".join(part.text for part in event.content if isinstance(part, TextContent))
-                    if self._config.streaming_mode != "off" and time.monotonic() - state["last"] >= 1:
-                        await self._preview(state["subject"], state)
-                    continue
-                elif event.type in (MessageEventType.FLUSH, MessageEventType.COMPLETED, MessageEventType.MESSAGE):
-                    state["finalizing"] = True
-                    if event.type == MessageEventType.MESSAGE:
-                        final_text = "".join(part.text for part in event.content if isinstance(part, TextContent))
-                        # A textual final is authoritative, including revisions. A
-                        # media-only final still flushes the pending delta text.
-                        if final_text:
-                            state["text"] = final_text
-                            event = event.model_copy(
-                                update={
-                                    "content": [part for part in event.content if not isinstance(part, TextContent)]
-                                }
-                            )
-                    if state["text"]:
-                        yield MessageEvent.delta(state["text"])
-            yield event
-            if state is not None and event.type in (MessageEventType.FLUSH, MessageEventType.MESSAGE):
-                state.update(text="", finalizing=False, last=0.0)
-        if state is not None and state["text"]:
-            yield MessageEvent.delta(state["text"])
-        # BaseChannel defines successful completion via COMPLETED, not iterator exhaustion.
+        # Closing this wrapper must close the host processor. Aclosing an async
+        # generator paused at ``yield`` does not run a nested ``async for``
+        # finalizer, so ERROR (a terminal event) would skip host cleanup.
+        source = self._original_processor(message)
+        try:
+            async for event in source:
+                if state is not None:
+                    if event.type == MessageEventType.DELTA:
+                        state["text"] += "".join(part.text for part in event.content if isinstance(part, TextContent))
+                        if self._config.streaming_mode != "off" and time.monotonic() - state["last"] >= 1:
+                            await self._preview(state["subject"], state)
+                        continue
+                    elif event.type in (MessageEventType.FLUSH, MessageEventType.COMPLETED, MessageEventType.MESSAGE):
+                        state["finalizing"] = True
+                        if event.type == MessageEventType.MESSAGE:
+                            final_text = "".join(part.text for part in event.content if isinstance(part, TextContent))
+                            # A textual final is authoritative, including revisions. A
+                            # media-only final still flushes the pending delta text.
+                            if final_text:
+                                state["text"] = final_text
+                                event = event.model_copy(
+                                    update={
+                                        "content": [part for part in event.content if not isinstance(part, TextContent)]
+                                    }
+                                )
+                        if state["text"]:
+                            yield MessageEvent.delta(state["text"])
+                yield event
+                if state is not None and event.type in (MessageEventType.FLUSH, MessageEventType.MESSAGE):
+                    state.update(text="", finalizing=False, last=0.0)
+            if state is not None and state["text"]:
+                yield MessageEvent.delta(state["text"])
+            # BaseChannel defines successful completion via COMPLETED, not iterator exhaustion.
+        finally:
+            await close_event_stream(source)
 
     async def _preview(self, subject: ChannelSubject, state: dict[str, Any]) -> None:
         if not self._app or state.get("disabled"):
