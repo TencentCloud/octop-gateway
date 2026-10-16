@@ -134,7 +134,7 @@ def registered_channel_kinds() -> frozenset[str]:
     return frozenset(_CHANNEL_MAP) | frozenset(_PLUGIN_OWNERS)
 
 
-def register_channel_kind(kind: str, channel_cls: type[BaseChannel], *, plugin_id: str = "") -> None:
+def register_channel_kind(kind: str, channel_cls: type[BaseChannel], *, plugin_id: str) -> None:
     """Register a BaseChannel subclass; the same owner may replace it on reload.
 
     Builtins and registrations owned by another plugin cannot be replaced.
@@ -144,6 +144,8 @@ def register_channel_kind(kind: str, channel_cls: type[BaseChannel], *, plugin_i
 
     normalized = str(kind).strip().lower()
     owner = str(plugin_id).strip()
+    if not owner:
+        raise ValueError("plugin_id must not be empty")
     if not normalized:
         raise ValueError("channel kind must not be empty")
     if normalized in _CHANNEL_MAP:
@@ -156,8 +158,11 @@ def register_channel_kind(kind: str, channel_cls: type[BaseChannel], *, plugin_i
     _PLUGIN_OWNERS[normalized] = owner
 
 
-def unregister_channel_kind(kind: str, *, plugin_id: str = "") -> bool:
+def unregister_channel_kind(kind: str, *, plugin_id: str) -> bool:
     """Remove only the matching owners registration; preserve builtin kinds."""
+    owner = str(plugin_id).strip()
+    if not owner:
+        raise ValueError("plugin_id must not be empty")
     normalized = str(kind).strip().lower()
     if normalized in _CHANNEL_MAP:
         raise ValueError("cannot unregister a builtin channel kind")
