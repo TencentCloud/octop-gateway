@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from telegram import Message
 
 from octop_gateway.channels.telegram import TelegramChannel, TelegramConfig
 from octop_gateway.channels.telegram.format_html import markdown_to_telegram_html
@@ -97,13 +98,15 @@ class TestTelegramAllowedUsers:
         callback = handlers[0].callback
 
         def update(user_id: int) -> SimpleNamespace:
-            msg = SimpleNamespace(
-                from_user=SimpleNamespace(id=user_id),
-                chat=SimpleNamespace(id=user_id, type="private"),
-                text="hi",
-                caption=None,
-                message_id=1,
-                message_thread_id=None,
+            msg = Message.de_json(
+                {
+                    "from": {"id": user_id, "first_name": "User", "is_bot": False},
+                    "chat": {"id": user_id, "type": "private"},
+                    "text": "hi",
+                    "message_id": 1,
+                    "date": 0,
+                },
+                None,
             )
             return SimpleNamespace(message=msg, edited_message=None)
 
