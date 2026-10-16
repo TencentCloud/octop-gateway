@@ -86,6 +86,7 @@ Use a Bot Token and enable Message Content Intent in the developer portal. `allo
 #### Unified message abstraction
 - `InboundMessage` carries the text, structured `ContentPart`s (text / image / video / audio / file), and a `ChannelSubject`.
 - Your processor is a `Callable[[InboundMessage], AsyncIterator[MessageEvent]]` — emit `MESSAGE` for complete text, `DELTA` for token streaming, and `COMPLETED` to flush.
+- `ERROR` is a failed terminal event: consumers stop reading immediately and explicitly close the producer. Put cleanup in the producer's `finally`; cleanup has a five-second timeout and failures are logged. Persist any durable failure history before yielding `ERROR`, since no later event is required.
 - `ChannelConfig` is a typed dataclass per platform; `BaseChannel` defines `start` / `stop` / `parse_inbound` / `_send_*`.
 
 #### Custom channels
@@ -312,3 +313,14 @@ Thanks to all contributors:
 <a href="https://github.com/TencentCloud/octop-gateway/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=TencentCloud/octop-gateway" />
 </a>
+
+### Runtime channel registration
+
+Hosts may use `register_channel_kind(kind, ChannelClass, plugin_id=owner)`
+to register a `BaseChannel` subclass before constructing it with
+`ChannelManager`. The same owner may replace a class during reload; another
+owner or a builtin collision raises `ValueError`. Stop affected instances
+before updating. `unregister_channel_kind(kind, plugin_id=owner)` removes the
+registration only, not running instances or persisted configuration.
+`registered_channel_kinds()` returns the active builtin and plugin kinds;
+`SUPPORTED_CHANNEL_KINDS` remains the builtin compatibility snapshot.

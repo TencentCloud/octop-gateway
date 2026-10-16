@@ -35,6 +35,7 @@ from octop_gateway.models import (
     VideoContent,
 )
 from octop_gateway.push_routing import alias_subject_fields
+from octop_gateway.utils import close_event_stream
 
 logger = logging.getLogger(__name__)
 
@@ -435,8 +436,9 @@ class WeComChannel(BaseChannel):
             async for ev in iterator:
                 yield ev
 
+        events = _events()
         try:
-            async for event in _events():
+            async for event in events:
                 if event.type == MessageEventType.TYPING:
                     pass  # WeCom shows thinking bubble on first stream chunk
 
@@ -523,6 +525,10 @@ class WeComChannel(BaseChannel):
                 finish=True,
             )
             return
+
+        finally:
+            await close_event_stream(events)
+            await close_event_stream(iterator)
 
         # Close a text stream before replying with native media messages.
         final_text = "".join(content_buffer)
