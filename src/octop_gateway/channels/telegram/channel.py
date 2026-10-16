@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
-from typing import Any
+from typing import Any, Self
 
 from telegram.error import TelegramError
 
@@ -42,13 +43,29 @@ class TelegramConfig(ChannelConfig):
         show_typing: Send ``typing`` chat action while processing.
         show_thinking: Forward thinking/reasoning content to the chat.
         show_tool_hints: Show tool-call status messages in the chat.
+        allowed_user_ids: Telegram user IDs allowed to talk to the bot, in
+            private chats and groups. Empty (default) keeps the bot open to
+            everyone, as before. Messages from other users are dropped before
+            any media is fetched or the agent runs.
     """
 
     bot_token: str = ""
     http_proxy: str = ""
     show_typing: bool = True
+    allowed_user_ids: list[str] = field(default_factory=list)
 
     required_credentials = ("bot_token",)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        cleaned = dict(data)
+        value = cleaned.get("allowed_user_ids", [])
+        if isinstance(value, str):
+            value = re.split(r"[,\s]+", value.strip()) if value.strip() else []
+        if not isinstance(value, list) or any(not str(item).isascii() or not str(item).isdigit() for item in value):
+            raise ValueError("allowed_user_ids: expected Telegram user IDs separated by commas or whitespace")
+        cleaned["allowed_user_ids"] = list(dict.fromkeys(str(item) for item in value))
+        return super().from_dict(cleaned)
 
 
 class TelegramChannel(BaseChannel):
@@ -108,7 +125,7 @@ class TelegramChannel(BaseChannel):
 
         async def handle_message(update: Any, _context: ContextTypes.DEFAULT_TYPE) -> None:
             message = update.message or update.edited_message
-            if not message:
+            if not message or not self._is_allowed_sender(message):
                 return
             native = await self._build_native_from_update(update)
             if native:
@@ -130,6 +147,17 @@ class TelegramChannel(BaseChannel):
             self._app = None
         self._connection_session = None
         logger.info("TelegramChannel stopped")
+
+    def _is_allowed_sender(self, message: Any) -> bool:
+        allowed = self._config.allowed_user_ids
+        if not allowed:
+            return True
+        user = getattr(message, "from_user", None)
+        user_id = str(getattr(user, "id", "")) if user else ""
+        if user_id in allowed:
+            return True
+        logger.info("Telegram message from user %s ignored: not in allowed_user_ids", user_id or "unknown")
+        return False
 
     async def _build_native_from_update(self, update: Any) -> dict[str, Any] | None:
         message = update.message or update.edited_message

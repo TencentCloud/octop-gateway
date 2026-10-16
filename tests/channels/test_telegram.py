@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
 from octop_gateway.channels.telegram import TelegramChannel, TelegramConfig
 from octop_gateway.channels.telegram.format_html import markdown_to_telegram_html
 from octop_gateway.models import InboundMessage, MessageEvent, TextContent
@@ -39,3 +44,71 @@ class TestTelegramChannelUnit:
         html = markdown_to_telegram_html("**bold** and `code`")
         assert "<b>bold</b>" in html
         assert "<code>code</code>" in html
+
+
+class TestTelegramAllowedUsers:
+    @staticmethod
+    def _message(user_id: int | None) -> SimpleNamespace:
+        user = SimpleNamespace(id=user_id) if user_id is not None else None
+        return SimpleNamespace(from_user=user, chat=SimpleNamespace(id=-100123, type="supergroup"))
+
+    def test_empty_allowlist_keeps_bot_open(self) -> None:
+        ch = TelegramChannel(processor=_noop_processor, config=TelegramConfig(bot_token="t"))
+        assert ch._is_allowed_sender(self._message(42)) is True
+        assert ch._is_allowed_sender(self._message(None)) is True
+
+    def test_allowlist_filters_senders(self) -> None:
+        cfg = TelegramConfig(bot_token="t", allowed_user_ids=["42"])
+        ch = TelegramChannel(processor=_noop_processor, config=cfg)
+        assert ch._is_allowed_sender(self._message(42)) is True
+        assert ch._is_allowed_sender(self._message(7)) is False
+        assert ch._is_allowed_sender(self._message(None)) is False
+
+    def test_from_dict_parses_ids(self) -> None:
+        cfg = TelegramConfig.from_dict({"bot_token": " t ", "allowed_user_ids": "42, 43\n42"})
+        assert cfg.bot_token == "t"
+        assert cfg.allowed_user_ids == ["42", "43"]
+        assert TelegramConfig.from_dict({"bot_token": "t", "allowed_user_ids": [42, "43"]}).allowed_user_ids == [
+            "42",
+            "43",
+        ]
+        assert TelegramConfig.from_dict({"bot_token": "t", "allowed_user_ids": ""}).allowed_user_ids == []
+        assert TelegramConfig.from_dict({"bot_token": "t"}).allowed_user_ids == []
+
+    def test_from_dict_rejects_non_numeric_ids(self) -> None:
+        with pytest.raises(ValueError, match="allowed_user_ids"):
+            TelegramConfig.from_dict({"bot_token": "t", "allowed_user_ids": "@username"})
+
+    async def test_blocked_sender_never_reaches_processor(self) -> None:
+        cfg = TelegramConfig(bot_token="t", allowed_user_ids=["42"])
+        ch = TelegramChannel(processor=_noop_processor, config=cfg)
+        handlers: list = []
+        app = MagicMock()
+        app.add_handler.side_effect = lambda h: handlers.append(h)
+        app.initialize = AsyncMock()
+        app.start = AsyncMock()
+        app.updater = None
+        builder = MagicMock()
+        builder.token.return_value.build.return_value = app
+        with patch("telegram.ext.Application.builder", return_value=builder):
+            await ch.start()
+        enqueued: list = []
+        ch.enqueue = enqueued.append  # type: ignore[method-assign]
+        callback = handlers[0].callback
+
+        def update(user_id: int) -> SimpleNamespace:
+            msg = SimpleNamespace(
+                from_user=SimpleNamespace(id=user_id),
+                chat=SimpleNamespace(id=user_id, type="private"),
+                text="hi",
+                caption=None,
+                message_id=1,
+                message_thread_id=None,
+            )
+            return SimpleNamespace(message=msg, edited_message=None)
+
+        await callback(update(7), None)
+        assert enqueued == []
+        await callback(update(42), None)
+        assert len(enqueued) == 1
+        assert enqueued[0]["user_id"] == "42"

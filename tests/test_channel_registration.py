@@ -9,6 +9,8 @@ from octop_gateway.channels import (
     BUILTIN_CHANNELS,
     ChannelKind,
     register_channel_kind,
+    registered_channel_kinds,
+    unregister_channel_kind,
 )
 
 
@@ -20,9 +22,7 @@ class _StubChannel(BaseChannel):
     class Config(ChannelConfig):
         token: str = ""
 
-    def __init__(
-        self, processor: MessageProcessor, config: ChannelConfig | None = None
-    ) -> None:
+    def __init__(self, processor: MessageProcessor, config: ChannelConfig | None = None) -> None:
         super().__init__(processor, config=config)
 
 
@@ -32,8 +32,7 @@ def _cleanup_registration() -> None:
     # Remove any kind registered during the test (builtins must survive).
     for key in list(BUILTIN_CHANNELS.keys()):
         if key not in {k.value for k in ChannelKind}:
-            dict.__delitem__(BUILTIN_CHANNELS, key)
-            BUILTIN_CHANNELS._loaded = True
+            unregister_channel_kind(key)
 
 
 def test_register_and_resolve() -> None:
@@ -42,16 +41,15 @@ def test_register_and_resolve() -> None:
     assert BUILTIN_CHANNELS["acme"] is _StubChannel
 
 
-def test_register_is_idempotent() -> None:
+def test_register_replaces_same_owner() -> None:
     register_channel_kind("acme", _StubChannel)
 
     class _Other(BaseChannel):
         channel_type = "acme-other"
 
-    # Second apply with another class: first registration wins (stable
-    # across host reloads), no error.
+    # The same owner can replace its implementation on reload.
     register_channel_kind("acme", _Other)
-    assert BUILTIN_CHANNELS["acme"] is _StubChannel
+    assert BUILTIN_CHANNELS["acme"] is _Other
 
 
 def test_register_rejects_builtin_override() -> None:
@@ -67,3 +65,16 @@ def test_register_rejects_empty_kind() -> None:
 def test_register_rejects_non_class() -> None:
     with pytest.raises(TypeError, match="must be a class"):
         register_channel_kind("acme", lambda: None)  # type: ignore[arg-type]
+
+
+def test_owner_conflict_and_unregister() -> None:
+    register_channel_kind("acme", _StubChannel, plugin_id="first")
+    try:
+        assert "acme" in registered_channel_kinds()
+        with pytest.raises(ValueError, match="owned"):
+            register_channel_kind("acme", _StubChannel, plugin_id="second")
+        with pytest.raises(ValueError, match="owned"):
+            unregister_channel_kind("acme", plugin_id="second")
+    finally:
+        assert unregister_channel_kind("acme", plugin_id="first")
+    assert "acme" not in registered_channel_kinds()

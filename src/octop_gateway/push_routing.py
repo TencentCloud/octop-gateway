@@ -31,6 +31,12 @@ def alias_subject_fields(
     return meta
 
 
+# Durable copy of the latest iLink context token. The ephemeral ``context_token``
+# key is stripped on proactive push; cron reads this one from the session row.
+WEIXIN_CONTEXT_TOKEN_KEY = "weixin_context_token"
+WEIXIN_CONTEXT_TOKEN_MS_KEY = "weixin_context_token_ms"
+
+
 def strip_ephemeral_push_meta(meta: dict[str, Any]) -> dict[str, Any]:
     """Remove passive-reply-only fields so proactive sends use the right path."""
     for key in EPHEMERAL_PUSH_META:

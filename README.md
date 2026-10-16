@@ -312,3 +312,14 @@ Thanks to all contributors:
 <a href="https://github.com/TencentCloud/octop-gateway/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=TencentCloud/octop-gateway" />
 </a>
+
+### Runtime channel registration
+
+Hosts may use `register_channel_kind(kind, ChannelClass, plugin_id=owner)`
+to register a `BaseChannel` subclass before constructing it with
+`ChannelManager`. The same owner may replace a class during reload; another
+owner or a builtin collision raises `ValueError`. Stop affected instances
+before updating. `unregister_channel_kind(kind, plugin_id=owner)` removes the
+registration only, not running instances or persisted configuration.
+`registered_channel_kinds()` returns the active builtin and plugin kinds;
+`SUPPORTED_CHANNEL_KINDS` remains the builtin compatibility snapshot.

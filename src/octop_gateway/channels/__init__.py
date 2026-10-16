@@ -126,42 +126,48 @@ class _LazyBuiltinDict(dict):  # type: ignore[type-arg]
 BUILTIN_CHANNELS: dict[str, type[BaseChannel]] = _LazyBuiltinDict()
 
 
-def register_channel_kind(kind: str, channel_cls: type[BaseChannel]) -> None:
-    """Register an additional channel kind at runtime.
+_PLUGIN_OWNERS: dict[str, str] = {}
 
-    Hosts (e.g. octop) call this while applying plugin-contributed channel
-    implementations, before any channel of that kind is built. The kind must
-    not clash with a builtin kind; registering an already-registered plugin
-    kind is a no-op (idempotent), so host code can apply the plugin registry
-    on every boot/reload without special-casing.
 
-    Args:
-        kind: Channel-type string persisted in the control-plane database
-            and passed to :meth:`~octop_gateway.manager.ChannelManager`.
-        channel_cls: The channel class to construct for this kind. It must
-            expose a ``Config`` dataclass attribute (like builtin channels)
-            so ``ChannelManager._build_config`` can normalize dicts.
+def registered_channel_kinds() -> frozenset[str]:
+    """Return builtin and currently registered plugin kinds without loading SDKs."""
+    return frozenset(_CHANNEL_MAP) | frozenset(_PLUGIN_OWNERS)
 
-    Raises:
-        ValueError: If *kind* is empty or clashes with a builtin kind.
-        TypeError: If *channel_cls* is not a class.
+
+def register_channel_kind(kind: str, channel_cls: type[BaseChannel], *, plugin_id: str = "") -> None:
+    """Register a BaseChannel subclass; the same owner may replace it on reload.
+
+    Builtins and registrations owned by another plugin cannot be replaced.
+    Hosts must stop affected live instances before replacing registrations.
     """
+    from octop_gateway.channel import BaseChannel
+
     normalized = str(kind).strip().lower()
+    owner = str(plugin_id).strip()
     if not normalized:
         raise ValueError("channel kind must not be empty")
     if normalized in _CHANNEL_MAP:
-        raise ValueError(
-            f"channel kind {normalized!r} is a builtin kind and cannot be overridden"
-        )
-    if not isinstance(channel_cls, type):
-        raise TypeError("channel_cls must be a class")
-    if normalized in BUILTIN_CHANNELS:
-        # Already registered by the host (idempotent re-apply); keep the
-        # first registration to stay stable across reloads.
-        return
+        raise ValueError(f"channel kind {normalized!r} is a builtin kind and cannot be overridden")
+    if not isinstance(channel_cls, type) or not issubclass(channel_cls, BaseChannel):
+        raise TypeError("channel_cls must be a class inheriting BaseChannel")
+    if normalized in BUILTIN_CHANNELS and _PLUGIN_OWNERS.get(normalized) != owner:
+        raise ValueError(f"channel kind {normalized!r} is owned by another plugin")
     BUILTIN_CHANNELS[normalized] = channel_cls
-    if normalized not in _CLASS_NAMES:
-        _CLASS_NAMES[normalized] = channel_cls.__name__
+    _PLUGIN_OWNERS[normalized] = owner
+
+
+def unregister_channel_kind(kind: str, *, plugin_id: str = "") -> bool:
+    """Remove only the matching owners registration; preserve builtin kinds."""
+    normalized = str(kind).strip().lower()
+    if normalized in _CHANNEL_MAP:
+        raise ValueError("cannot unregister a builtin channel kind")
+    if normalized not in _PLUGIN_OWNERS:
+        return False
+    if _PLUGIN_OWNERS[normalized] != str(plugin_id).strip():
+        raise ValueError(f"channel kind {normalized!r} is owned by another plugin")
+    _PLUGIN_OWNERS.pop(normalized)
+    BUILTIN_CHANNELS.pop(normalized, None)
+    return True
 
 
 __all__ = [
@@ -169,4 +175,6 @@ __all__ = [
     "SUPPORTED_CHANNEL_KINDS",
     "ChannelKind",
     "register_channel_kind",
+    "registered_channel_kinds",
+    "unregister_channel_kind",
 ]
