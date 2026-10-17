@@ -765,3 +765,94 @@ class TestFeishuChannelExtendedUnit:
 
         # Bot messages should be skipped
         assert len(enqueued) == 0
+
+
+# ---------------------------------------------------------------------------
+# WebSocket thread / event-loop ownership
+# ---------------------------------------------------------------------------
+
+
+class TestFeishuWebSocketThread:
+    """The lark-oapi client must be created on the thread that drives it.
+
+    ``lark_oapi.ws.Client.start()`` is blocking and resolves its loop through
+    the module-level ``loop`` in ``lark_oapi.ws.client`` (newer builds also
+    capture it in ``__init__``). Building the client on Octop's main thread
+    made ``start()`` call ``run_until_complete`` on the already-running main
+    loop, which is the ``RuntimeError: This event loop is already running``
+    followed by ``attached to a different loop`` reported for the Feishu
+    channel.
+    """
+
+    def test_client_is_built_on_the_websocket_thread(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import asyncio
+        import sys
+        import threading
+        import types
+
+        recorded: dict[str, object] = {}
+
+        fake_lark = types.ModuleType("lark_oapi")
+        fake_ws = types.ModuleType("lark_oapi.ws")
+        fake_ws_client = types.ModuleType("lark_oapi.ws.client")
+        fake_ws_client.loop = None
+
+        class _Dispatcher:
+            @staticmethod
+            def builder(_encrypt_key: str, _verification_token: str) -> _Dispatcher:
+                return _Dispatcher()
+
+            def register_p2_im_message_receive_v1(self, _handler: object) -> _Dispatcher:
+                return self
+
+            def build(self) -> object:
+                return object()
+
+        class _Client:
+            def __init__(
+                self,
+                app_id: str,
+                app_secret: str,
+                event_handler: object = None,
+                log_level: object = None,
+            ) -> None:
+                recorded["app_id"] = app_id
+                recorded["constructed_on"] = threading.get_ident()
+                recorded["loop_at_construction"] = asyncio.get_event_loop()
+                self.on_reconnecting = None
+                self.on_reconnected = None
+
+            def start(self) -> None:
+                recorded["started_on"] = threading.get_ident()
+                recorded["loop_at_start"] = fake_ws_client.loop
+                recorded["loop_running_at_start"] = fake_ws_client.loop.is_running()
+                recorded["hooks_attached"] = callable(self.on_reconnecting) and callable(self.on_reconnected)
+
+        fake_lark.EventDispatcherHandler = _Dispatcher
+        fake_lark.LogLevel = types.SimpleNamespace(INFO="INFO")
+        fake_lark.ws = fake_ws
+        fake_ws.Client = _Client
+        fake_ws.client = fake_ws_client
+
+        monkeypatch.setitem(sys.modules, "lark_oapi", fake_lark)
+        monkeypatch.setitem(sys.modules, "lark_oapi.ws", fake_ws)
+        monkeypatch.setitem(sys.modules, "lark_oapi.ws.client", fake_ws_client)
+
+        ch = FeishuChannel(processor=_noop_processor, config=_make_config())
+        main_thread = threading.get_ident()
+
+        async def _start() -> None:
+            recorded["main_loop"] = asyncio.get_running_loop()
+            await ch._start_ws_client()
+
+        asyncio.run(_start())
+        ch._ws_thread.join(timeout=5)
+
+        assert not ch._ws_thread.is_alive(), "the fake client's start() returns, so the thread must exit"
+        assert recorded["constructed_on"] != main_thread, "the client was built on Octop's main thread"
+        assert recorded["constructed_on"] == recorded["started_on"]
+        assert recorded["loop_at_construction"] is not recorded["main_loop"]
+        assert recorded["loop_at_start"] is recorded["loop_at_construction"]
+        assert recorded["loop_running_at_start"] is False
+        assert recorded["hooks_attached"] is True
+        assert recorded["app_id"] == _FEISHU_APP_ID

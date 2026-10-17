@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 修复
+
+- 飞书通道的 lark-oapi WebSocket 客户端改为在 WS 守护线程内构造：SDK 把阻塞驱动绑定到「构造它的线程」的事件循环（`lark_oapi.ws.client` 的模块级 `loop`，新版还会在 `__init__` 里捕获），原先在主线程构造导致 `start()` 对已运行的主循环调用 `run_until_complete`，报 `This event loop is already running` 与 `attached to a different loop`，连接反复崩溃重连、双向收发全部失效。
+
 ## [1.0.3] - 2026-10-16
 
 ### 新增

@@ -107,6 +107,7 @@ class FeishuChannel(BaseChannel):
         self._token_expires_at: float = 0.0
         self._token_lock = asyncio.Lock()
         self._ws_client: Any = None
+        self._ws_event_handler: Any = None
         self._ws_thread: Any = None
         self._ws_loop: asyncio.AbstractEventLoop | None = None
         self._ws_watchdog_task: asyncio.Task[None] | None = None
@@ -238,8 +239,9 @@ class FeishuChannel(BaseChannel):
         self._ws_reconnecting_since = None
         self._mark_ws_activity()
 
-        # Build event handler
-        event_handler = (
+        # Build event handler. The dispatcher is loop-agnostic, so it can be
+        # built here; the client cannot (see below).
+        self._ws_event_handler = (
             lark.EventDispatcherHandler.builder(
                 self._config.encrypt_key or "",
                 self._config.verification_token or "",
@@ -248,18 +250,16 @@ class FeishuChannel(BaseChannel):
             .build()
         )
 
-        # Create WebSocket client (lark_oapi.ws.Client)
-        self._ws_client = lark.ws.Client(
-            self._config.app_id,
-            self._config.app_secret,
-            event_handler=event_handler,
-            log_level=lark.LogLevel.INFO,
-        )
-        # SDK reconnect hooks (fire on the WS thread's loop).
-        self._ws_client.on_reconnecting = self._on_ws_reconnecting
-        self._ws_client.on_reconnected = self._on_ws_reconnected
-
-        # lark-oapi WS client is blocking; run in a daemon thread
+        # lark-oapi WS client is blocking; run in a daemon thread.
+        #
+        # The client is constructed *inside* that thread, not here: lark-oapi
+        # binds its blocking driver to the event loop of the thread that
+        # creates it (the module-level ``loop`` in ``lark_oapi.ws.client``,
+        # and ``self.loop`` on versions that capture it in ``__init__``).
+        # Building it on the main thread while Octop's main loop is running
+        # made ``Client.start()`` call ``run_until_complete`` on that already
+        # running loop -- "This event loop is already running" -- and the
+        # SDK's own ``create_task`` calls then landed on the wrong loop.
         self._ws_thread = threading.Thread(
             target=self._run_ws_thread,
             daemon=True,
@@ -277,14 +277,28 @@ class FeishuChannel(BaseChannel):
         self._ws_loop = loop
         _asyncio.set_event_loop(loop)
         try:
+            import lark_oapi as lark
             import lark_oapi.ws.client as ws_client_module
 
+            # Belt and braces: the SDK resolves the loop through this module
+            # global, and it may already point at the main thread's loop if
+            # lark_oapi was imported there first.
             ws_client_module.loop = loop
         except (ImportError, AttributeError):
-            pass
+            lark = None  # type: ignore[assignment]
         try:
-            if self._ws_client:
-                self._ws_client.start()
+            if lark is not None:
+                client = lark.ws.Client(
+                    self._config.app_id,
+                    self._config.app_secret,
+                    event_handler=self._ws_event_handler,
+                    log_level=lark.LogLevel.INFO,
+                )
+                # SDK reconnect hooks (fire on the WS thread's loop).
+                client.on_reconnecting = self._on_ws_reconnecting
+                client.on_reconnected = self._on_ws_reconnected
+                self._ws_client = client
+                client.start()
         except Exception:  # pylint: disable=broad-except
             # The SDK owns this thread boundary and does not publish an exception contract.
             logger.exception("Feishu WebSocket thread failed")
