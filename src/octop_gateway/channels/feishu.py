@@ -224,6 +224,33 @@ class FeishuChannel(BaseChannel):
     # WebSocket Client (lark-oapi)
     # =========================================================================
 
+    def _build_event_handler(self) -> Any:
+        """Build the lark-oapi event dispatcher for the WebSocket client.
+
+        Reaction events (``im.message.reaction.created_v1`` /
+        ``im.message.reaction.deleted_v1``) are registered so the SDK answers
+        the platform with a success ACK instead of ``processor not found``
+        (which the WS frame handler turns into a ``code=500`` confirmation).
+        They are acknowledged only — reactions never trigger the model.
+        """
+        import lark_oapi as lark
+
+        return (
+            lark.EventDispatcherHandler.builder(
+                self._config.encrypt_key or "",
+                self._config.verification_token or "",
+            )
+            .register_p2_im_message_receive_v1(self._on_message_event)
+            .register_p2_im_message_reaction_created_v1(self._on_reaction_event)
+            .register_p2_im_message_reaction_deleted_v1(self._on_reaction_event)
+            .build()
+        )
+
+    def _on_reaction_event(self, event: Any) -> None:
+        """Acknowledge a reaction event; reactions must not trigger the model."""
+        event_type = getattr(getattr(event, "header", None), "event_type", None)
+        logger.debug("Feishu reaction event acknowledged (type=%s)", event_type)
+
     async def _start_ws_client(self) -> None:
         """Start the lark-oapi WebSocket event client in a background thread."""
         import threading
@@ -239,14 +266,7 @@ class FeishuChannel(BaseChannel):
         self._mark_ws_activity()
 
         # Build event handler
-        event_handler = (
-            lark.EventDispatcherHandler.builder(
-                self._config.encrypt_key or "",
-                self._config.verification_token or "",
-            )
-            .register_p2_im_message_receive_v1(self._on_message_event)
-            .build()
-        )
+        event_handler = self._build_event_handler()
 
         # Create WebSocket client (lark_oapi.ws.Client)
         self._ws_client = lark.ws.Client(
