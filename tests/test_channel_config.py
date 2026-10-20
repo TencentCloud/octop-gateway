@@ -12,6 +12,7 @@ from octop_gateway.channels import (
 )
 from octop_gateway.channels.dingtalk import DingTalkConfig
 from octop_gateway.channels.feishu import FeishuConfig
+from octop_gateway.channels.mqtt import MQTTConfig
 from octop_gateway.channels.qq import QQConfig
 from octop_gateway.channels.weixin.channel import WeixinConfig
 
@@ -81,3 +82,37 @@ def test_channel_credentials_error_carries_structured_data() -> None:
     assert err.missing == ["app_id", "app_secret"]
     with pytest.raises(ChannelCredentialsError):
         raise err
+
+
+def test_numeric_fields_coerced_from_strings() -> None:
+    """Console form values arrive as strings; the declared types must hold."""
+    cfg = MQTTConfig.from_dict({"host": "broker", "port": "1883", "qos": "1"})
+    assert cfg.port == 1883
+    assert isinstance(cfg.port, int)
+    assert cfg.qos == 1
+    assert isinstance(cfg.qos, int)
+
+
+def test_bool_fields_coerced_from_strings() -> None:
+    assert MQTTConfig.from_dict({"tls_enabled": "false"}).tls_enabled is False
+    assert MQTTConfig.from_dict({"tls_enabled": "true"}).tls_enabled is True
+
+
+def test_string_port_accepted_by_paho() -> None:
+    """Regression: a string port used to crash paho's port setter."""
+    import paho.mqtt.client as mqtt
+
+    cfg = MQTTConfig.from_dict({"host": "broker", "port": "1883"})
+    client = mqtt.Client()
+    client.port = cfg.port
+    assert client.port == 1883
+
+
+def test_non_numeric_port_rejected_with_field_name() -> None:
+    with pytest.raises(ValueError, match="port"):
+        MQTTConfig.from_dict({"host": "broker", "port": "not-a-port"})
+
+
+def test_string_field_accepts_number() -> None:
+    cfg = MQTTConfig.from_dict({"host": "broker", "port": 1883, "username": 42})
+    assert cfg.username == "42"

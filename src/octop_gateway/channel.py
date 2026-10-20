@@ -15,10 +15,11 @@ import logging
 import mimetypes
 import re
 import time
+import types
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, fields
-from typing import Any, Self
+from typing import Any, Self, Union, get_args, get_origin, get_type_hints
 from urllib.parse import urlparse
 
 import aiohttp
@@ -56,6 +57,114 @@ MessageProcessor = Callable[[InboundMessage], AsyncIterator[MessageEvent]]
 # ---------------------------------------------------------------------------
 # ChannelConfig — base class for all platform-specific Config dataclasses
 # ---------------------------------------------------------------------------
+
+
+_BOOL_TRUE = frozenset({"1", "true", "yes", "on"})
+_BOOL_FALSE = frozenset({"0", "false", "no", "off"})
+
+_FIELD_TYPES: dict[type, dict[str, Any]] = {}
+
+
+def _field_types(cls: type) -> dict[str, Any]:
+    """Resolved declared types for ``cls``'s dataclass fields.
+
+    ``from __future__ import annotations`` turns annotations into strings, so
+    ``fields(cls)[i].type`` is not a type object. Classes with unresolvable
+    forward references yield an empty mapping, which leaves their values
+    untouched rather than failing the call.
+    """
+    cached = _FIELD_TYPES.get(cls)
+    if cached is not None:
+        return cached
+    try:
+        hints = get_type_hints(cls)
+    except Exception:  # pragma: no cover - unresolvable forward references
+        hints = {}
+    resolved = {f.name: hints[f.name] for f in fields(cls) if f.name in hints}
+    _FIELD_TYPES[cls] = resolved
+    return resolved
+
+
+def _coerce_value(name: str, value: Any, target: Any) -> Any:
+    """Coerce ``value`` to the declared field type ``target``.
+
+    Channel configs are built from untyped JSON — console form values, API
+    payloads, persisted rows. HTML inputs always yield strings, so a numeric
+    field such as MQTT's ``port`` arrives as ``"1883"``. The config dataclasses
+    declare ``port: int``, but plain dataclasses do not validate at runtime, so
+    the string used to travel down to the transport layer and fail there
+    (``TypeError: '<=' not supported between instances of 'str' and 'int'``).
+
+    Coercing here makes the declared type an actual contract. Values that
+    cannot be represented are rejected with a message naming the field.
+    """
+    if value is None:
+        return None
+    origin = get_origin(target)
+    if origin is Union or origin is types.UnionType:
+        members = [arg for arg in get_args(target) if arg is not type(None)]
+        if not members:
+            return value
+        target = members[0]
+    if target is Any or not isinstance(target, type):
+        return value
+    if target is bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            low = value.strip().lower()
+            if low in _BOOL_TRUE:
+                return True
+            if low in _BOOL_FALSE:
+                return False
+        elif isinstance(value, int):
+            return bool(value)
+        raise ValueError(f"channel field {name!r} must be a boolean, got {value!r}")
+    if target is int:
+        if isinstance(value, bool):
+            raise ValueError(f"channel field {name!r} must be an integer, got {value!r}")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(value.strip())
+            except ValueError:
+                pass
+        raise ValueError(f"channel field {name!r} must be an integer, got {value!r}")
+    if target is float:
+        if isinstance(value, bool):
+            raise ValueError(f"channel field {name!r} must be a number, got {value!r}")
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                pass
+        raise ValueError(f"channel field {name!r} must be a number, got {value!r}")
+    if target is str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
+        return value
+    return value
+
+
+def _coerce_fields(cls: type, values: dict[str, Any]) -> dict[str, Any]:
+    """Coerce ``values`` to the declared field types of ``cls``."""
+    declared = _field_types(cls)
+    if not declared:
+        return values
+    coerced = dict(values)
+    for name, value in values.items():
+        target = declared.get(name)
+        if target is None:
+            continue
+        coerced[name] = _coerce_value(name, value, target)
+    return coerced
 
 
 @dataclass
@@ -100,6 +209,8 @@ class ChannelConfig:
         Behaviour:
 
         - String values are stripped of surrounding whitespace.
+        - Values are coerced to the declared field type, so a numeric field
+          given as a string (``"1883"``) becomes an ``int``.
         - Keys listed in :attr:`field_aliases` are mapped to their canonical
           field name (only when the canonical field was not given directly).
         - Keys that do not match a declared dataclass field are ignored, so
@@ -133,7 +244,7 @@ class ChannelConfig:
         for alias, canonical in cls.field_aliases.items():  # type: ignore[attr-defined]
             if canonical in known and not out.get(canonical) and data.get(alias):
                 out[canonical] = _clean(data[alias])
-        return cls(**out)
+        return cls(**_coerce_fields(cls, out))
 
     def missing_credentials(self) -> list[str]:
         """Return the :attr:`required_credentials` fields that are empty.
