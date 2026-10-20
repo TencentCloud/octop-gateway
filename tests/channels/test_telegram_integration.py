@@ -805,3 +805,51 @@ async def test_start_and_callback_errors_sanitized_without_swallowing():
     query.answer.side_effect = ValueError("host error")
     with pytest.raises(ValueError, match="host error"):
         await ch._handle_callback(SimpleNamespace(callback_query=query))
+
+
+# A reply inside a non-forum supergroup carries message_thread_id (the id of the thread root),
+# but only forum topic messages set is_topic_message.
+_REPLY_THREAD = {
+    "message_thread_id": 397,
+    "reply_to_message": {"message_id": 397, "date": 0, "chat": {"id": -42, "type": "supergroup"}},
+}
+
+
+async def test_non_forum_reply_thread_is_not_a_topic():
+    ch = channel(topic_isolation=True)
+    native = await ch._build_message(sdk_message(398, **_REPLY_THREAD))
+    assert native["message_thread_id"] is None
+    msg = ch.parse_inbound(native)
+    assert msg.channel_subject.subject_id == "-42"
+
+
+async def test_forum_topic_message_keeps_thread_id():
+    ch = channel(topic_isolation=True)
+    native = await ch._build_message(sdk_message(398, message_thread_id=12, is_topic_message=True))
+    assert native["message_thread_id"] == 12
+    assert ch.parse_inbound(native).channel_subject.subject_id == "-42:topic:12"
+
+
+@pytest.mark.parametrize(
+    ("thread", "is_topic", "registered"),
+    [(397, False, None), (12, True, 12)],
+    ids=["non-forum-reply", "forum-topic"],
+)
+async def test_callback_topic_matches_registration(thread, is_topic, registered):
+    ch = channel()
+    handled = []
+
+    async def action():
+        handled.append(True)
+
+    token = ch.register_callback(subject(private=False, topic=registered), action)
+    update = SimpleNamespace(
+        callback_query=SimpleNamespace(
+            answer=AsyncMock(),
+            data=token,
+            from_user=SimpleNamespace(id=7),
+            message=SimpleNamespace(chat=SimpleNamespace(id=-42), message_thread_id=thread, is_topic_message=is_topic),
+        )
+    )
+    await ch._handle_callback(update)
+    assert handled == [True]

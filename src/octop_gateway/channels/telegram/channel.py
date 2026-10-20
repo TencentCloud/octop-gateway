@@ -44,6 +44,15 @@ _TELEGRAM_SEND_CHUNK_SIZE = 4000
 _TELEGRAM_MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024
 
 
+def _topic_thread_id(message: Any) -> int | None:
+    """Forum topic id of *message*, or ``None`` outside a forum topic.
+
+    ``message_thread_id`` also carries the root message id of a reply thread in
+    non-forum groups; only ``is_topic_message`` marks a real forum topic.
+    """
+    return getattr(message, "message_thread_id", None) if getattr(message, "is_topic_message", False) else None
+
+
 @dataclass
 class TelegramConfig(ChannelConfig):
     """Configuration for Telegram Bot channel.
@@ -444,7 +453,7 @@ class TelegramChannel(BaseChannel):
             "user_id": user_id,
             "message_id": str(getattr(message, "message_id", "")),
             "is_group": is_group,
-            "message_thread_id": getattr(message, "message_thread_id", None),
+            "message_thread_id": _topic_thread_id(message),
             "content": content_parts,
             "media": media_metadata,
             "edited": edited,
@@ -768,7 +777,7 @@ class TelegramChannel(BaseChannel):
                 query.data or "",
                 str(query.from_user.id),
                 str(query.message.chat.id),
-                getattr(query.message, "message_thread_id", None),
+                _topic_thread_id(query.message),
             )
 
     async def _reaction(self, subject: ChannelSubject, emoji: str) -> None:
