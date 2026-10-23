@@ -10,9 +10,33 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.error import BadRequest, InvalidToken, NetworkError
 
 from octop_gateway.channels.telegram import TelegramChannel, TelegramConfig
+from octop_gateway.channels.telegram.policy import strip_own_mention
 from octop_gateway.models import ChannelSubject, MessageEvent
 
 TABLE = "| name | value |\n|---|---|\n| cpu | 80% |"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("@OurBot, hello", "hello"),
+        ("@OurBot check the site", "check the site"),
+        ("does @ourbot know?", "does know?"),
+        ("line one\n@OurBot line two", "line one\nline two"),
+        ("ask @OtherBot and @hr together", "ask @OtherBot and @hr together"),
+        ("mail john@ourbot.com", "mail john@ourbot.com"),
+        ("@robot please", "@robot please"),
+        ("@OurBotX stays", "@OurBotX stays"),
+        ("@OurBot fix:\ndef f():\n    return  1", "fix:\ndef f():\n    return  1"),
+    ],
+)
+def test_only_own_addressing_is_removed(raw, expected):
+    assert strip_own_mention(raw, "OurBot") == expected
+
+
+def test_unknown_bot_identity_keeps_mentions():
+    text = "@somebot run\n    indented  code"
+    assert strip_own_mention(text, None) == text
 
 
 async def noop(_message):
