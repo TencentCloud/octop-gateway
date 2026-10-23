@@ -18,6 +18,7 @@ class Callback:
     topic: int | None
     expires: float
     action: Callable[[], Awaitable[None]]
+    settle: bool = True
 
 
 class Interactions:
@@ -27,11 +28,18 @@ class Interactions:
         self.pending: OrderedDict[str, Callback] = OrderedDict()
 
     def register(
-        self, user: str, chat: str, topic: int | None, action: Callable[[], Awaitable[None]], *, ttl: float = 300
+        self,
+        user: str,
+        chat: str,
+        topic: int | None,
+        action: Callable[[], Awaitable[None]],
+        *,
+        ttl: float = 300,
+        settle: bool = True,
     ) -> str:
         """Register a short host action; long work must be queued by the host."""
         token = secrets.token_urlsafe(18)
-        self.pending[token] = Callback(user, chat, topic, time.monotonic() + ttl, action)
+        self.pending[token] = Callback(user, chat, topic, time.monotonic() + ttl, action, settle)
         while len(self.pending) > 1000:
             self.pending.popitem(last=False)
         return token
