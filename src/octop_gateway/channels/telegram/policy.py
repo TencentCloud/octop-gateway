@@ -113,3 +113,13 @@ def should_accept_message(
         and reply.from_user is not None
         and reply.from_user.id == bot_id
     )
+
+
+def strip_own_mention(text: str, username: str | None) -> str:
+    """Remove this bot's addressing syntax without changing other mentions or spacing."""
+    if not username:
+        return text
+    name = re.escape(username.lstrip("@"))
+    text = re.sub(rf"^(\s*/[\w-]+)@{name}(?=\s|$)", r"\1", text, flags=re.IGNORECASE)
+    text = re.sub(rf"^[ \t]*@{name}(?!\w)[ \t]*[,\uFF0C]?[ \t]*", "", text, flags=re.IGNORECASE | re.MULTILINE)
+    return re.sub(rf"[ \t]*(?<![\w.])@{name}(?!\w)", "", text, flags=re.IGNORECASE).strip()

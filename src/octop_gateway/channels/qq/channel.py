@@ -29,6 +29,7 @@ from octop_gateway.channels.qq.stream import (
 )
 from octop_gateway.channels.qq.stream_blocks import stable_markdown_prefix
 from octop_gateway.constraints import ChannelConstraints, tool_hint_message
+from octop_gateway.format_tables import convert_tables_to_plain
 from octop_gateway.group_context import GroupContextConfig
 from octop_gateway.models import (
     AudioContent,
@@ -455,6 +456,7 @@ class QQChannel(BaseChannel):
         better rendering. If markdown is rejected (400), falls back to plain
         text (msg_type=0) and caches the failure to skip markdown next time.
         """
+        text = convert_tables_to_plain(text)
         msg_type, meta = self._resolve_send_routing(subject)
         msg_id = meta.get("msg_id")
 
@@ -510,7 +512,7 @@ class QQChannel(BaseChannel):
 
         for part in parts:
             if isinstance(part, TextContent):
-                text_parts.append(part.text)
+                text_parts.append(convert_tables_to_plain(part.text))
             else:
                 media_parts.append(part)
 
