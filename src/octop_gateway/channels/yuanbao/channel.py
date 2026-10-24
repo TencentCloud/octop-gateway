@@ -57,6 +57,26 @@ from octop_gateway.models import (
 
 logger = logging.getLogger(__name__)
 
+# TIMCustomElem (elem_type 1002) carries group-mention data; ``@all`` is
+# signalled by these user_id values / display texts (platform convention).
+_AT_ALL_MARKERS = frozenset({"0", "all"})
+_AT_ALL_TEXTS = frozenset({"@all", "@所有人", "@全体成员"})
+
+
+def _parse_custom_elem(content_map: Mapping[str, object]) -> dict[str, str] | None:
+    """Extract an at-element (elem_type 1002) from a TIMCustomElem content map."""
+    data_str = content_map.get("data")
+    try:
+        custom = json.loads(data_str) if isinstance(data_str, str) else None
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(custom, Mapping) or str(custom.get("elem_type") or "") != "1002":
+        return None
+    return {
+        "user_id": str(custom.get("user_id") or "").strip(),
+        "text": str(custom.get("text") or "").strip(),
+    }
+
 
 class YuanbaoChannel(BaseChannel):
     """Tencent Yuanbao bot channel over binary WebSocket."""
@@ -764,7 +784,7 @@ class YuanbaoChannel(BaseChannel):
             )
             with contextlib.suppress(Exception):
                 inbound = self.parse_inbound(payload)
-                if inbound.channel_subject:
+                if inbound.channel_subject and self._group_context.will_trigger(inbound):
                     await self._send_typing_indicator(inbound.channel_subject)
 
         if self._enqueue_callback:
@@ -846,6 +866,9 @@ class YuanbaoChannel(BaseChannel):
         is_group = bool(group_code) or str(data.get("callback_command") or "").startswith("Group.")
 
         content_parts: list[ContentPart] = []
+        at_elems: list[dict[str, str]] = []
+        is_mentioned_bot = False
+        at_all = False
         for body in data.get("msg_body") or []:
             if not isinstance(body, Mapping):
                 continue
@@ -856,6 +879,19 @@ class YuanbaoChannel(BaseChannel):
                 text = str(content_map.get("text") or "")
                 if text:
                     content_parts.append(TextContent(text=text))
+            elif msg_type == "TIMCustomElem":
+                # Group-mention carrier; the protocol module exposes no
+                # MSG_TYPE_CUSTOM constant, so compare the literal string.
+                custom = _parse_custom_elem(content_map)
+                if custom is not None:
+                    at_user_id = custom["user_id"]
+                    at_text = custom["text"]
+                    if at_user_id:
+                        at_elems.append({"user_id": at_user_id, "text": at_text})
+                        if at_user_id == (self._bot_id or self._config.bot_id):
+                            is_mentioned_bot = True
+                    if at_text in _AT_ALL_TEXTS or at_user_id in _AT_ALL_MARKERS:
+                        at_all = True
             elif msg_type == proto.MSG_TYPE_IMAGE:
                 image_info = _first_image_info(content_map)
                 url = _first_media_url(content_map, api_domain=self._config.api_domain)
@@ -931,6 +967,13 @@ class YuanbaoChannel(BaseChannel):
             "trace_id": trace_id,
             "bot_id": self._bot_id or self._config.bot_id,
         }
+        if is_group:
+            # GroupContextManager reads ``bot_mentioned`` to decide whether a
+            # group message starts an agent turn (mention activation).
+            metadata["bot_mentioned"] = is_mentioned_bot or at_all
+            metadata["mentioned_user_ids"] = [elem["user_id"] for elem in at_elems]
+            metadata["at_elems"] = at_elems
+            metadata["at_all"] = at_all
 
         return InboundMessage(
             channel_id=self.channel_id,

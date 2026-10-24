@@ -156,6 +156,20 @@ class GroupContextManager:
         conversation_id = self._conversation_id(message)
         return bool(conversation_id and self._config.resolve(conversation_id).enabled)
 
+    def will_trigger(self, message: InboundMessage) -> bool:
+        """Whether this message would start an agent turn under the active policy.
+
+        Read-only counterpart to :meth:`prepare`; channels use it to skip
+        speculative work (e.g. typing indicators) for passive group chatter.
+        """
+        conversation_id = self._conversation_id(message)
+        if not conversation_id:
+            return True
+        policy = self._config.resolve(conversation_id)
+        if not policy.enabled:
+            return True
+        return self._should_process(message, policy)
+
     def should_persist_media(self, message: InboundMessage) -> bool:
         """Whether media must survive long enough to reach the agent.
 
