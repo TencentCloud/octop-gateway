@@ -278,6 +278,8 @@ class ChannelManager:
             except Exception:  # pylint: disable=broad-except
                 # Preserve the existing worker error path for malformed payloads.
                 message = None
+            if message is not None and not channel.group_context_manager.accepts(message):
+                return
             if message is not None and self._interrupt_message_predicate(message):
                 task = asyncio.create_task(
                     self._run_interrupt(channel_id, channel, message),
@@ -724,6 +726,8 @@ class ChannelManager:
             try:
                 # Parse to get session key for locking
                 message = payload if isinstance(payload, InboundMessage) else channel.parse_inbound(payload)
+                if not channel.group_context_manager.accepts(message):
+                    continue
                 session_key = channel.get_debounce_key(message)
 
                 # Drain additional same-session items from queue
@@ -782,16 +786,18 @@ class ChannelManager:
 
             try:
                 msg = payload if isinstance(payload, InboundMessage) else channel.parse_inbound(payload)
+                if not channel.group_context_manager.accepts(msg):
+                    continue
                 if self._control_message_predicate is not None and self._control_message_predicate(msg):
                     try:
                         queue.put_nowait(payload)
                     except asyncio.QueueFull:
                         logger.warning("Queue full when re-enqueuing control message, dropping")
                     break
-                if channel.get_debounce_key(msg) == session_key:
+                if channel.get_debounce_key(msg) == session_key and channel.should_batch_inbound(msg):
                     drained.append(msg)
                 else:
-                    # Different session, put it back
+                    # Preserve another session or a message needing its own turn.
                     try:
                         queue.put_nowait(payload)
                     except asyncio.QueueFull:

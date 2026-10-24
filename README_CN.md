@@ -197,6 +197,37 @@ MessageProcessor: InboundMessage → AsyncIterator[MessageEvent]
 
 每个 `BaseChannel` 管理自己的传输；管理器负责调度、媒体、约束与分发。你的处理器只看到归一化后的事件流。
 
+### QQ 群命令权限
+
+QQ 默认启用群内命令保护，旧 JSON 配置未填写新字段时也会启用：
+
+```json
+{
+  "group_context": {
+    "enabled": true,
+    "owner_commands_only": true,
+    "owner_ids": []
+  }
+}
+```
+
+`owner_ids` 填写可信发送者的 `author.member_openid`，与消息元数据中的
+`sender_id` 匹配；不要填写 QQ 号、群 ID 或 Octop 用户 ID。白名单为空时，
+所有成员的群内命令都被忽略，可先通过 Dashboard/CLI 管理。
+两个字段均支持在现有 `group_context.groups` 中按群覆盖。
+
+仅匹配消息开头符合完整语法的 Octop 内置斜杠命令及别名，例如 `/model`、
+`/new`、`/help`、`/delete`、`/stop`。消息中间的 `/model`、URL、
+`/tmp/file` 等路径、代码块和未登记的自定义斜杠名称仍按普通消息处理。
+Octop 新增命令时，应同步 `group_context.py` 中的内置名称表。
+
+非所有者命令在宿主控制回调、媒体下载和处理器调用前静默丢弃，也不会进入
+临时群上下文。关闭 `group_context.enabled` 只关闭触发和上下文处理，命令
+保护继续生效；显式设置 `owner_commands_only: false` 才会放开群命令。
+私聊和消息发送流程沿用现有行为，其他通道默认不启用此策略。
+
+该策略不限制自然语言请求或 Agent 工具权限，应用仍需配置适当的工具权限。
+
 ### 开发
 
 **环境要求：** Python 3.12+、[uv](https://docs.astral.sh/uv/)

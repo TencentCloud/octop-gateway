@@ -217,6 +217,7 @@ class QQConfig(ChannelConfig):
             activation="mention",
             history="recent",
             history_limit=10,
+            owner_commands_only=True,
         )
     )
 
@@ -240,6 +241,8 @@ class QQConfig(ChannelConfig):
         raw_group_context = data.get("group_context")
         if isinstance(raw_group_context, dict) and "enabled" not in raw_group_context:
             config.group_context.enabled = True
+        if isinstance(raw_group_context, dict) and "owner_commands_only" not in raw_group_context:
+            config.group_context.owner_commands_only = True
         return config
 
     @classmethod

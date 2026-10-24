@@ -756,6 +756,8 @@ class BaseChannel(ABC):
         """Prepare one message for any channel-specific output strategy."""
         message = self.parse_inbound(raw_payload)
         await self._preprocess_inbound(message)
+        if not self._group_context.accepts(message):
+            return None
 
         # GroupContextManager owns short-lived passive chatter and activation
         # policy.  A non-triggering group message is intentionally observed but
@@ -1113,10 +1115,10 @@ class BaseChannel(ABC):
     def should_batch_inbound(self, message: InboundMessage) -> bool:
         """Return whether manager-level batching may merge this message.
 
-        Group-context-enabled messages must retain individual sender labels and
-        ordering, so they are processed one event at a time.
+        Group-context messages retain individual sender labels. Protected
+        commands must not absorb other senders' messages as arguments.
         """
-        return not self._group_context.handles(message)
+        return not (self._group_context.handles(message) or self._group_context.protects_command(message))
 
     def merge_inbound(self, messages: list[InboundMessage]) -> InboundMessage:
         """Merge multiple inbound messages into one (for batching).

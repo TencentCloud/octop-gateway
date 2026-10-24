@@ -9,6 +9,8 @@ start an agent turn.
 
 from __future__ import annotations
 
+import logging
+import re
 import time
 from collections import deque
 from collections.abc import Mapping
@@ -16,6 +18,62 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from octop_gateway.models import ContentPart, GroupContext, GroupContextMessage, InboundMessage, TextContent
+
+logger = logging.getLogger(__name__)
+
+# Octop's built-in names and aliases (infra/gateway/slash/catalog.py).
+# Match its full command syntax so paths, URLs and inline examples remain text.
+_OCTOP_COMMAND_RE = re.compile(r"^\s*/([a-zA-Z][\w-]*)(?:\s[\s\S]*)?$")
+_OCTOP_COMMANDS = frozenset(
+    {
+        "agent",
+        "approve",
+        "ask",
+        "cancel",
+        "clear",
+        "compact",
+        "connectors",
+        "craft",
+        "cron",
+        "delete",
+        "exit",
+        "help",
+        "history",
+        "list",
+        "memory",
+        "mode",
+        "model",
+        "models",
+        "new",
+        "pending",
+        "pin",
+        "plan",
+        "quit",
+        "reject",
+        "resume",
+        "sessions",
+        "skills",
+        "status",
+        "stop",
+        "switch",
+        "title",
+        "token",
+        "topics",
+        "unpin",
+    }
+)
+
+
+def _owner_commands_only(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError("owner_commands_only must be a boolean")
+    return value
+
+
+def _owner_ids(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple) or any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ValueError("owner_ids must be a list of non-empty sender IDs")
+    return tuple(dict.fromkeys(item.strip() for item in value))
 
 
 class GroupVisibility(StrEnum):
@@ -52,6 +110,8 @@ class GroupContextPolicy:
     history_limit: int = 10
     history_ttl_seconds: float = 300.0
     clear_after_reply: bool = True
+    owner_commands_only: bool = False
+    owner_ids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -72,6 +132,8 @@ class GroupContextConfig:
     history_ttl_seconds: float = 300.0
     clear_after_reply: bool = True
     groups: dict[str, dict[str, object]] = field(default_factory=dict)
+    owner_commands_only: bool = False
+    owner_ids: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> GroupContextConfig:
@@ -90,6 +152,8 @@ class GroupContextConfig:
             history_ttl_seconds=float(str(data.get("history_ttl_seconds", 300.0))),
             clear_after_reply=bool(data.get("clear_after_reply", True)),
             groups=groups,
+            owner_commands_only=_owner_commands_only(data.get("owner_commands_only", False)),
+            owner_ids=list(_owner_ids(data.get("owner_ids", []))),
         )
 
     def resolve(self, conversation_id: str) -> GroupContextPolicy:
@@ -102,6 +166,8 @@ class GroupContextConfig:
                 "history_limit": self.history_limit,
                 "history_ttl_seconds": self.history_ttl_seconds,
                 "clear_after_reply": self.clear_after_reply,
+                "owner_commands_only": self.owner_commands_only,
+                "owner_ids": self.owner_ids,
             }
         )
         wildcard = self.groups.get("*")
@@ -122,6 +188,8 @@ class GroupContextConfig:
             history_limit=max(0, int(str(data.get("history_limit", 10)))),
             history_ttl_seconds=max(0.0, float(str(data.get("history_ttl_seconds", 300.0)))),
             clear_after_reply=bool(data.get("clear_after_reply", True)),
+            owner_commands_only=_owner_commands_only(data.get("owner_commands_only", False)),
+            owner_ids=_owner_ids(data.get("owner_ids", [])),
         )
 
     @classmethod
@@ -134,6 +202,8 @@ class GroupContextConfig:
             "history_limit": values.get("history_limit", base.history_limit),
             "history_ttl_seconds": values.get("history_ttl_seconds", base.history_ttl_seconds),
             "clear_after_reply": values.get("clear_after_reply", base.clear_after_reply),
+            "owner_commands_only": values.get("owner_commands_only", base.owner_commands_only),
+            "owner_ids": values.get("owner_ids", base.owner_ids),
         }
         return cls._policy_from_mapping(raw)
 
@@ -155,6 +225,38 @@ class GroupContextManager:
     def handles(self, message: InboundMessage) -> bool:
         conversation_id = self._conversation_id(message)
         return bool(conversation_id and self._config.resolve(conversation_id).enabled)
+
+    def protects_command(self, message: InboundMessage) -> bool:
+        """Keep an authorized command separate from other senders' arguments."""
+        policy = self._config.resolve(self._conversation_id(message))
+        return self._is_group(message) and policy.owner_commands_only and self._is_octop_command(message.text)
+
+    def accepts(self, message: InboundMessage) -> bool:
+        """Authorize group commands before batching, host callbacks or media I/O."""
+        if not self._is_group(message):
+            return True
+        policy = self._config.resolve(self._conversation_id(message))
+        if self._accepts_command(policy, message.text, message.metadata.get("sender_id")):
+            return True
+        logger.debug("non_owner_blocked_in_group: channel=%s", message.channel_id)
+        return False
+
+    @staticmethod
+    def _is_group(message: InboundMessage) -> bool:
+        return message.metadata.get("chat_type") == "group" or bool(
+            message.channel_subject and message.channel_subject.chat_type == "group"
+        )
+
+    @staticmethod
+    def _accepts_command(policy: GroupContextPolicy, text: str, sender_id: object) -> bool:
+        if not policy.owner_commands_only or not GroupContextManager._is_octop_command(text):
+            return True
+        return isinstance(sender_id, str) and sender_id not in ("", "unknown") and sender_id in policy.owner_ids
+
+    @staticmethod
+    def _is_octop_command(text: str) -> bool:
+        command = _OCTOP_COMMAND_RE.match(text)
+        return command is not None and command[1].lower() in _OCTOP_COMMANDS
 
     def should_persist_media(self, message: InboundMessage) -> bool:
         """Whether media must survive long enough to reach the agent.
@@ -187,6 +289,8 @@ class GroupContextManager:
 
     def prepare(self, message: InboundMessage) -> InboundMessage | None:
         """Record passive chatter or enrich a message that should reach the agent."""
+        if not self.accepts(message):
+            return None
         conversation_id = self._conversation_id(message)
         if not conversation_id:
             return message
@@ -208,6 +312,8 @@ class GroupContextManager:
             platform_messages,
             list(self._buffers.get(conversation_id, ())),
         )
+        if self._is_group(message):
+            buffered = [item for item in buffered if self._accepts_command(policy, item.text, item.sender_id)]
         if policy.history is GroupHistoryMode.NONE or policy.visibility is GroupVisibility.MENTION_ONLY:
             buffered = []
 

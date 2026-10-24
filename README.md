@@ -247,6 +247,8 @@ policy. It can be configured globally and overridden by native group ID:
     "history_limit": 10,
     "history_ttl_seconds": 300,
     "clear_after_reply": true,
+    "owner_commands_only": true,
+    "owner_ids": [],
     "groups": {
       "GROUP_OPENID_WITH_FULL_ACCESS": {
         "visibility": "all",
@@ -266,6 +268,29 @@ policy. It can be configured globally and overridden by native group ID:
   `all` visibility, so replayed recent messages cannot trigger multiple replies.
 - `history`: `recent` or `none`. Passive messages are bounded, expire by TTL,
   and are cleared after a successful reply.
+- `owner_commands_only`: QQ defaults to `true`, including older JSON configs
+  without this key. Other channels keep their existing behavior by default.
+- `owner_ids`: trusted platform sender IDs matched against `metadata.sender_id`.
+  For QQ groups, use `author.member_openid`, not a QQ number, group ID or Octop
+  user ID. An empty list denies group commands to everyone; use Dashboard/CLI
+  for management until owners are configured. Both fields support overrides
+  in `groups`.
+
+The owner check applies to Octop's built-in slash commands and aliases at the
+start of a message, such as `/model`, `/new`, `/help`, `/delete` and `/stop`.
+Inline mentions of `/model`, URLs, paths such as `/tmp/file`, code blocks and
+unknown/custom slash names remain ordinary messages. Keep the built-in name
+registry in `group_context.py` aligned when Octop adds commands.
+
+Non-owner commands are silently dropped before host control callbacks, media
+downloads and processor invocation, and excluded from passive context.
+Protection stays active when `group_context.enabled` is `false`; that switch
+only disables activation/context handling. Explicitly setting
+`owner_commands_only` to `false` restores unrestricted group commands. Private
+messages and outbound delivery keep their existing behavior.
+
+This policy does not restrict normal language requests or the agent's tools.
+Applications exposing powerful tools must enforce their own tool permissions.
 
 When a platform permission is downgraded, update `visibility` to the granted
 level (or restart/reconfigure the channel); this immediately drops the old
