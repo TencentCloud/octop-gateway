@@ -332,6 +332,13 @@ class QQChannel(BaseChannel):
         return ChannelConstraints(
             send_rate_limit=(20, 60.0),
             typing_keepalive_interval=5.0,
+            # QQ 没有强制回复时限，但 agent 型定时任务 / 长工具链单轮可能跑几分钟。
+            # reply_timeout 留 0 时，基类里「首响超时先发占位文案」的分支永远不会
+            # 触发，用户在首条消息到达前没有任何反馈（C2C 的「正在输入」依赖
+            # input_notify，并非所有客户端都会渲染）。这里给一个宽松的首响阈值，
+            # 配合 placeholder 策略先回一句，再把正文发出去。
+            reply_timeout=20.0,
+            timeout_strategy="placeholder",
             show_thinking=False,
             show_tool_hints=False,
         )
