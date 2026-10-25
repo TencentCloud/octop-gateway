@@ -248,6 +248,7 @@ policy. It can be configured globally and overridden by native group ID:
     "history_ttl_seconds": 300,
     "clear_after_reply": true,
     "owner_commands_only": true,
+    "owner_tools_only": true,
     "owner_ids": [],
     "groups": {
       "GROUP_OPENID_WITH_FULL_ACCESS": {
@@ -270,6 +271,11 @@ policy. It can be configured globally and overridden by native group ID:
   and are cleared after a successful reply.
 - `owner_commands_only`: QQ defaults to `true`, including older JSON configs
   without this key. Other channels keep their existing behavior by default.
+- `owner_tools_only`: optional tool protection for every group adapter. Defaults
+  to `false` for compatibility. When enabled, non-owners receive
+  `InboundMessage.allowed_tools=[]` and can still chat; owners inherit the
+  existing tool policy. Unknown senders are treated as non-owners. This setting
+  also supports per-group overrides and remains active with `enabled=false`.
 - `owner_ids`: trusted platform sender IDs matched against `metadata.sender_id`.
   For QQ groups, use `author.member_openid`, not a QQ number, group ID or Octop
   user ID. An empty list denies group commands to everyone; use Dashboard/CLI
@@ -289,8 +295,13 @@ only disables activation/context handling. Explicitly setting
 `owner_commands_only` to `false` restores unrestricted group commands. Private
 messages and outbound delivery keep their existing behavior.
 
-This policy does not restrict normal language requests or the agent's tools.
-Applications exposing powerful tools must enforce their own tool permissions.
+Tool protection is enforced by the agent runtime: hosts must forward
+`allowed_tools` to a runtime that filters the tool list and rejects disallowed
+execution (for example, `octop-harness.ChatRequest.allowed_tools`). `None`
+inherits existing permissions; an empty list denies all tools. Merging messages
+intersects their ceilings. Protected groups keep each sender's trigger separate
+so batching cannot promote a non-owner message into an owner's tool turn.
+This does not remove private memory already included in model context.
 
 When a platform permission is downgraded, update `visibility` to the granted
 level (or restart/reconfigure the channel); this immediately drops the old
@@ -349,3 +360,5 @@ before updating. `unregister_channel_kind(kind, plugin_id=owner)` removes the
 registration only, not running instances or persisted configuration.
 `registered_channel_kinds()` returns the active builtin and plugin kinds;
 `SUPPORTED_CHANNEL_KINDS` remains the builtin compatibility snapshot.
+
+发布接入要求：启用 `owner_tools_only` 的宿主必须透传 `allowed_tools`，并使用已实现回合级工具限制的运行时。Octop 应在新版本中配套升级 gateway 与 harness；单独升级网关不能代表端到端权限限制已生效。

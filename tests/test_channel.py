@@ -743,3 +743,41 @@ class TestRateLimitAcquisition:
         await ch.reply_text(user, "hello")
         await ch.push_text(user, "hello")
         # If we got here without hanging, no-op confirmed.
+
+
+def test_tool_protected_groups_are_not_batched_even_without_passive_context() -> None:
+    channel = EchoChannel(
+        make_echo_processor, config=ChannelConfig(group_context=GroupContextConfig(owner_tools_only=True))
+    )
+    message = InboundMessage(
+        channel_id=channel.channel_id,
+        channel_subject=ChannelSubject(subject_id="group", chat_type="group"),
+        content=[TextContent(text="read a file")],
+        metadata={"sender_id": "member"},
+    )
+    assert channel.should_batch_inbound(message) is False
+
+
+@pytest.mark.asyncio
+async def test_shared_pipeline_forwards_tool_policy_and_still_replies() -> None:
+    seen: list[list[str] | None] = []
+
+    async def processor(message: InboundMessage) -> AsyncIterator[MessageEvent]:
+        seen.append(message.allowed_tools)
+        yield MessageEvent.text("still chatting")
+        yield MessageEvent.completed()
+
+    channel = EchoChannel(
+        processor, config=ChannelConfig(group_context=GroupContextConfig(owner_tools_only=True, owner_ids=["owner"]))
+    )
+    for sender in ("member", "owner"):
+        await channel.handle_inbound(
+            InboundMessage(
+                channel_id=channel.channel_id,
+                channel_subject=ChannelSubject(subject_id="group", chat_type="group"),
+                content=[TextContent(text="hello a/b")],
+                metadata={"sender_id": sender},
+            )
+        )
+    assert seen == [[], None]
+    assert channel.sent_messages == [("group", "still chatting"), ("group", "still chatting")]

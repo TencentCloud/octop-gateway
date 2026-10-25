@@ -64,9 +64,9 @@ _OCTOP_COMMANDS = frozenset(
 )
 
 
-def _owner_commands_only(value: object) -> bool:
+def _owner_only(value: object, name: str) -> bool:
     if not isinstance(value, bool):
-        raise ValueError("owner_commands_only must be a boolean")
+        raise ValueError(f"{name} must be a boolean")
     return value
 
 
@@ -112,6 +112,7 @@ class GroupContextPolicy:
     clear_after_reply: bool = True
     owner_commands_only: bool = False
     owner_ids: tuple[str, ...] = ()
+    owner_tools_only: bool = False
 
 
 @dataclass
@@ -134,6 +135,7 @@ class GroupContextConfig:
     groups: dict[str, dict[str, object]] = field(default_factory=dict)
     owner_commands_only: bool = False
     owner_ids: list[str] = field(default_factory=list)
+    owner_tools_only: bool = False
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> GroupContextConfig:
@@ -152,7 +154,8 @@ class GroupContextConfig:
             history_ttl_seconds=float(str(data.get("history_ttl_seconds", 300.0))),
             clear_after_reply=bool(data.get("clear_after_reply", True)),
             groups=groups,
-            owner_commands_only=_owner_commands_only(data.get("owner_commands_only", False)),
+            owner_commands_only=_owner_only(data.get("owner_commands_only", False), "owner_commands_only"),
+            owner_tools_only=_owner_only(data.get("owner_tools_only", False), "owner_tools_only"),
             owner_ids=list(_owner_ids(data.get("owner_ids", []))),
         )
 
@@ -167,6 +170,7 @@ class GroupContextConfig:
                 "history_ttl_seconds": self.history_ttl_seconds,
                 "clear_after_reply": self.clear_after_reply,
                 "owner_commands_only": self.owner_commands_only,
+                "owner_tools_only": self.owner_tools_only,
                 "owner_ids": self.owner_ids,
             }
         )
@@ -188,7 +192,8 @@ class GroupContextConfig:
             history_limit=max(0, int(str(data.get("history_limit", 10)))),
             history_ttl_seconds=max(0.0, float(str(data.get("history_ttl_seconds", 300.0)))),
             clear_after_reply=bool(data.get("clear_after_reply", True)),
-            owner_commands_only=_owner_commands_only(data.get("owner_commands_only", False)),
+            owner_commands_only=_owner_only(data.get("owner_commands_only", False), "owner_commands_only"),
+            owner_tools_only=_owner_only(data.get("owner_tools_only", False), "owner_tools_only"),
             owner_ids=_owner_ids(data.get("owner_ids", [])),
         )
 
@@ -203,6 +208,7 @@ class GroupContextConfig:
             "history_ttl_seconds": values.get("history_ttl_seconds", base.history_ttl_seconds),
             "clear_after_reply": values.get("clear_after_reply", base.clear_after_reply),
             "owner_commands_only": values.get("owner_commands_only", base.owner_commands_only),
+            "owner_tools_only": values.get("owner_tools_only", base.owner_tools_only),
             "owner_ids": values.get("owner_ids", base.owner_ids),
         }
         return cls._policy_from_mapping(raw)
@@ -231,6 +237,10 @@ class GroupContextManager:
         policy = self._config.resolve(self._conversation_id(message))
         return self._is_group(message) and policy.owner_commands_only and self._is_octop_command(message.text)
 
+    def protects_tools(self, message: InboundMessage) -> bool:
+        """Keep different group senders out of the same privileged tool turn."""
+        return self._is_group(message) and self._config.resolve(self._conversation_id(message)).owner_tools_only
+
     def accepts(self, message: InboundMessage) -> bool:
         """Authorize group commands before batching, host callbacks or media I/O."""
         if not self._is_group(message):
@@ -251,6 +261,10 @@ class GroupContextManager:
     def _accepts_command(policy: GroupContextPolicy, text: str, sender_id: object) -> bool:
         if not policy.owner_commands_only or not GroupContextManager._is_octop_command(text):
             return True
+        return GroupContextManager._is_owner(policy, sender_id)
+
+    @staticmethod
+    def _is_owner(policy: GroupContextPolicy, sender_id: object) -> bool:
         return isinstance(sender_id, str) and sender_id not in ("", "unknown") and sender_id in policy.owner_ids
 
     @staticmethod
@@ -292,9 +306,15 @@ class GroupContextManager:
         if not self.accepts(message):
             return None
         conversation_id = self._conversation_id(message)
+        policy = self._config.resolve(conversation_id)
+        if (
+            self._is_group(message)
+            and policy.owner_tools_only
+            and not self._is_owner(policy, message.metadata.get("sender_id"))
+        ):
+            message.allowed_tools = []
         if not conversation_id:
             return message
-        policy = self._config.resolve(conversation_id)
         if not policy.enabled:
             message.group_context = None
             return message

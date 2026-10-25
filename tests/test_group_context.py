@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from octop_gateway.group_context import GroupContextConfig, GroupContextManager
 from octop_gateway.models import ChannelSubject, FileContent, InboundMessage, TextContent
 
@@ -128,3 +130,55 @@ def test_per_group_override_can_disable_history() -> None:
     current = manager.prepare(_group_message("question", message_id="m2", sender_id="bob", mentioned=True))
     assert current is not None and current.group_context is not None
     assert current.group_context.messages == []
+
+
+@pytest.mark.parametrize("sender, expected", [("owner", None), ("member", []), ("unknown", []), ("", [])])
+def test_group_tools_are_scoped_without_blocking_normal_messages(sender: str, expected: list[str] | None) -> None:
+    manager = GroupContextManager(GroupContextConfig(owner_tools_only=True, owner_ids=["owner"]))
+    message = _group_message("read USER.md; explain a/b", message_id="m1", sender_id=sender, mentioned=True)
+
+    assert manager.prepare(message) is message
+    assert message.allowed_tools == expected
+    assert message.group_context is None  # Protection also applies with passive context disabled.
+
+
+def test_tool_protection_preserves_existing_restrictions_and_group_overrides() -> None:
+    config = GroupContextConfig.from_dict(
+        {"owner_tools_only": True, "owner_ids": ["owner"], "groups": {"group-1": {"owner_ids": ["local-owner"]}}}
+    )
+    manager = GroupContextManager(config)
+    message = _group_message("hello", message_id="m1", sender_id="owner")
+    assert manager.prepare(message) is message
+    assert message.allowed_tools == []
+
+    owner_message = _group_message("hello", message_id="m2", sender_id="local-owner")
+    owner_message.allowed_tools = ["web_fetch"]
+    assert manager.prepare(owner_message) is owner_message
+    assert owner_message.allowed_tools == ["web_fetch"]
+
+
+def test_tool_protection_keeps_direct_messages_and_legacy_groups_unchanged() -> None:
+    message = _group_message("hello", message_id="m1", sender_id="member")
+    assert GroupContextManager().prepare(message) is message
+    assert message.allowed_tools is None
+
+    message.metadata["chat_type"] = "direct"
+    assert message.channel_subject is not None
+    message.channel_subject.chat_type = "direct"
+    manager = GroupContextManager(GroupContextConfig(owner_tools_only=True))
+    assert manager.prepare(message) is message
+    assert message.allowed_tools is None
+
+
+def test_tool_policy_can_be_disabled_for_a_specific_group() -> None:
+    config = GroupContextConfig.from_dict(
+        {"owner_tools_only": True, "groups": {"group-1": {"owner_tools_only": False}}}
+    )
+    message = _group_message("hello", message_id="m1", sender_id="member")
+    assert GroupContextManager(config).prepare(message) is message
+    assert message.allowed_tools is None
+
+
+def test_tool_policy_rejects_non_boolean_config() -> None:
+    with pytest.raises(ValueError, match="owner_tools_only"):
+        _ = GroupContextConfig.from_dict({"owner_tools_only": "false"})

@@ -181,6 +181,8 @@ class InboundMessage(BaseModel):
     channel_session_id: str | None = None
     content: list[ContentPart]
     group_context: GroupContext | None = None
+    # Per-invocation tool ceiling: None inherits, [] denies all tools.
+    allowed_tools: list[str] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     timestamp: float = Field(default_factory=time.time)
 

@@ -1118,7 +1118,11 @@ class BaseChannel(ABC):
         Group-context messages retain individual sender labels. Protected
         commands must not absorb other senders' messages as arguments.
         """
-        return not (self._group_context.handles(message) or self._group_context.protects_command(message))
+        return not (
+            self._group_context.handles(message)
+            or self._group_context.protects_command(message)
+            or self._group_context.protects_tools(message)
+        )
 
     def merge_inbound(self, messages: list[InboundMessage]) -> InboundMessage:
         """Merge multiple inbound messages into one (for batching).
