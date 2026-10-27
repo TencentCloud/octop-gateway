@@ -247,6 +247,9 @@ policy. It can be configured globally and overridden by native group ID:
     "history_limit": 10,
     "history_ttl_seconds": 300,
     "clear_after_reply": true,
+    "owner_commands_only": true,
+    "owner_tools_only": true,
+    "owner_ids": [],
     "groups": {
       "GROUP_OPENID_WITH_FULL_ACCESS": {
         "visibility": "all",
@@ -266,6 +269,41 @@ policy. It can be configured globally and overridden by native group ID:
   `all` visibility, so replayed recent messages cannot trigger multiple replies.
 - `history`: `recent` or `none`. Passive messages are bounded, expire by TTL,
   and are cleared after a successful reply.
+- `owner_commands_only`: defaults to `true` for channels using the shared group
+  policy, including Python config objects and older JSON configs without this
+  key. With no `owner_ids`, all built-in group commands are denied. Set this
+  explicitly to `false` to allow unrestricted group commands.
+- `owner_tools_only`: optional tool protection for every group adapter. Defaults
+  to `false` for compatibility. When enabled, non-owners receive
+  `InboundMessage.allowed_tools=[]` and can still chat; owners inherit the
+  existing tool policy. Unknown senders are treated as non-owners. This setting
+  also supports per-group overrides and remains active with `enabled=false`.
+- `owner_ids`: trusted platform sender IDs matched against `metadata.sender_id`.
+  For QQ groups, use `author.member_openid`, not a QQ number, group ID or Octop
+  user ID. An empty list denies group commands to everyone; use Dashboard/CLI
+  for management until owners are configured. These settings support overrides
+  in `groups`.
+
+The owner check applies to Octop's built-in slash commands and aliases at the
+start of a message, such as `/model`, `/new`, `/help`, `/delete` and `/stop`.
+Inline mentions of `/model`, URLs, paths such as `/tmp/file`, code blocks and
+unknown/custom slash names remain ordinary messages. Keep the built-in name
+registry in `group_context.py` aligned when Octop adds commands.
+
+Non-owner commands are silently dropped before host control callbacks, media
+downloads and processor invocation, and excluded from passive context.
+Protection stays active when `group_context.enabled` is `false`; that switch
+only disables activation/context handling. Explicitly setting
+`owner_commands_only` to `false` restores unrestricted group commands. Private
+messages and outbound delivery keep their existing behavior.
+
+Tool protection is enforced by the agent runtime: hosts must forward
+`allowed_tools` to a runtime that filters the tool list and rejects disallowed
+execution (for example, `octop-harness.ChatRequest.allowed_tools`). `None`
+inherits existing permissions; an empty list denies all tools. Merging messages
+intersects their ceilings. Protected groups keep each sender's trigger separate
+so batching cannot promote a non-owner message into an owner's tool turn.
+This does not remove private memory already included in model context.
 
 When a platform permission is downgraded, update `visibility` to the granted
 level (or restart/reconfigure the channel); this immediately drops the old
@@ -324,3 +362,5 @@ before updating. `unregister_channel_kind(kind, plugin_id=owner)` removes the
 registration only, not running instances or persisted configuration.
 `registered_channel_kinds()` returns the active builtin and plugin kinds;
 `SUPPORTED_CHANNEL_KINDS` remains the builtin compatibility snapshot.
+
+发布接入要求：启用 `owner_tools_only` 的宿主必须透传 `allowed_tools`，并使用已实现回合级工具限制的运行时。Octop 应在新版本中配套升级 gateway 与 harness；单独升级网关不能代表端到端权限限制已生效。

@@ -100,8 +100,13 @@ def merge_messages(messages: list[InboundMessage]) -> InboundMessage:
     merged_content: list[ContentPart] = []
     merged_meta: dict[str, Any] = dict(messages[0].metadata)
     earliest_ts = messages[0].timestamp
+    allowed_tools: set[str] | None = None
 
     for msg in messages:
+        if msg.allowed_tools is not None:
+            allowed_tools = (
+                set(msg.allowed_tools) if allowed_tools is None else allowed_tools.intersection(msg.allowed_tools)
+            )
         merged_content.extend(msg.content)
         earliest_ts = min(earliest_ts, msg.timestamp)
         # Merge metadata (later messages may add keys)
@@ -114,6 +119,7 @@ def merge_messages(messages: list[InboundMessage]) -> InboundMessage:
             "content": merged_content,
             "metadata": merged_meta,
             "timestamp": earliest_ts,
+            "allowed_tools": sorted(allowed_tools) if allowed_tools is not None else None,
         }
     )
 
