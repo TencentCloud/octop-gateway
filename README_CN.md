@@ -197,9 +197,9 @@ MessageProcessor: InboundMessage → AsyncIterator[MessageEvent]
 
 每个 `BaseChannel` 管理自己的传输；管理器负责调度、媒体、约束与分发。你的处理器只看到归一化后的事件流。
 
-### QQ 群命令权限
+### 群命令权限（QQ 示例）
 
-QQ 默认启用群内命令保护，旧 JSON 配置未填写新字段时也会启用：
+使用公共群策略的通道默认启用群内命令保护，Python 配置对象及未填写该字段的旧 JSON 配置也会启用。下面以 QQ 为例：
 
 ```json
 {
@@ -224,7 +224,7 @@ Octop 新增命令时，应同步 `group_context.py` 中的内置名称表。
 非所有者命令在宿主控制回调、媒体下载和处理器调用前静默丢弃，也不会进入
 临时群上下文。关闭 `group_context.enabled` 只关闭触发和上下文处理，命令
 保护继续生效；显式设置 `owner_commands_only: false` 才会放开群命令。
-私聊和消息发送流程沿用现有行为，其他通道默认不启用此策略。
+私聊和消息发送流程沿用现有行为。该默认值同样适用于其他使用公共群策略的通道；如需放开群命令，应显式设置 `owner_commands_only: false`。
 
 该策略不限制自然语言请求或 Agent 工具权限，应用仍需配置适当的工具权限。
 

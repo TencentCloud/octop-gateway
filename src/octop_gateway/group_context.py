@@ -110,7 +110,7 @@ class GroupContextPolicy:
     history_limit: int = 10
     history_ttl_seconds: float = 300.0
     clear_after_reply: bool = True
-    owner_commands_only: bool = False
+    owner_commands_only: bool = True
     owner_ids: tuple[str, ...] = ()
     owner_tools_only: bool = False
 
@@ -133,7 +133,7 @@ class GroupContextConfig:
     history_ttl_seconds: float = 300.0
     clear_after_reply: bool = True
     groups: dict[str, dict[str, object]] = field(default_factory=dict)
-    owner_commands_only: bool = False
+    owner_commands_only: bool = True
     owner_ids: list[str] = field(default_factory=list)
     owner_tools_only: bool = False
 
@@ -154,7 +154,7 @@ class GroupContextConfig:
             history_ttl_seconds=float(str(data.get("history_ttl_seconds", 300.0))),
             clear_after_reply=bool(data.get("clear_after_reply", True)),
             groups=groups,
-            owner_commands_only=_owner_only(data.get("owner_commands_only", False), "owner_commands_only"),
+            owner_commands_only=_owner_only(data.get("owner_commands_only", True), "owner_commands_only"),
             owner_tools_only=_owner_only(data.get("owner_tools_only", False), "owner_tools_only"),
             owner_ids=list(_owner_ids(data.get("owner_ids", []))),
         )
@@ -192,7 +192,7 @@ class GroupContextConfig:
             history_limit=max(0, int(str(data.get("history_limit", 10)))),
             history_ttl_seconds=max(0.0, float(str(data.get("history_ttl_seconds", 300.0)))),
             clear_after_reply=bool(data.get("clear_after_reply", True)),
-            owner_commands_only=_owner_only(data.get("owner_commands_only", False), "owner_commands_only"),
+            owner_commands_only=_owner_only(data.get("owner_commands_only", True), "owner_commands_only"),
             owner_tools_only=_owner_only(data.get("owner_tools_only", False), "owner_tools_only"),
             owner_ids=_owner_ids(data.get("owner_ids", [])),
         )

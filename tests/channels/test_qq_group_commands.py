@@ -251,12 +251,26 @@ async def test_interrupt_path_rejects_non_owner_and_still_accepts_owner() -> Non
         await manager.stop()
 
 
-def test_other_channels_keep_existing_group_command_behavior() -> None:
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_qq_python_group_config_uses_command_protection(enabled: bool) -> None:
+    received: list[str] = []
+
+    async def processor(message: InboundMessage) -> AsyncIterator[MessageEvent]:
+        received.append(message.metadata["sender_id"])
+        yield MessageEvent.completed()
+
+    channel = _channel(processor, group_context=GroupContextConfig(enabled=enabled, owner_ids=["owner"]))
+    await channel.handle_inbound(_payload("/new", "member"))
+    await channel.handle_inbound(_payload("/new", "owner"))
+    assert received == ["owner"]
+
+
+def test_shared_group_policy_can_opt_out_of_command_protection() -> None:
     async def processor(message: InboundMessage) -> AsyncIterator[MessageEvent]:
         yield MessageEvent.completed()
 
     message = _channel(processor).parse_inbound(_payload("/new"))
-    manager = GroupContextManager(GroupContextConfig(enabled=True))
+    manager = GroupContextManager(GroupContextConfig(enabled=True, owner_commands_only=False))
     assert manager.prepare(message) is message
 
 

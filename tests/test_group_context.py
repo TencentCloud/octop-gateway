@@ -32,6 +32,45 @@ def _group_message(
     )
 
 
+@pytest.mark.parametrize(
+    "config",
+    [
+        GroupContextConfig(),
+        GroupContextConfig.from_dict({}),
+        GroupContextConfig.from_dict({"enabled": False}),
+        GroupContextConfig.from_dict({"groups": {"*": {"history": "none"}}}),
+        GroupContextConfig.from_dict({"groups": {"group-1": {"owner_ids": ["owner"]}}}),
+    ],
+    ids=["constructor", "empty-json", "context-disabled", "wildcard-inherits", "group-inherits"],
+)
+def test_command_protection_defaults_to_enabled(config: GroupContextConfig) -> None:
+    manager = GroupContextManager(config)
+    command = _group_message("/new", message_id="cmd", sender_id="member", mentioned=True)
+    assert manager.protects_command(command) is True
+    assert manager.accepts(command) is False
+    assert manager.prepare(command) is None
+
+    normal = _group_message("explain /new", message_id="text", sender_id="member", mentioned=True)
+    assert manager.protects_command(normal) is False
+    assert manager.prepare(normal) is normal
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"owner_commands_only": False},
+        {"groups": {"*": {"owner_commands_only": False}}},
+        {"groups": {"group-1": {"owner_commands_only": False}}},
+    ],
+    ids=["global-opt-out", "wildcard-opt-out", "group-opt-out"],
+)
+def test_command_protection_can_be_explicitly_disabled(raw: dict[str, object]) -> None:
+    manager = GroupContextManager(GroupContextConfig.from_dict(raw))
+    command = _group_message("/new", message_id="cmd", sender_id="member", mentioned=True)
+    assert manager.protects_command(command) is False
+    assert manager.prepare(command) is command
+
+
 def test_mention_recent_buffers_passive_messages_and_attaches_them_to_mention() -> None:
     manager = GroupContextManager(GroupContextConfig(enabled=True, visibility="mention_recent", history_limit=10))
 

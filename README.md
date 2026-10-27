@@ -269,8 +269,10 @@ policy. It can be configured globally and overridden by native group ID:
   `all` visibility, so replayed recent messages cannot trigger multiple replies.
 - `history`: `recent` or `none`. Passive messages are bounded, expire by TTL,
   and are cleared after a successful reply.
-- `owner_commands_only`: QQ defaults to `true`, including older JSON configs
-  without this key. Other channels keep their existing behavior by default.
+- `owner_commands_only`: defaults to `true` for channels using the shared group
+  policy, including Python config objects and older JSON configs without this
+  key. With no `owner_ids`, all built-in group commands are denied. Set this
+  explicitly to `false` to allow unrestricted group commands.
 - `owner_tools_only`: optional tool protection for every group adapter. Defaults
   to `false` for compatibility. When enabled, non-owners receive
   `InboundMessage.allowed_tools=[]` and can still chat; owners inherit the
@@ -279,7 +281,7 @@ policy. It can be configured globally and overridden by native group ID:
 - `owner_ids`: trusted platform sender IDs matched against `metadata.sender_id`.
   For QQ groups, use `author.member_openid`, not a QQ number, group ID or Octop
   user ID. An empty list denies group commands to everyone; use Dashboard/CLI
-  for management until owners are configured. Both fields support overrides
+  for management until owners are configured. These settings support overrides
   in `groups`.
 
 The owner check applies to Octop's built-in slash commands and aliases at the
