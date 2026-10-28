@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 公共群策略支持 `owner_tools_only`，通过回合级 `allowed_tools` 限制非所有者工具权限，保留普通聊天，并防止合并消息扩大权限；工具保护缺省关闭。
 - QQ 群内 Octop 斜杠命令默认仅允许显式配置的所有者发送；在控制回调和消息合并前鉴权，保留普通消息中的斜杠、URL、文件路径和自定义命令名称。
 - Telegram 非论坛群里的回复线程不再被当作话题：只有 `is_topic_message` 为真时才取 `message_thread_id`。此前机器人按钮消息（对用户消息的回复）会带上线程 id，与注册时的 `None` 不一致，导致按钮点击被回调校验拒绝，且开启话题隔离时会把一次回复误当作独立话题。
+- 通道配置按声明的类型转换，控制台传入的字符串不再穿透到传输层。MQTT 的 `port`、`qos` 由字符串 `"1883"` 变为整数，`paho` 不再抛 `TypeError: '<=' not supported between instances of 'str' and 'int'`；无法转换的值会给出带字段名的明确报错。
 
 ## [1.0.3] - 2026-10-16
 
