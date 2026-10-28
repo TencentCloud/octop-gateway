@@ -684,7 +684,11 @@ class ChannelManager:
         return channel_id
 
     async def remove_channel(self, channel_id: str) -> None:
-        """Dynamically remove a channel (stops it and cancels its workers)."""
+        """Cancel and drain owned workers/interrupts before stopping the channel.
+
+        An owned task removing its own channel is cancelled, but cannot await
+        its own cleanup before the adapter closes.
+        """
         channel = self._channels.pop(channel_id, None)
         if not channel:
             return
