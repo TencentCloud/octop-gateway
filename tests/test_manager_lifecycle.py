@@ -34,6 +34,7 @@ class LifecycleChannel(BaseChannel):
         self.cleanup_connected: bool | None = None
         self.manager: ChannelManager | None = None
         self.raise_in_cleanup = False
+        self.raise_in_stop = False
 
     async def start(self) -> None:
         self.connected = True
@@ -41,6 +42,8 @@ class LifecycleChannel(BaseChannel):
     async def stop(self) -> None:
         self.connected = False
         self.stopped.set()
+        if self.raise_in_stop:
+            raise RuntimeError("adapter stop failed")
 
     def parse_inbound(self, raw_payload: Any) -> InboundMessage:
         if isinstance(raw_payload, InboundMessage):
@@ -170,8 +173,12 @@ async def test_remove_cancels_and_drains_owned_interrupt_before_stop() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancelled_remove_still_stops_transport_and_propagates_cancellation() -> None:
+@pytest.mark.parametrize("stop_fails", [False, True])
+async def test_cancelled_remove_still_stops_transport_and_propagates_cancellation(
+    stop_fails: bool, caplog: pytest.LogCaptureFixture
+) -> None:
     channel = LifecycleChannel("cancel-remove")
+    channel.raise_in_stop = stop_fails
     manager = ChannelManager({channel.channel_id: channel}, workers_per_channel=1)
     await manager.start()
     worker = manager._workers[0]
@@ -186,8 +193,26 @@ async def test_cancelled_remove_still_stops_transport_and_propagates_cancellatio
         assert channel.cleaned.is_set()
         assert channel.cleanup_connected is True
         assert channel.stopped.is_set()
+        if stop_fails:
+            assert "adapter stop failed" in caplog.text
     finally:
         await _release_all(manager, [channel], [removal, worker])
+
+
+@pytest.mark.asyncio
+async def test_remove_propagates_adapter_stop_failure_without_caller_cancellation() -> None:
+    channel = LifecycleChannel("stop-error")
+    channel.raise_in_stop = True
+    manager = ChannelManager({channel.channel_id: channel}, workers_per_channel=1)
+    await manager.start()
+    workers = list(manager._workers)
+    try:
+        with pytest.raises(RuntimeError, match="adapter stop failed"):
+            await manager.remove_channel(channel.channel_id)
+        assert all(worker.done() for worker in workers)
+        assert channel.stopped.is_set()
+    finally:
+        await _release_all(manager, [channel], workers)
 
 
 @pytest.mark.asyncio

@@ -688,6 +688,7 @@ class ChannelManager:
 
         An owned task removing its own channel is cancelled, but cannot await
         its own cleanup before the adapter closes.
+        Cancellation during task draining takes precedence over shutdown errors.
         """
         channel = self._channels.pop(channel_id, None)
         if not channel:
@@ -709,8 +710,14 @@ class ChannelManager:
         try:
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
-        finally:
-            # Caller cancellation must not skip adapter shutdown after detach.
+        except asyncio.CancelledError:
+            try:
+                await channel.stop()
+            except Exception:  # pylint: disable=broad-except
+                # Retain cancellation while making the secondary failure visible.
+                logger.exception("Channel cleanup failed after removal cancellation: %s", channel_id)
+            raise
+        else:
             await channel.stop()
 
     def _track_channel_task(self, channel_id: str, task: asyncio.Task[None]) -> None:
