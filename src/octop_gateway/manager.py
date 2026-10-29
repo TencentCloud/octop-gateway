@@ -112,6 +112,7 @@ class ChannelManager:
         self._queues: dict[str, asyncio.Queue[Any]] = {}
         self._workers: list[asyncio.Task[None]] = []
         self._interrupt_tasks: set[asyncio.Task[None]] = set()
+        self._task_channels: dict[asyncio.Task[None], str] = {}
 
         # Session locking: prevent same-session messages from being processed
         # concurrently across workers
@@ -176,6 +177,7 @@ class ChannelManager:
                     name=f"gateway-worker-{channel_id}-{i}",
                 )
                 self._workers.append(task)
+                self._track_channel_task(channel_id, task)
 
         logger.info(
             "ChannelManager started: %d channels, %d workers each",
@@ -287,6 +289,7 @@ class ChannelManager:
                 )
                 self._interrupt_tasks.add(task)
                 task.add_done_callback(self._interrupt_tasks.discard)
+                self._track_channel_task(channel_id, task)
                 return
             if message is not None:
                 queued_payload = message
@@ -670,6 +673,7 @@ class ChannelManager:
                     name=f"gateway-worker-{channel_id}-{i}",
                 )
                 self._workers.append(task)
+                self._track_channel_task(channel_id, task)
 
         logger.info(
             "Channel registered: id=%s type=%s tenant=%s",
@@ -680,23 +684,46 @@ class ChannelManager:
         return channel_id
 
     async def remove_channel(self, channel_id: str) -> None:
-        """Dynamically remove a channel (stops it and cancels its workers)."""
+        """Cancel and drain owned workers/interrupts before stopping the channel.
+
+        An owned task removing its own channel is cancelled, but cannot await
+        its own cleanup before the adapter closes.
+        Cancellation during task draining takes precedence over shutdown errors.
+        """
         channel = self._channels.pop(channel_id, None)
         if not channel:
             return
 
         self._queues.pop(channel_id, None)
 
-        # Cancel workers for this channel
-        remaining: list[asyncio.Task[None]] = []
-        for task in self._workers:
-            if task.get_name().startswith(f"gateway-worker-{channel_id}-"):
-                task.cancel()
-            else:
-                remaining.append(task)
-        self._workers = remaining
+        owned = {task for task, owner in self._task_channels.items() if owner == channel_id}
+        for task in owned:
+            self._task_channels.pop(task, None)
+            task.cancel()
+        self._workers = [task for task in self._workers if task not in owned]
+        self._interrupt_tasks.difference_update(owned)
 
-        await channel.stop()
+        # A handler removing its own channel retains self-cancellation, but
+        # cannot join its own task. External removals drain all owned activity.
+        current = asyncio.current_task()
+        pending = [task for task in owned if task is not current]
+        try:
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        except asyncio.CancelledError:
+            try:
+                await channel.stop()
+            except Exception:  # pylint: disable=broad-except
+                # Retain cancellation while making the secondary failure visible.
+                logger.exception("Channel cleanup failed after removal cancellation: %s", channel_id)
+            raise
+        else:
+            await channel.stop()
+
+    def _track_channel_task(self, channel_id: str, task: asyncio.Task[None]) -> None:
+        """Keep exact ownership until a manager-created activity completes."""
+        self._task_channels[task] = channel_id
+        task.add_done_callback(lambda done: self._task_channels.pop(done, None))
 
     @property
     def channel_ids(self) -> list[str]:
