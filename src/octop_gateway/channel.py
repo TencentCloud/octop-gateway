@@ -17,7 +17,8 @@ import re
 import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field, fields
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Self
 from urllib.parse import urlparse
 
@@ -51,6 +52,16 @@ logger = logging.getLogger(__name__)
 
 # Type alias for the message processor: takes InboundMessage, yields MessageEvents
 MessageProcessor = Callable[[InboundMessage], AsyncIterator[MessageEvent]]
+
+
+@dataclass
+class InboundReceipt:
+    attempted: bool = False
+    delivered: bool = False
+
+
+_inbound_receipt: ContextVar[InboundReceipt | None] = ContextVar("inbound_receipt", default=None)
+_inbound_activation: ContextVar[bool] = ContextVar("inbound_activation", default=False)
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +103,7 @@ class ChannelConfig:
     show_thinking: bool = False
     show_tool_hints: bool = True
     group_context: GroupContextConfig = field(default_factory=GroupContextConfig)
+    plugin_group_settings: dict[str, bool] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
@@ -129,7 +141,12 @@ class ChannelConfig:
         out = {k: _clean(v) for k, v in data.items() if k in known}
         group_context = out.get("group_context")
         if isinstance(group_context, dict):
-            out["group_context"] = GroupContextConfig.from_dict(group_context)
+            group_field = next(item for item in fields(cls) if item.name == "group_context")
+            defaults = asdict(group_field.default_factory())  # type: ignore[misc]
+            out["group_context"] = GroupContextConfig.from_dict({**defaults, **group_context})
+            out["plugin_group_settings"] = {
+                key: value for key, value in group_context.items() if isinstance(key, str) and type(value) is bool
+            }
         for alias, canonical in cls.field_aliases.items():  # type: ignore[attr-defined]
             if canonical in known and not out.get(canonical) and data.get(alias):
                 out[canonical] = _clean(data[alias])
@@ -239,6 +256,7 @@ class BaseChannel(ABC):
         # Set by ChannelManager
         self._enqueue_callback: Callable[[Any], None] | None = None
         self._group_context = GroupContextManager(config.group_context if config is not None else None)
+        self._plugin_group_settings = dict(config.plugin_group_settings) if config is not None else {}
 
         # Platform constraints
         self._constraints = constraints or self._default_constraints()
@@ -282,6 +300,18 @@ class BaseChannel(ABC):
     def group_context_manager(self) -> GroupContextManager:
         """Expose group policy state for adapter capability-change hooks."""
         return self._group_context
+
+    @property
+    def plugin_group_settings(self) -> dict[str, bool]:
+        """Return persisted switches contributed by inbound policy plugins."""
+        return self._plugin_group_settings.copy()
+
+    def on_inbound_claimed(self, message: InboundMessage) -> None:
+        """Release transport intake after a policy plugin owns this input.
+
+        Durable adapters may acknowledge passive input here. Delayed agent
+        dispatch still uses the normal preparation and completion lifecycle.
+        """
 
     # =========================================================================
     # Lifecycle
@@ -350,17 +380,32 @@ class BaseChannel(ABC):
         (``subject.subject_id`` + ``subject.metadata``).
         """
         await self._acquire_rate_slot()
+        receipt = _inbound_receipt.get()
+        if receipt is not None:
+            receipt.attempted = True
         await self._send_text(subject, text)
+        if receipt is not None:
+            receipt.delivered = True
 
     async def reply_content(self, subject: ChannelSubject, parts: list[ContentPart]) -> None:
         """Reply with rich content (text + media)."""
         await self._acquire_rate_slot()
+        receipt = _inbound_receipt.get()
+        if receipt is not None:
+            receipt.attempted = True
         await self._send_content(subject, parts)
+        if receipt is not None:
+            receipt.delivered = True
 
     async def reply_media(self, subject: ChannelSubject, media: ContentPart) -> None:
         """Reply with a single media item."""
         await self._acquire_rate_slot()
+        receipt = _inbound_receipt.get()
+        if receipt is not None:
+            receipt.attempted = True
         await self._send_media(subject, media)
+        if receipt is not None:
+            receipt.delivered = True
 
     # ------- Push (bot-initiated) -------------------------------------------
 
@@ -734,11 +779,24 @@ class BaseChannel(ABC):
         5. Finalize the group-context lifecycle after a successful reply
         """
         prepared = await self._prepare_inbound(raw_payload)
-        if prepared is None:
-            return
-        message, subject = prepared
-        processing_succeeded = await self._process_inbound(message, subject)
-        self._finalize_inbound(message, processing_succeeded=processing_succeeded)
+        if prepared is not None:
+            message, subject = prepared
+            processing_succeeded = await self._process_inbound(message, subject)
+            self._finalize_inbound(message, processing_succeeded=processing_succeeded)
+
+    async def dispatch_inbound(
+        self, raw_payload: object, *, force_activation: bool = False, receipt: InboundReceipt | None = None
+    ) -> InboundReceipt:
+        """Deliver admitted input through the adapter's native inbound strategy."""
+        receipt = receipt if receipt is not None else InboundReceipt()
+        token = _inbound_receipt.set(receipt)
+        activation_token = _inbound_activation.set(force_activation)
+        try:
+            await self.handle_inbound(raw_payload)
+            return receipt
+        finally:
+            _inbound_activation.reset(activation_token)
+            _inbound_receipt.reset(token)
 
     async def _preprocess_inbound(self, message: InboundMessage) -> None:
         """Normalize platform-specific content before shared policy runs.
@@ -752,12 +810,20 @@ class BaseChannel(ABC):
     async def _prepare_inbound(
         self,
         raw_payload: object,
+        *,
+        force_activation: bool = False,
     ) -> tuple[InboundMessage, ChannelSubject] | None:
         """Prepare one message for any channel-specific output strategy."""
+        force_activation = force_activation or _inbound_activation.get()
         message = self.parse_inbound(raw_payload)
         await self._preprocess_inbound(message)
         if not self._group_context.accepts(message):
             return None
+
+        if force_activation:
+            policy = self._group_context.policy_for(message)
+            if not policy.enabled or policy.visibility != "all":
+                return None
 
         # GroupContextManager owns short-lived passive chatter and activation
         # policy.  A non-triggering group message is intentionally observed but
@@ -769,7 +835,7 @@ class BaseChannel(ABC):
         if self._media_backend and self._group_context.should_persist_media(message):
             await self._persist_media(message)
 
-        prepared = self._group_context.prepare(message)
+        prepared = self._group_context.prepare(message, force_activation=force_activation)
         if prepared is None:
             return None
         message = prepared

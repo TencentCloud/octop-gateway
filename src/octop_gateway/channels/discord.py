@@ -284,6 +284,7 @@ class DiscordChannel(BaseChannel):
             "channel_id_native": chat_id,
             "chat_type": chat_type,
             "sender_id": sender_id,
+            "sender_is_bot": bool(message.author.bot),
             "sender_name": message.author.display_name,
             "message_id": str(message.id),
             "bot_mentioned": mentioned,

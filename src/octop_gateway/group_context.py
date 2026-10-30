@@ -301,7 +301,11 @@ class GroupContextManager:
             and policy.history_limit > 0
         )
 
-    def prepare(self, message: InboundMessage) -> InboundMessage | None:
+    def policy_for(self, message: InboundMessage) -> GroupContextPolicy:
+        """Read the effective group policy without changing permission or history."""
+        return self._config.resolve(self._conversation_id(message))
+
+    def prepare(self, message: InboundMessage, *, force_activation: bool = False) -> InboundMessage | None:
         """Record passive chatter or enrich a message that should reach the agent."""
         if not self.accepts(message):
             return None
@@ -314,23 +318,31 @@ class GroupContextManager:
         ):
             message.allowed_tools = []
         if not conversation_id:
-            return message
+            return None if force_activation else message
         if not policy.enabled:
             message.group_context = None
-            return message
+            return None if force_activation else message
 
         self._expire(conversation_id, policy, now=message.timestamp)
         activation, capability_degraded = self._effective_activation(policy)
-        should_process = activation is GroupActivation.ALWAYS or bool(message.metadata.get("bot_mentioned"))
+        if force_activation and policy.visibility is not GroupVisibility.ALL:
+            return None
+        should_process = (
+            force_activation or activation is GroupActivation.ALWAYS or bool(message.metadata.get("bot_mentioned"))
+        )
         if not should_process:
             if policy.visibility is not GroupVisibility.MENTION_ONLY and policy.history is GroupHistoryMode.RECENT:
                 self._append(conversation_id, message, policy)
             return None
 
         platform_messages = message.group_context.messages if message.group_context else []
-        buffered = self._merge_messages(
-            platform_messages,
-            list(self._buffers.get(conversation_id, ())),
+        buffered = (
+            platform_messages
+            if force_activation
+            else self._merge_messages(
+                platform_messages,
+                list(self._buffers.get(conversation_id, ())),
+            )
         )
         if self._is_group(message):
             buffered = [item for item in buffered if self._accepts_command(policy, item.text, item.sender_id)]
