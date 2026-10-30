@@ -18,7 +18,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Self
 from urllib.parse import urlparse
 
@@ -103,6 +103,7 @@ class ChannelConfig:
     show_thinking: bool = False
     show_tool_hints: bool = True
     group_context: GroupContextConfig = field(default_factory=GroupContextConfig)
+    plugin_group_settings: dict[str, bool] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
@@ -140,7 +141,12 @@ class ChannelConfig:
         out = {k: _clean(v) for k, v in data.items() if k in known}
         group_context = out.get("group_context")
         if isinstance(group_context, dict):
-            out["group_context"] = GroupContextConfig.from_dict(group_context)
+            group_field = next(item for item in fields(cls) if item.name == "group_context")
+            defaults = asdict(group_field.default_factory())  # type: ignore[misc]
+            out["group_context"] = GroupContextConfig.from_dict({**defaults, **group_context})
+            out["plugin_group_settings"] = {
+                key: value for key, value in group_context.items() if isinstance(key, str) and type(value) is bool
+            }
         for alias, canonical in cls.field_aliases.items():  # type: ignore[attr-defined]
             if canonical in known and not out.get(canonical) and data.get(alias):
                 out[canonical] = _clean(data[alias])
@@ -250,6 +256,7 @@ class BaseChannel(ABC):
         # Set by ChannelManager
         self._enqueue_callback: Callable[[Any], None] | None = None
         self._group_context = GroupContextManager(config.group_context if config is not None else None)
+        self._plugin_group_settings = dict(config.plugin_group_settings) if config is not None else {}
 
         # Platform constraints
         self._constraints = constraints or self._default_constraints()
@@ -293,6 +300,18 @@ class BaseChannel(ABC):
     def group_context_manager(self) -> GroupContextManager:
         """Expose group policy state for adapter capability-change hooks."""
         return self._group_context
+
+    @property
+    def plugin_group_settings(self) -> dict[str, bool]:
+        """Return persisted switches contributed by inbound policy plugins."""
+        return self._plugin_group_settings.copy()
+
+    def on_inbound_claimed(self, message: InboundMessage) -> None:
+        """Release transport intake after a policy plugin owns this input.
+
+        Durable adapters may acknowledge passive input here. Delayed agent
+        dispatch still uses the normal preparation and completion lifecycle.
+        """
 
     # =========================================================================
     # Lifecycle

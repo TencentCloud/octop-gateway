@@ -81,3 +81,18 @@ def test_channel_credentials_error_carries_structured_data() -> None:
     assert err.missing == ["app_id", "app_secret"]
     with pytest.raises(ChannelCredentialsError):
         raise err
+
+
+def test_plugin_group_switch_retains_adapter_policy_defaults() -> None:
+    from octop_gateway.channels.discord import DiscordConfig
+
+    cfg = DiscordConfig.from_dict({"group_context": {"social_trigger_enabled": False}})
+    assert cfg.group_context.enabled
+    assert cfg.group_context.visibility == "all"
+    assert cfg.group_context.activation == "mention"
+    assert cfg.plugin_group_settings["social_trigger_enabled"] is False
+    generic = FeishuConfig.from_dict(
+        {"group_context": {"enabled": True, "social_trigger_enabled": True, "not_a_switch": "true"}}
+    )
+    assert generic.plugin_group_settings["social_trigger_enabled"] is True
+    assert "not_a_switch" not in generic.plugin_group_settings

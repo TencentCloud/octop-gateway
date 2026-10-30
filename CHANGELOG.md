@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- 通用入站策略开关与接管回调，保留适配器默认群策略；补齐 Discord、飞书、Telegram 的群消息身份和 @ 状态。
+
 ### Added
 
 - Add per-message admission hooks, guarded delayed dispatch and reply receipts. Preserve adapter overrides, group visibility and per-turn tool permissions.

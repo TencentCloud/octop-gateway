@@ -259,11 +259,12 @@ class TelegramChannel(BaseChannel):
         return False
 
     def _accept(self, message: Any) -> bool:
+        shared = self._config.group_context.resolve(str(message.chat.id))
         return self._is_allowed_sender(message) and should_accept_message(
             message,
             bot_id=self._bot_id,
             bot_username=self._bot_username,
-            activation=self._config.group_activation,
+            activation="always" if shared.enabled else self._config.group_activation,
             allowed_user_ids=self._config.allowed_user_ids,
             allowed_chat_ids=self._config.allowed_chat_ids,
             allow_unaddressed_commands=self._config.allow_unaddressed_commands,
@@ -451,6 +452,17 @@ class TelegramChannel(BaseChannel):
         return {
             "chat_id": chat_id,
             "user_id": user_id,
+            "sender_is_bot": bool(user.is_bot) if user and not message.sender_chat else None,
+            "bot_mentioned": should_accept_message(
+                message,
+                bot_id=self._bot_id,
+                bot_username=self._bot_username,
+                activation="mention_or_reply" if self._config.group_activation == "mention_or_reply" else "mention",
+                allowed_user_ids=[],
+                allowed_chat_ids=[],
+            )
+            if is_group
+            else False,
             "message_id": str(getattr(message, "message_id", "")),
             "is_group": is_group,
             "message_thread_id": _topic_thread_id(message),
@@ -684,6 +696,8 @@ class TelegramChannel(BaseChannel):
             "is_group": is_group,
             "source_message_id": data.get("message_id", ""),
             "sender_id": user_id,
+            "sender_is_bot": data.get("sender_is_bot"),
+            "bot_mentioned": data.get("bot_mentioned"),
             "reply_to_message_id": data.get("reply_to_message_id"),
             "media": data.get("media", []),
             "edited": data.get("edited", False),

@@ -745,6 +745,8 @@ class ChannelManager:
             claimed = await handler(channel, message, dispatch)
             if not isinstance(claimed, bool):
                 raise TypeError("admission handlers must return bool")
+            if claimed:
+                channel.on_inbound_claimed(message)
             return claimed
         except Exception:
             logger.warning("inbound admission handler failed: channel=%s", channel_id)

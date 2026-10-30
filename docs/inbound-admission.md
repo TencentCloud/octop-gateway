@@ -24,6 +24,20 @@ Cancellation propagates. Ordinary group input fails closed on hook errors;
 native commands, direct messages and mentions retain normal routing. The default
 without a hook preserves existing batching and routing behavior.
 
-QQ adapters expose a copy of boolean `group_context` values through `plugin_group_settings`. Plugin-owned keys are preserved without adding plugin-specific fields to Gateway. A handler uses its declared default when its key is absent.
+After a handler claims input, the manager calls the adapter's synchronous
+`on_inbound_claimed(message)` hook. Durable adapters can release their intake
+slot here; they must preserve an already started or completed message if the
+handler dispatched synchronously. A later dispatch still follows the normal
+preparation, processing and completion lifecycle.
+
+Group participation policies use the same hook across channel types. Adapters
+must provide stable subject and sender IDs plus explicit boolean
+`bot_mentioned` and `sender_is_bot` metadata. An adapter may instead expose
+`async resolve_sender_is_bot(message) -> bool | None`; unknown identities are
+not evidence of a human sender. Ordinary messages must reach the hook before
+the native activation check without bypassing sender or command permissions.
+`BaseChannel.plugin_group_settings` exposes persisted boolean switches under
+`group_context`, including switches contributed by policy plugins; it does not
+change the platform's message access permissions.
 
 Delivery receipts track native `reply_*` sends in the current dispatch context; independent proactive pushes are not a receipt for this turn.

@@ -805,3 +805,20 @@ class TestDictConfigAndProbe:
         finally:
             await mgr.stop()
             BUILTIN_CHANNELS.pop("probe_mock", None)
+
+
+@pytest.mark.asyncio
+async def test_claimed_input_notifies_durable_adapter_without_starting_agent() -> None:
+    from unittest.mock import Mock
+
+    channel = MockChannel(_echo_processor)
+    channel.on_inbound_claimed = Mock()  # type: ignore[method-assign]
+
+    async def claim(*_args: Any) -> bool:
+        return True
+
+    manager = ChannelManager({channel.channel_id: channel}, inbound_handler=claim)
+    message = channel.parse_inbound("passive")
+    assert await manager._admit(channel.channel_id, channel, message)
+    channel.on_inbound_claimed.assert_called_once_with(message)
+    assert channel.sent == []
