@@ -438,6 +438,59 @@ class TestChannelManager:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+async def test_admission_runs_for_each_batched_message() -> None:
+    processed = asyncio.Event()
+    admitted: list[str] = []
+    handled: list[str] = []
+
+    async def processor(message):
+        handled.append(message.text)
+        processed.set()
+        yield MessageEvent.completed()
+
+    async def admission(channel, message, dispatch):
+        admitted.append(message.text)
+        return message.text == "claim"
+
+    channel = MockChannel(processor)
+    manager = ChannelManager({channel.channel_id: channel}, workers_per_channel=1, inbound_handler=admission)
+    await manager.start()
+    try:
+        queue = manager._queues[channel.channel_id]
+        queue.put_nowait("keep")
+        queue.put_nowait("claim")
+        await asyncio.wait_for(processed.wait(), timeout=1)
+        assert admitted == ["keep", "claim"]
+        assert handled == ["keep"]
+    finally:
+        await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_delayed_admission_dispatch_does_not_revive_removed_channel() -> None:
+    captured = asyncio.Event()
+    pending = []
+
+    async def admission(channel, message, dispatch):
+        pending.append((message, dispatch))
+        captured.set()
+        return True
+
+    channel = MockChannel(_echo_processor)
+    manager = ChannelManager({channel.channel_id: channel}, workers_per_channel=1, inbound_handler=admission)
+    await manager.start()
+    try:
+        manager.enqueue(channel.channel_id, "delayed")
+        await asyncio.wait_for(captured.wait(), timeout=1)
+        await manager.remove_channel(channel.channel_id)
+        message, dispatch = pending[0]
+        assert await dispatch(message) is None
+        assert channel.sent == []
+    finally:
+        await manager.stop()
+
+
 class TestChannelConfig:
     """Tests for ChannelConfig base class."""
 

@@ -206,6 +206,7 @@ class QQConfig(ChannelConfig):
     sandbox: bool = False
     intents: int | None = None
     c2c_streaming: bool = True
+    plugin_group_settings: dict[str, bool] = field(default_factory=dict)
     show_tool_hints: bool = False
     stream_throttle_ms: int = 150
     stream_hold_keepalive_s: float = 3.0
@@ -239,6 +240,11 @@ class QQConfig(ChannelConfig):
             # ``c2c_streaming: false`` remains the only opt-out.
             config.c2c_streaming = True
         raw_group_context = data.get("group_context")
+        config.plugin_group_settings = {}
+        if isinstance(raw_group_context, dict):
+            config.plugin_group_settings = {
+                key: value for key, value in raw_group_context.items() if isinstance(key, str) and type(value) is bool
+            }
         if isinstance(raw_group_context, dict) and "enabled" not in raw_group_context:
             config.group_context.enabled = True
         if isinstance(raw_group_context, dict) and "owner_commands_only" not in raw_group_context:
@@ -276,6 +282,11 @@ class QQChannel(BaseChannel):
     """
 
     channel_type = "qq"
+
+    @property
+    def plugin_group_settings(self) -> dict[str, bool]:
+        """A copy of boolean QQ group-policy options for loaded plugins."""
+        return self._config.plugin_group_settings.copy()
 
     def __init__(
         self,
@@ -1093,6 +1104,8 @@ class QQChannel(BaseChannel):
             "sender_id": sender_id,
             "sender_name": sender_name,
         }
+        if isinstance(sender, dict) and type(sender.get("bot")) is bool:
+            metadata["sender_is_bot"] = sender["bot"]
         if is_group:
             metadata["conversation_id"] = conversation_id
             metadata["bot_mentioned"] = self._is_bot_mentioned(data, event_type)
