@@ -18,6 +18,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Self
+from urllib.parse import quote
 
 from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor
 from octop_gateway.channels.qq.login_qr import QQBotQRCredentials
@@ -28,7 +29,7 @@ from octop_gateway.channels.qq.stream import (
     reconcile_stream_text,
 )
 from octop_gateway.channels.qq.stream_blocks import stable_markdown_prefix
-from octop_gateway.constraints import ChannelConstraints, tool_hint_message
+from octop_gateway.constraints import ChannelConstraints, RateLimiter, tool_hint_message
 from octop_gateway.group_context import GroupContextConfig
 from octop_gateway.models import (
     AudioContent,
@@ -298,6 +299,7 @@ class QQChannel(BaseChannel):
         self._config = config
         self._intents = config.intents if config.intents is not None else _DEFAULT_INTENTS
         self._api_base = _SANDBOX_API_BASE if config.sandbox else _API_BASE
+        self._group_info_limiter = RateLimiter(max_calls=30, window_seconds=60)
 
         # WebSocket state
         self._ws: Any = None  # websockets connection
@@ -1560,6 +1562,45 @@ class QQChannel(BaseChannel):
             headers["Content-Type"] = "application/json"
             status, body = await _do(headers)
         return status, body
+
+    async def get_group_info(self, group_openid: str) -> dict[str, Any]:
+        """Fetch group metadata for a platform-allowlisted bot.
+
+        QQ limits this API to 30 requests/minute. This channel waits for a
+        slot, including token retries; callers may cancel or set a timeout.
+        Cache metadata at the caller rather than querying on every message.
+        QQ returns the group OpenID and name, not the numeric QQ group ID.
+        """
+        if not group_openid.strip():
+            raise ValueError("group_openid must not be empty")
+        http = await self._ensure_http()
+        url = f"{self._api_base}/v2/groups/{quote(group_openid, safe='')}/info"
+
+        async def _do(headers: dict[str, str]) -> tuple[int, str]:
+            await self._group_info_limiter.acquire()
+            async with http.get(url, headers=headers) as resp:
+                return resp.status, await resp.text()
+
+        headers = await self._fresh_auth_headers()
+        status, body = await _do(headers)
+        if self._is_access_token_error(status, body):
+            self._invalidate_access_token()
+            status, body = await _do(await self._fresh_auth_headers())
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"QQ group info lookup returned invalid JSON: HTTP {status}") from exc
+        if status != 200:
+            code = data.get("code") if isinstance(data, dict) else None
+            detail = (
+                f", QQ code={code}" if isinstance(code, int) or (isinstance(code, str) and code.isdecimal()) else ""
+            )
+            if str(code) == "11253":
+                detail += " (platform allowlist permission required)"
+            raise RuntimeError(f"QQ group info lookup failed: HTTP {status}{detail}")
+        if not isinstance(data, dict):
+            raise RuntimeError("QQ group info lookup returned an invalid response")
+        return data
 
     async def _ensure_access_token(self) -> str:
         """Ensure a valid OAuth2 access token is available.
