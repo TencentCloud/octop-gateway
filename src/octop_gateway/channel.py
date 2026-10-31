@@ -56,12 +56,22 @@ MessageProcessor = Callable[[InboundMessage], AsyncIterator[MessageEvent]]
 
 @dataclass
 class InboundReceipt:
+    """Track a dispatch and optionally filter its buffered text before delivery."""
+
     attempted: bool = False
     delivered: bool = False
+    text_filter: Callable[[str], str] | None = field(default=None, repr=False, compare=False)
+    input_filter: Callable[[InboundMessage], bool] | None = field(default=None, repr=False, compare=False)
+    suppress_thinking: bool = False
 
 
 _inbound_receipt: ContextVar[InboundReceipt | None] = ContextVar("inbound_receipt", default=None)
 _inbound_activation: ContextVar[bool] = ContextVar("inbound_activation", default=False)
+
+
+def current_inbound_receipt() -> InboundReceipt | None:
+    """Return the current managed inbound dispatch, if one exists."""
+    return _inbound_receipt.get()
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +305,11 @@ class BaseChannel(ABC):
             channel.constraints.show_tool_hints = False
         """
         return self._constraints
+
+    def should_show_thinking(self) -> bool:
+        """Return the effective thinking visibility for the current dispatch."""
+        receipt = _inbound_receipt.get()
+        return self._constraints.show_thinking and not getattr(receipt, "suppress_thinking", False)
 
     @property
     def group_context_manager(self) -> GroupContextManager:
@@ -807,6 +822,17 @@ class BaseChannel(ABC):
         :meth:`handle_inbound` template.
         """
 
+    @staticmethod
+    def _accept_filtered_inbound(message: InboundMessage) -> bool:
+        receipt = current_inbound_receipt()
+        if receipt is None or receipt.input_filter is None:
+            return True
+        try:
+            return receipt.input_filter(message) is True
+        except Exception:
+            logger.warning("Inbound filter failed; message skipped")
+            return False
+
     async def _prepare_inbound(
         self,
         raw_payload: object,
@@ -839,6 +865,8 @@ class BaseChannel(ABC):
         if prepared is None:
             return None
         message = prepared
+        if not self._accept_filtered_inbound(message):
+            return None
 
         # Look up or create subject
         subject_id = message.channel_subject.subject_id if message.channel_subject else ""
@@ -866,6 +894,7 @@ class BaseChannel(ABC):
         delta_buffer: list[str] = []
         # Thinking accumulation buffer (separate from content)
         thinking_buffer: list[str] = []
+        show_thinking = self.should_show_thinking()
 
         # --- Set up platform constraint helpers ---
         timeout_guard: ReplyTimeoutGuard | None = None
@@ -910,10 +939,11 @@ class BaseChannel(ABC):
                             delta_buffer.append(part.text)
                 elif event.type == MessageEventType.THINKING:
                     # Complete thinking block — format and send if show_thinking
-                    await self._on_thinking(subject, event)
+                    if show_thinking:
+                        await self._on_thinking(subject, event)
                 elif event.type == MessageEventType.THINKING_DELTA:
                     # Streaming thinking fragment — accumulate separately
-                    if self._constraints.show_thinking:
+                    if show_thinking:
                         for part in event.content:
                             if isinstance(part, TextContent) and part.text:
                                 thinking_buffer.append(part.text)
@@ -1007,7 +1037,17 @@ class BaseChannel(ABC):
         rate-limit slot.
         """
         text = self._clean_output(text)
-        if not text:
+        receipt = _inbound_receipt.get()
+        text_filter = getattr(receipt, "text_filter", None)
+        if text and text_filter is not None:
+            try:
+                text = text_filter(text)
+                if not isinstance(text, str):
+                    raise TypeError("inbound text filter must return str")
+            except Exception:  # pylint: disable=broad-except
+                logger.warning("inbound text filter failed; reply suppressed")
+                return
+        if not text.strip():
             return
         await self.reply_text(subject, text)
 
@@ -1042,7 +1082,7 @@ class BaseChannel(ABC):
         if not text:
             return ""
 
-        if self._constraints.show_thinking:
+        if self.should_show_thinking():
             # Format thinking blocks with template prefix
             def _format_think(match: re.Match[str]) -> str:
                 content = match.group(1).strip()

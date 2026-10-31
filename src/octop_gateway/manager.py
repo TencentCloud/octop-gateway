@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
-from octop_gateway.channel import BaseChannel, InboundReceipt, MessageProcessor
+from octop_gateway.channel import BaseChannel, InboundReceipt, MessageProcessor, _inbound_receipt
 from octop_gateway.media import FileSystemMediaBackend, MediaBackend
 from octop_gateway.models import ChannelSubject, ContentPart, InboundMessage
 
@@ -774,6 +774,7 @@ class ChannelManager:
             except asyncio.CancelledError:
                 break
 
+            receipt_token = _inbound_receipt.set(InboundReceipt())
             try:
                 # Parse to get session key for locking
                 message = payload if isinstance(payload, InboundMessage) else channel.parse_inbound(payload)
@@ -817,6 +818,8 @@ class ChannelManager:
             except Exception:  # pylint: disable=broad-except
                 # One malformed payload or adapter failure must not stop the worker.
                 logger.exception("Worker error: channel=%s", channel_id)
+            finally:
+                _inbound_receipt.reset(receipt_token)
 
     def _session_lock(self, channel_id: str, session_key: str) -> asyncio.Lock:
         """Return the shared lock for one registered-channel session."""

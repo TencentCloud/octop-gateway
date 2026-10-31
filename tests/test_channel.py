@@ -79,6 +79,68 @@ async def test_inbound_receipt_reports_actual_delivery() -> None:
 
 
 @pytest.mark.asyncio
+async def test_inbound_text_filter_is_scoped_to_its_dispatch() -> None:
+    channel = EchoChannel(make_echo_processor)
+    receipt = InboundReceipt(text_filter=lambda _: "")
+    await channel.dispatch_inbound("suppressed", receipt=receipt)
+    assert not receipt.attempted and not receipt.delivered
+    assert channel.sent_messages == []
+
+    await channel.handle_inbound("normal")
+    assert channel.sent_messages == [("user1", "Echo: normal")]
+
+
+@pytest.mark.asyncio
+async def test_inbound_text_filter_failure_does_not_send_unfiltered_text() -> None:
+    def fail(_text: str) -> str:
+        raise ValueError("filter failure")
+
+    channel = EchoChannel(make_echo_processor)
+    receipt = InboundReceipt(text_filter=fail)
+    await channel.dispatch_inbound("private", receipt=receipt)
+    assert channel.sent_messages == []
+    assert not receipt.attempted
+
+
+@pytest.mark.asyncio
+async def test_input_filter_checks_preprocessed_input_and_fails_closed() -> None:
+    class EnrichingChannel(EchoChannel):
+        async def _preprocess_inbound(self, message: InboundMessage) -> None:
+            message.content.append(TextContent(text="enriched"))
+
+    channel = EnrichingChannel(make_echo_processor)
+    receipt = InboundReceipt(input_filter=lambda message: "enriched" not in message.text)
+    await channel.dispatch_inbound("message", receipt=receipt)
+    assert channel.sent_messages == []
+
+    def fail(_message: InboundMessage) -> bool:
+        raise ValueError("do not log private input")
+
+    await channel.dispatch_inbound("message", receipt=InboundReceipt(input_filter=fail))
+    assert channel.sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_inbound_receipt_can_hide_thinking_only_for_its_dispatch() -> None:
+    async def processor(_message: InboundMessage) -> AsyncIterator[MessageEvent]:
+        yield MessageEvent.thinking("complete reasoning")
+        yield MessageEvent.thinking_delta("streamed reasoning")
+        yield MessageEvent.flush()
+        yield MessageEvent.delta("<think>embedded reasoning</think>visible answer")
+        yield MessageEvent.completed()
+
+    channel = EchoChannel(processor, ChannelConfig(show_thinking=True))
+    await channel.dispatch_inbound("automatic", receipt=InboundReceipt(suppress_thinking=True))
+    assert channel.sent_messages == [("user1", "visible answer")]
+
+    channel.sent_messages.clear()
+    await channel.handle_inbound("normal")
+    assert any("complete reasoning" in text for _, text in channel.sent_messages)
+    assert any("streamed reasoning" in text for _, text in channel.sent_messages)
+    assert any("embedded reasoning" in text for _, text in channel.sent_messages)
+
+
+@pytest.mark.asyncio
 async def test_admitted_dispatch_preserves_adapter_override_and_resets_on_cancel() -> None:
     calls = []
 

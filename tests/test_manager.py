@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor
+from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor, current_inbound_receipt
 from octop_gateway.manager import ChannelManager
 from octop_gateway.models import (
     ChannelSubject,
@@ -463,6 +463,38 @@ async def test_admission_runs_for_each_batched_message() -> None:
         await asyncio.wait_for(processed.wait(), timeout=1)
         assert admitted == ["keep", "claim"]
         assert handled == ["keep"]
+    finally:
+        await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_admission_output_filter_does_not_leak_to_next_message() -> None:
+    started = asyncio.Event()
+
+    async def processor(message):
+        if message.text == "first":
+            started.set()
+        yield MessageEvent.text(message.text)
+        yield MessageEvent.completed()
+
+    async def admission(channel, message, dispatch):
+        receipt = current_inbound_receipt()
+        assert receipt is not None
+        if message.text == "first":
+            receipt.text_filter = lambda _: ""
+        return False
+
+    channel = MockChannel(processor)
+    manager = ChannelManager({channel.channel_id: channel}, workers_per_channel=1, inbound_handler=admission)
+    await manager.start()
+    try:
+        manager.enqueue(channel.channel_id, "first")
+        await asyncio.wait_for(started.wait(), timeout=1)
+        manager.enqueue(channel.channel_id, "second")
+        async with asyncio.timeout(1):
+            while not channel.sent:
+                await asyncio.sleep(0.005)
+        assert channel.sent == [("user1", "second")]
     finally:
         await manager.stop()
 
