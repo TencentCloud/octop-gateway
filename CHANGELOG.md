@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Add per-message admission hooks, guarded delayed dispatch and reply receipts. Preserve adapter overrides, group visibility and per-turn tool permissions.
+- Add dispatch-scoped input and output filters and optional thinking suppression for admission handlers.
 
 ### 修复
 

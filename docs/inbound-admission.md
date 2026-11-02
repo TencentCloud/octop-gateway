@@ -24,6 +24,14 @@ Cancellation propagates. Ordinary group input fails closed on hook errors;
 native commands, direct messages and mentions retain normal routing. The default
 without a hook preserves existing batching and routing behavior.
 
+The current dispatch receipt can be obtained with `current_inbound_receipt()`.
+An admission handler may set its `input_filter` to accept or reject a prepared
+message, its `text_filter` to transform or suppress outbound text, and
+`suppress_thinking` to hide thinking for that dispatch. Filter exceptions fail
+closed. These callbacks are scoped to the dispatch and do not alter the
+channel's persistent settings. A retained `dispatch` can also receive an
+explicit `InboundReceipt` carrying these options.
+
 After a handler claims input, the manager calls the adapter's synchronous
 `on_inbound_claimed(message)` hook. Durable adapters can release their intake
 slot here; they must preserve an already started or completed message if the
