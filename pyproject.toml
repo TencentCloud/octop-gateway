@@ -38,6 +38,7 @@ dependencies = [
     "httpx>=0.27.0",
     "wecom-aibot-sdk>=1.0.7",
     "paho-mqtt>=2.0.0",
+    "nats-py>=2.6.0",
     "python-telegram-bot>=21.0",
 ]
 
@@ -126,6 +127,7 @@ module = [
     "dingtalk_stream.*",
     "wecom_aibot_sdk.*",
     "paho.mqtt.*",
+    "nats.*",
     "telegram.*",
 ]
 ignore_missing_imports = true

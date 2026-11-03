@@ -19,6 +19,7 @@ _CHANNEL_MAP: dict[str, str] = {
     "yuanbao": "octop_gateway.channels.yuanbao",
     "xiaoyi": "octop_gateway.channels.xiaoyi",
     "mqtt": "octop_gateway.channels.mqtt",
+    "nats": "octop_gateway.channels.nats",
     "telegram": "octop_gateway.channels.telegram",
 }
 
@@ -39,6 +40,7 @@ class ChannelKind(StrEnum):
     YUANBAO = "yuanbao"
     XIAOYI = "xiaoyi"
     MQTT = "mqtt"
+    NATS = "nats"
     TELEGRAM = "telegram"
 
 
@@ -55,6 +57,7 @@ _CLASS_NAMES: dict[str, str] = {
     "yuanbao": "YuanbaoChannel",
     "xiaoyi": "XiaoyiChannel",
     "mqtt": "MQTTChannel",
+    "nats": "NATSChannel",
     "telegram": "TelegramChannel",
 }
 
