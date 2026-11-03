@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 公共群策略支持 `owner_tools_only`，通过回合级 `allowed_tools` 限制非所有者工具权限，保留普通聊天，并防止合并消息扩大权限；工具保护缺省关闭。
 - QQ 群内 Octop 斜杠命令默认仅允许显式配置的所有者发送；在控制回调和消息合并前鉴权，保留普通消息中的斜杠、URL、文件路径和自定义命令名称。
 - Telegram 非论坛群里的回复线程不再被当作话题：只有 `is_topic_message` 为真时才取 `message_thread_id`。此前机器人按钮消息（对用户消息的回复）会带上线程 id，与注册时的 `None` 不一致，导致按钮点击被回调校验拒绝，且开启话题隔离时会把一次回复误当作独立话题。
+- 钉钉群聊会话边界改为「群」而不是「发送者」：同一群内所有成员共用一条会话线，群与群、群聊与私聊互相隔离；群内发言者保留在 `metadata.sender_id` / `sender_name`，回复按 `conversation_id` 走 `robot/groupMessages/send`。
+- 钉钉通道接入基类群聊上下文策略（`group_context`，默认开启）：群内未 @ 机器人的消息不再直接进入 Agent，而是按 `GroupContextManager` 的规则缓存为被动上下文；`bot_mentioned` 改为读取钉钉返回的 `isInAtList`，不再无条件置为 `true`。
 
 ## [1.0.3] - 2026-10-16
 
