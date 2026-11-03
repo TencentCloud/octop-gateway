@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
-from typing import ClassVar
+from typing import ClassVar, Self
 
 from octop_gateway.channel import ChannelConfig
 from octop_gateway.channels.yuanbao.constants import (
@@ -13,6 +13,7 @@ from octop_gateway.channels.yuanbao.constants import (
     HERMES_INSTANCE_ID,
 )
 from octop_gateway.channels.yuanbao.utils import _normalize_http_origin, _normalize_ws_url
+from octop_gateway.group_context import GroupContextConfig
 
 
 @dataclass
@@ -58,6 +59,28 @@ class YuanbaoConfig(ChannelConfig):
     connect_timeout: float = 15.0
     probe_mode: str = "full"
 
+    # Yuanbao pushes the bot's own replies — and any other bot's messages — back
+    # over the same callback. Answering them makes two bots trade messages until
+    # the channel is disabled by hand, so bot-authored messages are dropped by
+    # default. Set ``false`` to feed them to the processor anyway.
+    ignore_bot_senders: bool = True
+
+    # Yuanbao group chats deliver every member message to the bot, so the
+    # channel enables the shared mention policy by default: a group message
+    # only starts an agent turn when the bot itself is mentioned. Direct chats
+    # have no @ semantics and are never filtered. Set
+    # ``group_context.activation: "always"`` (with ``visibility: "all"``) to
+    # reply to every group message instead.
+    group_context: GroupContextConfig = field(
+        default_factory=lambda: GroupContextConfig(
+            enabled=True,
+            visibility="auto",
+            activation="mention",
+            history="recent",
+            history_limit=10,
+        )
+    )
+
     required_credentials: ClassVar[tuple[str, ...]] = ("app_key", "app_secret")
     field_aliases: ClassVar[dict[str, str]] = {
         "appId": "app_key",
@@ -78,6 +101,19 @@ class YuanbaoConfig(ChannelConfig):
         "operationSystem": "app_operation_system",
         "appOperationSystem": "app_operation_system",
     }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> Self:
+        config = super().from_dict(data)
+        # A partial group_context override (e.g. only history_limit) must not
+        # silently disable the enabled-by-default mention policy.
+        raw_group_context = data.get("group_context")
+        if isinstance(raw_group_context, dict) and "enabled" not in raw_group_context:
+            config.group_context.enabled = True
+        raw_ignore_bots = data.get("ignore_bot_senders")
+        if isinstance(raw_ignore_bots, str):
+            config.ignore_bot_senders = raw_ignore_bots.strip().lower() not in {"0", "false", "no", "off"}
+        return config
 
     def __post_init__(self) -> None:
         self.api_domain = _normalize_http_origin(self.api_domain or self.api_base or DEFAULT_API_DOMAIN)

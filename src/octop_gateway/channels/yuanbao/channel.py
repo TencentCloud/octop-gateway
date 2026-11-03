@@ -57,6 +57,39 @@ from octop_gateway.models import (
 
 logger = logging.getLogger(__name__)
 
+# ``TIMCustomElem`` (``elem_type`` 1002) is the group-mention carrier. The
+# protocol module exports no ``MSG_TYPE_CUSTOM`` constant, so the element type
+# is compared as a literal string.
+_MSG_TYPE_CUSTOM = "TIMCustomElem"
+_AT_ELEM_TYPE = 1002
+
+# ``@all`` is signalled by these ``user_id`` values / display texts.
+_AT_ALL_MARKERS = frozenset({"0", "all"})
+_AT_ALL_TEXTS = frozenset({"@all", "@所有人", "@全体成员"})
+
+# Bot accounts are pushed back to the bot itself, so a channel that answers
+# them replies to its own output (and to any other bot in the room).
+_BOT_ACCOUNT_PREFIX = "bot_"
+
+
+def _parse_at_element(content_map: Mapping[str, object]) -> dict[str, str] | None:
+    """Extract an at-element (``elem_type`` 1002) from a custom-element payload."""
+    raw = content_map.get("data")
+    if not isinstance(raw, str):
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    if str(payload.get("elem_type") or "") != str(_AT_ELEM_TYPE):
+        return None
+    return {
+        "user_id": str(payload.get("user_id") or "").strip(),
+        "text": str(payload.get("text") or "").strip(),
+    }
+
 
 class YuanbaoChannel(BaseChannel):
     """Tencent Yuanbao bot channel over binary WebSocket."""
@@ -752,6 +785,13 @@ class YuanbaoChannel(BaseChannel):
 
         if "msg_body" in payload:
             inbound_msg_id = str(payload.get("msg_id") or payload.get("msg_key") or payload.get("MsgKey") or "")
+            if self._should_drop_bot_sender(payload):
+                logger.info(
+                    "Yuanbao inbound from bot skipped: from=%s group=%s",
+                    _redact_account(str(payload.get("from_account") or "")),
+                    payload.get("group_code", ""),
+                )
+                return
             if inbound_msg_id and not self._remember_message_id(inbound_msg_id):
                 logger.info("Yuanbao duplicate inbound skipped: msg_id=%s", inbound_msg_id)
                 return
@@ -764,7 +804,7 @@ class YuanbaoChannel(BaseChannel):
             )
             with contextlib.suppress(Exception):
                 inbound = self.parse_inbound(payload)
-                if inbound.channel_subject:
+                if inbound.channel_subject and self._group_context.will_trigger(inbound):
                     await self._send_typing_indicator(inbound.channel_subject)
 
         if self._enqueue_callback:
@@ -838,6 +878,35 @@ class YuanbaoChannel(BaseChannel):
                 future.set_exception(exc)
         self._pending.clear()
 
+    def _is_bot_account(self, account: str) -> bool:
+        """Whether an inbound author is a bot rather than a human member.
+
+        Yuanbao pushes the bot's own replies back over the same callback, and a
+        second bot in the same group is pushed the same way. Without this guard
+        two bots answer each other until the channel is disabled by hand.
+        """
+        if not account:
+            return False
+        own_bot_id = self._bot_id or self._config.bot_id
+        if own_bot_id and account == own_bot_id:
+            return True
+        return account.startswith(_BOT_ACCOUNT_PREFIX)
+
+    def _should_drop_bot_sender(self, payload: proto.YuanbaoMapping) -> bool:
+        """Whether an inbound payload should be discarded as bot-authored.
+
+        Only group traffic is gated: a direct chat with another bot account is
+        an explicit one-to-one request and keeps working.
+        """
+        if not self._config.ignore_bot_senders:
+            return False
+        group_code = str(payload.get("group_code") or "")
+        is_group = bool(group_code) or str(payload.get("callback_command") or "").startswith("Group.")
+        if not is_group:
+            return False
+        from_account = str(payload.get("from_account") or "")
+        return self._is_bot_account(from_account)
+
     def _parse_yuanbao_message(self, data: proto.YuanbaoMapping) -> InboundMessage:
         group_code = str(data.get("group_code") or "")
         from_account = str(data.get("from_account") or "unknown")
@@ -846,6 +915,9 @@ class YuanbaoChannel(BaseChannel):
         is_group = bool(group_code) or str(data.get("callback_command") or "").startswith("Group.")
 
         content_parts: list[ContentPart] = []
+        at_elements: list[dict[str, str]] = []
+        bot_mentioned = False
+        at_all = False
         for body in data.get("msg_body") or []:
             if not isinstance(body, Mapping):
                 continue
@@ -856,6 +928,15 @@ class YuanbaoChannel(BaseChannel):
                 text = str(content_map.get("text") or "")
                 if text:
                     content_parts.append(TextContent(text=text))
+            elif msg_type == _MSG_TYPE_CUSTOM:
+                element = _parse_at_element(content_map)
+                if element is not None:
+                    at_elements.append(element)
+                    own_bot_id = self._bot_id or self._config.bot_id
+                    if element["user_id"] and element["user_id"] == own_bot_id:
+                        bot_mentioned = True
+                    if element["user_id"] in _AT_ALL_MARKERS or element["text"] in _AT_ALL_TEXTS:
+                        at_all = True
             elif msg_type == proto.MSG_TYPE_IMAGE:
                 image_info = _first_image_info(content_map)
                 url = _first_media_url(content_map, api_domain=self._config.api_domain)
@@ -930,7 +1011,17 @@ class YuanbaoChannel(BaseChannel):
             "private_from_group_code": data.get("private_from_group_code", ""),
             "trace_id": trace_id,
             "bot_id": self._bot_id or self._config.bot_id,
+            "sender_id": from_account,
+            "sender_name": str(data.get("sender_nickname") or ""),
+            "is_bot_sender": self._is_bot_account(from_account),
         }
+        if is_group:
+            # ``GroupContextManager`` reads ``bot_mentioned`` to decide whether a
+            # group message starts an agent turn under the mention policy.
+            metadata["bot_mentioned"] = bot_mentioned or at_all
+            metadata["at_all"] = at_all
+            metadata["mentioned_user_ids"] = [element["user_id"] for element in at_elements]
+            metadata["at_elems"] = at_elements
 
         return InboundMessage(
             channel_id=self.channel_id,
