@@ -179,6 +179,14 @@ asyncio.run(main())
 
 Copy `.env.example` to `.env` for environment-based configuration.
 
+### Reliable Feishu reception
+
+Feishu channels now persist receipts before acknowledgement by default. Mount
+`~/.octop-gateway` on persistent storage for restart-safe deduplication; delayed
+first deliveries are accepted regardless of age. Interrupted turns are retained
+for explicit recovery rather than blindly executed again. See
+[configuration, recovery and migration](docs/feishu-reliable-reception.md).
+
 ## Documentation
 
 - [What is Octop Gateway?](#what-is-octop-gateway)

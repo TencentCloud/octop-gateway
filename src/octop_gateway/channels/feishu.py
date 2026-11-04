@@ -21,6 +21,8 @@ from urllib.parse import quote
 import aiohttp
 
 from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor
+from octop_gateway.channels._feishu_ws import create_isolated_ws_client, run_isolated_ws_client
+from octop_gateway.inbox import SqliteInbox
 from octop_gateway.models import (
     AudioContent,
     ChannelSubject,
@@ -71,6 +73,9 @@ class FeishuConfig(ChannelConfig):
     verification_token: str = ""
     encrypt_key: str = ""
 
+    # Empty string explicitly opts out of restart-safe acceptance.
+    inbox_path: str | None = None
+
     required_credentials = ("app_id", "app_secret")
 
 
@@ -103,6 +108,9 @@ class FeishuChannel(BaseChannel):
             config=config,
         )
         self._config = config
+        if config.inbox_path:
+            self.inbound_store = SqliteInbox(config.inbox_path)
+            self.inbound_scope = f"feishu:{config.app_id}:im.message.receive_v1"
         self._tenant_token: str = ""
         self._token_expires_at: float = 0.0
         self._token_lock = asyncio.Lock()
@@ -127,8 +135,18 @@ class FeishuChannel(BaseChannel):
     # Lifecycle
     # =========================================================================
 
+    def prepare_inbound_store(self) -> None:
+        """Enable reliable reception by default when a manager owns consumption."""
+        if self._config.inbox_path is None and self.inbound_store is None:
+            self.inbound_store = SqliteInbox("~/.octop-gateway/feishu-inbox.sqlite3")
+            self.inbound_scope = f"feishu:{self._config.app_id}:im.message.receive_v1"
+
     async def start(self) -> None:
         """Start the Feishu channel: refresh token and connect WebSocket."""
+        if self.inbound_store is not None and self._enqueue_callback is None:
+            raise RuntimeError(
+                "Durable Feishu reception requires ChannelManager; set inbox_path='' for legacy direct use"
+            )
         self._running = True
         self._main_loop = asyncio.get_running_loop()
         await self._refresh_token()
@@ -245,15 +263,20 @@ class FeishuChannel(BaseChannel):
                 self._config.verification_token or "",
             )
             .register_p2_im_message_receive_v1(self._on_message_event)
+            .register_p2_im_message_reaction_created_v1(self._on_reaction_event)
             .build()
         )
 
-        # Create WebSocket client (lark_oapi.ws.Client)
-        self._ws_client = lark.ws.Client(
+        # lark-oapi keeps its loop in module-global state. Use an isolated
+        # module namespace so concurrent bot clients cannot replace each
+        # other's loop while connecting, receiving, or reconnecting.
+        self._ws_client = create_isolated_ws_client(
+            lark,
             self._config.app_id,
             self._config.app_secret,
             event_handler=event_handler,
             log_level=lark.LogLevel.INFO,
+            on_transport_activity=self._mark_ws_activity,
         )
         # SDK reconnect hooks (fire on the WS thread's loop).
         self._ws_client.on_reconnecting = self._on_ws_reconnecting
@@ -277,14 +300,8 @@ class FeishuChannel(BaseChannel):
         self._ws_loop = loop
         _asyncio.set_event_loop(loop)
         try:
-            import lark_oapi.ws.client as ws_client_module
-
-            ws_client_module.loop = loop
-        except (ImportError, AttributeError):
-            pass
-        try:
             if self._ws_client:
-                self._ws_client.start()
+                run_isolated_ws_client(self._ws_client, loop)
         except Exception:  # pylint: disable=broad-except
             # The SDK owns this thread boundary and does not publish an exception contract.
             logger.exception("Feishu WebSocket thread failed")
@@ -295,11 +312,11 @@ class FeishuChannel(BaseChannel):
 
     def _mark_ws_activity(self) -> None:
         """Record that the WS transport recently did something observable."""
-        self._last_ws_activity_at = time.time()
+        self._last_ws_activity_at = time.monotonic()
 
     def _on_ws_reconnecting(self) -> None:
         """Called by lark-oapi when the socket drops and reconnect starts."""
-        self._ws_reconnecting_since = time.time()
+        self._ws_reconnecting_since = time.monotonic()
         self._mark_ws_activity()
         logger.warning("Feishu WebSocket reconnecting...")
 
@@ -309,6 +326,9 @@ class FeishuChannel(BaseChannel):
         self._ws_session_id = str(uuid.uuid4())
         self._mark_ws_activity()
         logger.info("Feishu WebSocket reconnected (session=%s)", self._ws_session_id)
+
+    def _on_reaction_event(self, _data: Any) -> None:
+        """Acknowledge reaction events that have no gateway-side action."""
 
     async def _cancel_watchdog(self) -> None:
         """Cancel the WS health watchdog task if it is running."""
@@ -370,11 +390,11 @@ class FeishuChannel(BaseChannel):
         if thread is None or not thread.is_alive():
             return "thread_dead"
         if self._ws_reconnecting_since is not None:
-            age = time.time() - self._ws_reconnecting_since
+            age = time.monotonic() - self._ws_reconnecting_since
             if age >= _WS_RECONNECT_STALE_SECONDS:
                 return f"reconnect_stale={age:.0f}s"
         if self._last_ws_activity_at > 0:
-            idle = time.time() - self._last_ws_activity_at
+            idle = time.monotonic() - self._last_ws_activity_at
             if self._ws_reconnecting_since is None and idle >= _WS_ACTIVITY_STALE_SECONDS:
                 return f"activity_stale={idle:.0f}s"
         return "unknown"
@@ -385,10 +405,10 @@ class FeishuChannel(BaseChannel):
         if thread is None or not thread.is_alive():
             return True
         if self._ws_reconnecting_since is not None:
-            return (time.time() - self._ws_reconnecting_since) >= _WS_RECONNECT_STALE_SECONDS
+            return (time.monotonic() - self._ws_reconnecting_since) >= _WS_RECONNECT_STALE_SECONDS
         if self._last_ws_activity_at <= 0:
             return False
-        return (time.time() - self._last_ws_activity_at) >= _WS_ACTIVITY_STALE_SECONDS
+        return (time.monotonic() - self._last_ws_activity_at) >= _WS_ACTIVITY_STALE_SECONDS
 
     async def _restart_ws_client(self) -> None:
         """Tear down and recreate the WS client while the channel stays running."""
@@ -403,7 +423,7 @@ class FeishuChannel(BaseChannel):
                 )
                 # Keep / set reconnecting marker so the next tick still sees unhealthy.
                 if self._ws_reconnecting_since is None:
-                    self._ws_reconnecting_since = time.time()
+                    self._ws_reconnecting_since = time.monotonic()
                 return
             if self._running:
                 await self._start_ws_client()
@@ -471,7 +491,7 @@ class FeishuChannel(BaseChannel):
         Signature: (data: P2ImMessageReceiveV1) -> None
         """
         if not self._running:
-            return
+            raise RuntimeError("Feishu channel is stopping; retry delivery")
 
         try:
             event = data.event
@@ -487,7 +507,7 @@ class FeishuChannel(BaseChannel):
                 return
 
             message_id = message.message_id
-            if self._is_duplicate(message_id):
+            if self.inbound_store is None and message_id in self._seen_message_ids:
                 logger.debug("Duplicate Feishu message ignored: %s", message_id)
                 return
 
@@ -522,25 +542,40 @@ class FeishuChannel(BaseChannel):
             )
             self._mark_ws_activity()
 
-            # Add "Typing" reaction to acknowledge receipt (non-blocking)
-            self._add_reaction_async(message_id, "Typing")
-
-            # Enqueue for processing
-            if self._enqueue_callback:
+            # Persist before returning to the SDK (which then sends its ACK).
+            # This runs on the SDK thread, not the asyncio event loop. No age
+            # filter: delayed first delivery is still a legitimate request.
+            if self.inbound_store is not None:
+                raw_payload["event_id"] = str(getattr(data.header, "event_id", "") or "")
+                if not self.inbound_store.accept(self.inbound_scope, message_id, raw_payload):
+                    logger.info("Feishu duplicate receipt: app_id=%s message_id=%s", self._config.app_id, message_id)
+                    return
+                logger.info("Feishu receipt persisted: app_id=%s message_id=%s", self._config.app_id, message_id)
+                if self._enqueue_callback:
+                    try:
+                        self._enqueue_callback(raw_payload)
+                    except Exception:
+                        logger.warning("Feishu wakeup failed; receipt will be polled", exc_info=True)
+            elif self._enqueue_callback:
                 self._enqueue_callback(raw_payload)
-                logger.info("Feishu message enqueued: %s", message_id)
+                self._is_duplicate(message_id)
             else:
-                # Fallback: direct async handling (needs running loop)
-                try:
-                    loop = self._main_loop or asyncio.get_running_loop()
-                    asyncio.run_coroutine_threadsafe(self.handle_inbound(raw_payload), loop)
-                    logger.info("Feishu message dispatched (fallback): %s", message_id)
-                except RuntimeError:
-                    logger.error("Feishu: no running event loop, message DROPPED: %s", message_id)
+                loop = self._main_loop
+                if loop is None or not loop.is_running():
+                    raise RuntimeError("Feishu: no running consumer; retry delivery")
+                asyncio.run_coroutine_threadsafe(self.handle_inbound(raw_payload), loop)
+                self._is_duplicate(message_id)
 
-        except Exception:  # pylint: disable=broad-except
-            # SDK callbacks must not leak exceptions into the WebSocket dispatch thread.
-            logger.exception("Error handling Feishu message event")
+            # Non-critical UI acknowledgement happens only after acceptance.
+            try:
+                self._add_reaction_async(message_id, "Typing")
+            except Exception:
+                logger.debug("Feishu typing acknowledgement failed", exc_info=True)
+        except Exception:
+            # Let the SDK send a failure response. Swallowing an acceptance error
+            # would acknowledge a message that has not been saved anywhere.
+            logger.exception("Error accepting Feishu message event")
+            raise
 
     @staticmethod
     def _normalize_mentions(raw_mentions: Any) -> list[dict[str, str]]:
@@ -1024,6 +1059,7 @@ class FeishuChannel(BaseChannel):
         bot_mentioned = self._is_bot_mentioned(chat_type, mentions)
         metadata: dict[str, Any] = {
             "message_id": message_id,
+            "event_id": str(raw_payload.get("event_id", "")),
             "chat_id": chat_id,
             "chat_type": chat_type,
             "to_handle": to_handle,

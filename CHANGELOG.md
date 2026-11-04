@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 修复
 
+- Feishu persists application-scoped receipts before SDK acknowledgement, preserving pending work and deduplication across channel reconstruction and process restart without discarding delayed first deliveries. Interrupted turns require explicit reconciliation instead of automatic replay; configure persistent storage with `inbox_path` (see migration documentation).
+- Feishu isolates the SDK event loop per bot, refreshes watchdog activity on transport control frames, and acknowledges ignored reaction-created events without invoking the processor.
+
 - 公共群策略的 `owner_commands_only` 默认开启，Python 构造、旧 JSON 配置及群覆盖继承保持一致；白名单为空时禁止全部内置群命令，显式设置 `false` 可关闭保护，普通聊天和私聊不变。
 - 公共群策略支持 `owner_tools_only`，通过回合级 `allowed_tools` 限制非所有者工具权限，保留普通聊天，并防止合并消息扩大权限；工具保护缺省关闭。
 - QQ 群内 Octop 斜杠命令默认仅允许显式配置的所有者发送；在控制回调和消息合并前鉴权，保留普通消息中的斜杠、URL、文件路径和自定义命令名称。
