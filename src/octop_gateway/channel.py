@@ -18,7 +18,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, fields
-from typing import Any, Self
+from typing import Any, Literal, Self
 from urllib.parse import urlparse
 
 import aiohttp
@@ -31,6 +31,7 @@ from octop_gateway.constraints import (
     tool_hint_message,
 )
 from octop_gateway.group_context import GroupContextConfig, GroupContextManager
+from octop_gateway.inbox import InboxStore
 from octop_gateway.media import MediaBackend
 from octop_gateway.models import (
     AudioContent,
@@ -236,6 +237,8 @@ class BaseChannel(ABC):
         self._debounce_seconds = debounce_seconds
         self._debouncer: Debouncer | None = None
         self._http: aiohttp.ClientSession | None = None
+        self.inbound_store: InboxStore | None = None
+        self.inbound_scope: str = ""
         # Set by ChannelManager
         self._enqueue_callback: Callable[[Any], None] | None = None
         self._group_context = GroupContextManager(config.group_context if config is not None else None)
@@ -724,6 +727,9 @@ class BaseChannel(ABC):
     # Message processing pipeline
     # =========================================================================
 
+    def prepare_inbound_store(self) -> None:
+        """Configure optional storage before manager recovery and transport startup."""
+
     async def handle_inbound(self, raw_payload: object) -> None:
         """Run the shared inbound template around platform-specific delivery.
 
@@ -733,12 +739,21 @@ class BaseChannel(ABC):
         4. Process and deliver events using the channel's output strategy
         5. Finalize the group-context lifecycle after a successful reply
         """
+        await self.handle_inbound_result(raw_payload)
+
+    async def handle_inbound_result(self, raw_payload: object) -> Literal["completed", "ignored", "failed"]:
+        """Run the shared lifecycle and expose its outcome to durable consumers.
+
+        A normal return from ``handle_inbound`` alone does not imply success:
+        processor errors are caught to keep workers alive.
+        """
         prepared = await self._prepare_inbound(raw_payload)
         if prepared is None:
-            return
+            return "ignored"
         message, subject = prepared
         processing_succeeded = await self._process_inbound(message, subject)
         self._finalize_inbound(message, processing_succeeded=processing_succeeded)
+        return "completed" if processing_succeeded else "failed"
 
     async def _preprocess_inbound(self, message: InboundMessage) -> None:
         """Normalize platform-specific content before shared policy runs.
