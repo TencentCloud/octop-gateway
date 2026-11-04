@@ -6,7 +6,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from octop_gateway.channel import BaseChannel, MessageProcessor
 from octop_gateway.media import FileSystemMediaBackend, MediaBackend
@@ -134,6 +134,19 @@ class ChannelManager:
         if self._running:
             return
 
+        for channel_id, channel in self._channels.items():
+            channel.set_enqueue_callback(lambda payload, cid=channel_id: self.enqueue(cid, payload))  # type: ignore[misc]
+            channel.prepare_inbound_store()
+        scopes = [c.inbound_scope for c in self._channels.values() if c.inbound_store is not None]
+        if len(scopes) != len(set(scopes)):
+            raise ValueError("Duplicate durable inbound scope; use one consumer per application")
+        for channel in self._channels.values():
+            if channel.inbound_store is not None:
+                recovered = await asyncio.to_thread(channel.inbound_store.recover, channel.inbound_scope)
+                if recovered:
+                    logger.warning(
+                        "%d inbound receipts require reconciliation: scope=%s", recovered, channel.inbound_scope
+                    )
         self._running = True
         self._loop = asyncio.get_running_loop()
 
@@ -159,17 +172,19 @@ class ChannelManager:
                 lambda payload, cid=channel_id: self.enqueue(cid, payload)  # type: ignore[misc]
             )
 
-        # Start all channels
+        # Start all channels. Failed transports must not consume saved work.
+        started_channels: list[str] = []
         for channel_id, channel in self._channels.items():
             try:
                 await channel.start()
+                started_channels.append(channel_id)
                 logger.info("Channel started: %s", channel_id)
             except Exception:  # pylint: disable=broad-except
                 # Channel adapters are independent failure domains during startup.
                 logger.exception("Failed to start channel: %s", channel_id)
 
         # Spawn workers
-        for channel_id in self._channels:
+        for channel_id in started_channels:
             for i in range(self._workers_per_channel):
                 task = asyncio.create_task(
                     self._worker_loop(channel_id),
@@ -257,6 +272,8 @@ class ChannelManager:
             logger.warning("No queue for channel %s, dropping payload", channel_id)
             return
 
+        # Durable receipts already live in the store. This queue is only a
+        # best-effort urgent-control hint; normal workers poll the store.
         # Use stored loop for thread-safe enqueue
         loop = self._loop
         if loop is not None and loop.is_running():
@@ -281,8 +298,13 @@ class ChannelManager:
             if message is not None and not channel.group_context_manager.accepts(message):
                 return
             if message is not None and self._interrupt_message_predicate(message):
+                operation = (
+                    self._consume_receipt(channel, str(message.metadata["message_id"]), message)
+                    if channel.inbound_store is not None
+                    else self._run_interrupt(channel_id, channel, message)
+                )
                 task = asyncio.create_task(
-                    self._run_interrupt(channel_id, channel, message),
+                    operation,
                     name=f"gateway-interrupt-{channel_id}",
                 )
                 self._interrupt_tasks.add(task)
@@ -290,6 +312,8 @@ class ChannelManager:
                 return
             if message is not None:
                 queued_payload = message
+        if channel is not None and channel.inbound_store is not None:
+            return
         try:
             queue.put_nowait(queued_payload)
         except asyncio.QueueFull:
@@ -604,6 +628,9 @@ class ChannelManager:
             raise ValueError(f"Unknown channel_type '{channel_type}'. Available: {sorted(BUILTIN_CHANNELS.keys())}")
 
         probe_config = dict(config)
+        if channel_type == "feishu":
+            # A short-lived credential probe must not open/recover the live inbox.
+            probe_config["inbox_path"] = ""
         if channel_type == "yuanbao" and not probe_config.get("probe_mode"):
             # Yuanbao appears to allow only one effective bot WebSocket session.
             # Opening a second full connection for a UI probe can kick the live
@@ -635,6 +662,21 @@ class ChannelManager:
         channel_id = channel.channel_id
         if channel_id in self._channels:
             raise ValueError(f"Channel already exists: {channel_id}")
+
+        channel.set_enqueue_callback(lambda payload, cid=channel_id: self.enqueue(cid, payload))  # type: ignore[misc]
+        channel.prepare_inbound_store()
+        if channel.inbound_store is not None:
+            if any(
+                c.inbound_store is not None and c.inbound_scope == channel.inbound_scope
+                for c in self._channels.values()
+            ):
+                raise ValueError("Duplicate durable inbound scope; use one consumer per application")
+            if self._running:
+                recovered = await asyncio.to_thread(channel.inbound_store.recover, channel.inbound_scope)
+                if recovered:
+                    logger.warning(
+                        "%d inbound receipts require reconciliation: scope=%s", recovered, channel.inbound_scope
+                    )
 
         self._channels[channel_id] = channel
         queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=self._queue_maxsize)
@@ -689,12 +731,19 @@ class ChannelManager:
 
         # Cancel workers for this channel
         remaining: list[asyncio.Task[None]] = []
+        cancelled: list[asyncio.Task[None]] = []
         for task in self._workers:
             if task.get_name().startswith(f"gateway-worker-{channel_id}-"):
                 task.cancel()
+                cancelled.append(task)
             else:
                 remaining.append(task)
         self._workers = remaining
+        urgent = [t for t in self._interrupt_tasks if t.get_name() == f"gateway-interrupt-{channel_id}"]
+        for task in urgent:
+            task.cancel()
+        if cancelled or urgent:
+            await asyncio.gather(*cancelled, *urgent, return_exceptions=True)
 
         await channel.stop()
 
@@ -712,6 +761,10 @@ class ChannelManager:
         queue = self._queues.get(channel_id)
         channel = self._channels.get(channel_id)
         if not queue or not channel:
+            return
+
+        if channel.inbound_store is not None:
+            await self._durable_worker_loop(channel_id, channel)
             return
 
         while self._running:
@@ -762,6 +815,117 @@ class ChannelManager:
             except Exception:  # pylint: disable=broad-except
                 # One malformed payload or adapter failure must not stop the worker.
                 logger.exception("Worker error: channel=%s", channel_id)
+
+    async def _durable_worker_loop(self, channel_id: str, channel: BaseChannel) -> None:
+        """Poll reliable receipts; an in-memory queue is never the source of truth.
+
+        Claim atomically before invoking host hooks or processing. Interrupted/failed work is
+        retained for explicit host reconciliation, never blindly replayed.
+        """
+        store = channel.inbound_store
+        assert store is not None
+        scope = channel.inbound_scope
+        offset = 0
+        while self._running and self._channels.get(channel_id) is channel:
+            try:
+                entries = await asyncio.to_thread(store.pending, scope, 100, offset)
+                handled = False
+                for entry in entries:
+                    try:
+                        message = channel.parse_inbound(entry.payload)
+                    except Exception:
+                        if await asyncio.to_thread(store.claim, scope, entry.message_id):
+                            await asyncio.to_thread(store.finish, scope, entry.message_id, "failed")
+                        logger.exception("Invalid durable inbound: scope=%s message_id=%s", scope, entry.message_id)
+                        continue
+                    interrupt = (
+                        self._interrupt_message_predicate is not None
+                        and channel.group_context_manager.accepts(message)
+                        and self._interrupt_message_predicate(message)
+                    )
+                    lock = self._session_lock(channel_id, channel.get_debounce_key(message))
+                    if lock.locked() and not interrupt and self._on_pre_lock is None:
+                        continue
+                    await self._consume_receipt(channel, entry.message_id, message, None if interrupt else lock)
+                    handled = True
+                    break
+                if handled:
+                    offset = 0
+                elif len(entries) == 100:
+                    # Scan past busy sessions so another session (or /stop)
+                    # cannot be starved by more than one page of pending work.
+                    offset += len(entries)
+                else:
+                    offset = 0
+                    await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Durable worker error: channel=%s", channel_id)
+                await asyncio.sleep(1.0)
+
+    async def _consume_receipt(
+        self,
+        channel: BaseChannel,
+        message_id: str,
+        message: InboundMessage,
+        lock: asyncio.Lock | None = None,
+    ) -> None:
+        store = channel.inbound_store
+        assert store is not None
+        scope = channel.inbound_scope
+        claim = asyncio.create_task(asyncio.to_thread(store.claim, scope, message_id, waiting=True))
+        try:
+            claimed = await asyncio.shield(claim)
+        except asyncio.CancelledError:
+            # A thread cannot be cancelled. Wait until its state transition has
+            # committed before allowing shutdown/re-registration to recover it.
+            await claim
+            raise
+        if not claimed:
+            return
+        try:
+            # Stable correlation survives connection sessions and process restarts.
+            message.metadata["inbound_scope"] = scope
+            message.metadata["inbound_message_id"] = message_id
+            if self._on_pre_lock is not None and channel.group_context_manager.accepts(message):
+                try:
+                    await self._on_pre_lock(channel.channel_id, message)
+                except Exception:
+                    logger.exception("pre-lock handler error: channel=%s", channel.channel_id)
+            if lock is None:
+                result = await self._process_claimed(channel, message_id, message)
+            else:
+                async with lock:
+                    result = await self._process_claimed(channel, message_id, message)
+            await asyncio.to_thread(store.finish, scope, message_id, result)
+            logger.info("Durable receipt finished: scope=%s message_id=%s status=%s", scope, message_id, result)
+        except asyncio.CancelledError:
+            # Leave processing for startup recovery: cancellation may interrupt
+            # tools or outbound delivery after their side effects have happened.
+            raise
+        except Exception:
+            logger.exception("Durable processing failed: scope=%s message_id=%s", scope, message_id)
+            await asyncio.to_thread(store.finish, scope, message_id, "failed")
+        finally:
+            # A queued receipt has no processor effects; it remains replayable.
+            # Processing receipts are intentionally NOT released by this call.
+            await asyncio.to_thread(store.release, scope, message_id)
+
+    async def _process_claimed(
+        self, channel: BaseChannel, message_id: str, message: InboundMessage
+    ) -> Literal["completed", "ignored", "failed"]:
+        store = channel.inbound_store
+        assert store is not None
+        transition = asyncio.create_task(asyncio.to_thread(store.begin, channel.inbound_scope, message_id))
+        try:
+            begun = await asyncio.shield(transition)
+        except asyncio.CancelledError:
+            await transition
+            raise
+        if not begun:
+            raise RuntimeError("Durable receipt no longer owned by this consumer")
+        return await channel.handle_inbound_result(message)
 
     def _session_lock(self, channel_id: str, session_key: str) -> asyncio.Lock:
         """Return the shared lock for one registered-channel session."""

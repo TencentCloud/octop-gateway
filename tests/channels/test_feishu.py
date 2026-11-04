@@ -40,6 +40,7 @@ def _make_config() -> FeishuConfig:
     return FeishuConfig(
         app_id=_FEISHU_APP_ID,
         app_secret=_FEISHU_APP_SECRET,
+        inbox_path="",
     )
 
 
@@ -651,7 +652,7 @@ class TestFeishuChannelExtendedUnit:
         alive.is_alive.return_value = True
         ch._ws_thread = alive
         ch._ws_reconnecting_since = None
-        ch._last_ws_activity_at = time.time()
+        ch._last_ws_activity_at = time.monotonic()
         assert ch._ws_is_unhealthy() is False
 
     @pytest.mark.asyncio
