@@ -1029,6 +1029,7 @@ class FeishuChannel(BaseChannel):
             "to_handle": to_handle,
             "sender_id": sender_id,
             "bot_mentioned": bot_mentioned,
+            "has_mentions": bool(mentions),
             "sender_is_bot": raw_payload.get("sender", {}).get("sender_type") == "bot"
             if raw_payload.get("sender", {}).get("sender_type") in {"user", "bot"}
             else None,

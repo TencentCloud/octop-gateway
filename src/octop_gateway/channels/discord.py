@@ -288,6 +288,11 @@ class DiscordChannel(BaseChannel):
             "sender_name": message.author.display_name,
             "message_id": str(message.id),
             "bot_mentioned": mentioned,
+            "has_mentions": bool(
+                getattr(message, "mentions", [])
+                or getattr(message, "role_mentions", [])
+                or getattr(message, "mention_everyone", False)
+            ),
         }
         if is_group:
             metadata["guild_id"] = str(message.guild.id)

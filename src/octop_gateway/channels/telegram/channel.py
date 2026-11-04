@@ -453,6 +453,13 @@ class TelegramChannel(BaseChannel):
             "chat_id": chat_id,
             "user_id": user_id,
             "sender_is_bot": bool(user.is_bot) if user and not message.sender_chat else None,
+            "has_mentions": any(
+                entity.type in ("mention", "text_mention")
+                for entity in (
+                    *(getattr(message, "entities", ()) or ()),
+                    *(getattr(message, "caption_entities", ()) or ()),
+                )
+            ),
             "bot_mentioned": should_accept_message(
                 message,
                 bot_id=self._bot_id,
@@ -698,6 +705,7 @@ class TelegramChannel(BaseChannel):
             "sender_id": user_id,
             "sender_is_bot": data.get("sender_is_bot"),
             "bot_mentioned": data.get("bot_mentioned"),
+            "has_mentions": bool(data.get("has_mentions")),
             "reply_to_message_id": data.get("reply_to_message_id"),
             "media": data.get("media", []),
             "edited": data.get("edited", False),

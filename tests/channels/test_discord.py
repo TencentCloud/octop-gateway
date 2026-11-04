@@ -58,7 +58,19 @@ class FakeClient:
         await asyncio.Future()
 
 
-def message(*, channel=200, author=10, guild=100, parent=None, content="<@99> hello", msg_id=1, bot=False):
+def message(
+    *,
+    channel=200,
+    author=10,
+    guild=100,
+    parent=None,
+    content="<@99> hello",
+    msg_id=1,
+    bot=False,
+    mentions=None,
+    role_mentions=None,
+    mention_everyone=False,
+):
     return SimpleNamespace(
         id=msg_id,
         author=SimpleNamespace(id=author, bot=bot, display_name=f"User {author}"),
@@ -66,6 +78,9 @@ def message(*, channel=200, author=10, guild=100, parent=None, content="<@99> he
         channel=SimpleNamespace(id=channel, parent_id=parent, name="test-room"),
         content=content,
         attachments=[],
+        mentions=mentions or [],
+        role_mentions=role_mentions or [],
+        mention_everyone=mention_everyone,
         webhook_id=None,
         type=discord.MessageType.default,
         created_at=datetime.now(UTC),
@@ -219,6 +234,16 @@ def test_conversation_routing_separates_channels_threads_and_dms(channel):
     assert messages[3].metadata["chat_id"] == "300"
     assert messages[4].metadata["chat_id"] == "400"
     assert all(m.tenant_id == "agent-one" and m.channel_id == "registration" for m in messages)
+
+
+def test_has_mentions_is_independent_of_bot_mention(channel):
+    ordinary = channel.parse_inbound(message(content="hello", mentions=[SimpleNamespace(id=11)]))
+    role = channel.parse_inbound(message(content="hello", role_mentions=[SimpleNamespace(id=12)]))
+    everyone = channel.parse_inbound(message(content="hello", mention_everyone=True))
+    assert ordinary.metadata["has_mentions"] is True
+    assert ordinary.metadata["bot_mentioned"] is False
+    assert role.metadata["has_mentions"] is True
+    assert everyone.metadata["has_mentions"] is True
 
 
 async def test_access_filter_threads_bots_webhooks_and_dedup(channel, client):

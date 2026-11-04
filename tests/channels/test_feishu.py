@@ -136,6 +136,7 @@ class TestFeishuChannelUnit:
         assert msg.channel_subject is not None
         assert msg.channel_subject.chat_type == "group"
         assert msg.metadata["bot_mentioned"] is True
+        assert msg.metadata["has_mentions"] is True
         assert msg.metadata["sender_id"] == "ou_human"
         assert "@_user_1" not in msg.text
         assert "please help" in msg.text
@@ -156,6 +157,7 @@ class TestFeishuChannelUnit:
         }
         msg = ch.parse_inbound(payload)
         assert msg.metadata["bot_mentioned"] is False
+        assert msg.metadata["has_mentions"] is False
 
     def test_parse_inbound_image(self) -> None:
         ch = FeishuChannel(processor=_noop_processor, config=_make_config())

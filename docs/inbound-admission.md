@@ -40,7 +40,10 @@ preparation, processing and completion lifecycle.
 
 Group participation policies use the same hook across channel types. Adapters
 must provide stable subject and sender IDs plus explicit boolean
-`bot_mentioned` and `sender_is_bot` metadata. An adapter may instead expose
+`bot_mentioned` and `sender_is_bot` metadata. Adapters with platform mention
+data should also provide boolean `has_mentions`, meaning the message addresses
+any user, role, or everyone; it is independent of whether the bot itself was
+mentioned. An adapter may instead expose
 `async resolve_sender_is_bot(message) -> bool | None`; unknown identities are
 not evidence of a human sender. Ordinary messages must reach the hook before
 the native activation check without bypassing sender or command permissions.

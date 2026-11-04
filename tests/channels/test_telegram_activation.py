@@ -241,3 +241,21 @@ async def test_shared_group_policy_observes_unmentioned_humans_without_bypassing
     assert channel.group_context_manager.prepare(inbound) is None
     config.allowed_user_ids = ["8"]
     assert not channel._accept(ordinary)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caption", [False, True])
+async def test_inbound_exposes_any_telegram_mention(caption: bool) -> None:
+    from octop_gateway.channels.telegram.channel import TelegramChannel, TelegramConfig
+
+    text = "hello @someone"
+    item = entity(text, "@someone")
+    fields = {"caption": text, "caption_entities": [item]} if caption else {"entities": [item]}
+    incoming = message(text=None if caption else text, **fields)
+    channel = TelegramChannel(lambda _msg: None, config=TelegramConfig(bot_token="token"))
+    native = await channel._build_message(incoming)
+    assert native is not None
+    parsed = channel.parse_inbound(native)
+    assert native["has_mentions"] is True
+    assert parsed.metadata["has_mentions"] is True
+    assert parsed.metadata["bot_mentioned"] is False

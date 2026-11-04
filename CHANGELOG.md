@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - 通用入站策略开关与接管回调，保留适配器默认群策略；补齐 Discord、飞书、Telegram 的群消息身份和 @ 状态。
+- 为 Discord、飞书、Telegram 和 QQ 入站消息提供独立的 `has_mentions` 元数据；QQ 使用 READY 中的机器人身份识别并移除自身 @，不再把 AppID 当作群成员 ID。
 
 ### Added
 
