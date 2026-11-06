@@ -306,6 +306,7 @@ class QQChannel(BaseChannel):
         self._heartbeat_interval: float = 41.25  # seconds, updated from HELLO
         self._last_sequence: int | None = None
         self._session_id_ws: str | None = None
+        self._bot_user_id: str | None = None
         self._gateway_url: str | None = None
 
         # Lifecycle control
@@ -329,6 +330,7 @@ class QQChannel(BaseChannel):
         # Markdown support tracking: per-user/group.
         # If markdown send fails (400), we cache that and skip for subsequent sends.
         self._markdown_unsupported: set[str] = set()
+        self._sent_references: OrderedDict[tuple[str, str], float] = OrderedDict()
         self._active_c2c_stream: StreamSession | None = None
 
     def _default_constraints(self) -> ChannelConstraints:
@@ -490,11 +492,18 @@ class QQChannel(BaseChannel):
             md_payload["msg_id"] = msg_id
             md_payload["msg_seq"] = _get_next_msg_seq(msg_id)
 
-        ok, _, _ = await self._try_send_message(subject.subject_id, md_payload, msg_type, meta)
+        ok, status, body = await self._try_send_message(subject.subject_id, md_payload, msg_type, meta)
         if ok:
             return
 
-        # Markdown failed — mark unsupported and retry as plain text
+        # Retry only explicit Markdown capability rejections, never uncertain delivery.
+        try:
+            error_code = json.loads(body).get("code")
+        except (ValueError, AttributeError):
+            error_code = None
+        if status != 400 or error_code not in (304036, 40034127):
+            raise RuntimeError(f"QQChannel Markdown send failed: status={status} code={error_code}")
+
         logger.info("QQChannel markdown not supported for %s, falling back to plain text", target_key)
         self._markdown_unsupported.add(target_key)
         payload = {"content": text, "msg_type": 0}
@@ -1097,6 +1106,34 @@ class QQChannel(BaseChannel):
             metadata["conversation_id"] = conversation_id
             metadata["bot_mentioned"] = self._is_bot_mentioned(data, event_type)
 
+        scene = data.get("message_scene")
+        ext = scene.get("ext") if isinstance(scene, dict) else []
+        if isinstance(ext, list):
+            for entry in ext:
+                if isinstance(entry, str) and entry.startswith("msg_idx="):
+                    metadata["msg_idx"] = entry.removeprefix("msg_idx=")
+                elif isinstance(entry, str) and entry.startswith("ref_msg_idx="):
+                    metadata["ref_msg_idx"] = entry.removeprefix("ref_msg_idx=")
+        quoted = self._find_quoted_element(data)
+        if quoted is not None:
+            quote_text = str(quoted.get("content") or "").strip()
+            if not quote_text:
+                attachments = quoted.get("attachments")
+                if isinstance(attachments, list):
+                    quote_text = " ".join(
+                        str(att.get("asr_refer_text") or "").strip() for att in attachments if isinstance(att, dict)
+                    ).strip()
+            metadata["reply_quote_text"] = quote_text
+            author = quoted.get("author")
+            author = author if isinstance(author, dict) else {}
+            metadata["reply_to_sender_id"] = str(author.get("member_openid") or author.get("id") or "")
+            ref = str(metadata.get("ref_msg_idx") or "")
+            sent_at = self._sent_references.get((conversation_id, ref))
+            metadata["reply_to_bot"] = bool(
+                (self._bot_user_id and self._bot_user_id == metadata["reply_to_sender_id"])
+                or (sent_at is not None and time.monotonic() - sent_at < 600)
+            )
+
         # Carry guild/group/user context for replies
         if "guild_id" in data:
             metadata["guild_id"] = data["guild_id"]
@@ -1232,6 +1269,8 @@ class QQChannel(BaseChannel):
 
             if event_type == "READY":
                 self._session_id_ws = data.get("session_id")
+                user = data.get("user")
+                self._bot_user_id = str(user.get("id") or "") if isinstance(user, dict) else ""
                 # Reconnect succeeded all the way through IDENTIFY → reset
                 # the geometric backoff so a healthy session doesn't carry
                 # an inflated delay from prior failures.
@@ -1404,6 +1443,33 @@ class QQChannel(BaseChannel):
                 raise RuntimeError(f"No gateway URL in response: {data}")
             return url  # type: ignore[no-any-return]
 
+    @staticmethod
+    def _apply_quote(payload: dict[str, Any], msg_type: str, meta: dict[str, Any]) -> None:
+        # Only the current inbound group turn opts into automatic quoting.
+        if (
+            msg_type == "group"
+            and meta.get("msg_id")
+            and meta.get("msg_idx")
+            and (meta.get("bot_mentioned") or meta.get("ref_msg_idx"))
+        ):
+            payload.setdefault("message_reference", {"message_id": meta["msg_idx"]})
+
+    def _remember_reference(self, meta: dict[str, Any], body: str) -> None:
+        group = str(meta.get("group_openid") or "")
+        if not group:
+            return
+        try:
+            response = json.loads(body)
+            ref = response.get("ext_info", {}).get("ref_idx")
+        except (ValueError, AttributeError):
+            return
+        if isinstance(ref, str) and ref:
+            key = (group, ref)
+            self._sent_references[key] = time.monotonic()
+            self._sent_references.move_to_end(key)
+            while len(self._sent_references) > 512:
+                self._sent_references.popitem(last=False)
+
     async def _send_message(
         self,
         to_handle: str,
@@ -1434,6 +1500,7 @@ class QQChannel(BaseChannel):
                 # Proactive message: omit msg_id/msg_seq per QQ docs
                 payload.pop("msg_seq", None)
 
+        self._apply_quote(payload, msg_type, meta)
         url = f"{self._api_base}{endpoint}"
 
         try:
@@ -1447,6 +1514,7 @@ class QQChannel(BaseChannel):
                     body[:500],
                 )
                 raise RuntimeError(f"QQChannel send failed: status={status} body={body[:500]}")
+            self._remember_reference(meta, body)
             logger.debug("QQChannel message sent: endpoint=%s resp=%s", endpoint, body[:200])
         except Exception:  # pylint: disable=broad-except
             # Preserve transport-specific diagnostics before propagating to the caller.
@@ -1469,19 +1537,21 @@ class QQChannel(BaseChannel):
         if not endpoint:
             return False, 0, ""
 
+        self._apply_quote(payload, msg_type, meta)
         url = f"{self._api_base}{endpoint}"
 
         try:
             status, body = await self._qq_post(url, payload)
             if status in (200, 201, 202, 204):
+                self._remember_reference(meta, body)
                 logger.debug("QQChannel message sent (try): endpoint=%s resp=%s", endpoint, body[:200])
                 return True, status, body
             logger.warning("QQChannel try_send failed: status=%d body=%s", status, body[:200])
             return False, status, body
         except Exception:  # pylint: disable=broad-except
-            # This best-effort send API converts all transport failures into False.
+            # Propagate uncertain delivery so the host does not retry as another format.
             logger.exception("QQChannel try_send error: url=%s", url)
-            return False, 0, ""
+            raise
 
     def _resolve_send_endpoint(self, to_handle: str, msg_type: str, meta: dict[str, Any]) -> str | None:
         """Determine the REST API endpoint for sending a message."""
@@ -1634,17 +1704,9 @@ class QQChannel(BaseChannel):
 
         quoted = self._find_quoted_element(data)
         if quoted is not None:
-            quoted_text = str(quoted.get("content") or "").strip()
             quoted_attachments = quoted.get("attachments") or []
-            quoted_voice_transcripts: list[str] = []
-            if quoted_text:
-                text_parts.append(f"[quoted message: {quoted_text}]")
             if isinstance(quoted_attachments, list):
-                quoted_voice_transcripts = self._append_attachments(parts, quoted_attachments)
-            if not quoted_text and quoted_voice_transcripts:
-                text_parts.append(f"[quoted message: {' '.join(quoted_voice_transcripts)}]")
-            elif not quoted_text and not quoted_attachments:
-                text_parts.append("[quoted message]")
+                self._append_attachments(parts, quoted_attachments)
 
         if clean_text:
             text_parts.append(clean_text)
