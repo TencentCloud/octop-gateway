@@ -506,6 +506,8 @@ class FeishuChannel(BaseChannel):
                 "chat_id": message.chat_id,
                 "chat_type": message.chat_type,
                 "thread_id": getattr(message, "thread_id", "") or "",
+                "parent_id": getattr(message, "parent_id", "") or "",
+                "root_id": getattr(message, "root_id", "") or "",
                 "mentions": mentions,
                 "sender": {
                     "sender_id": sender_id,
@@ -1029,6 +1031,8 @@ class FeishuChannel(BaseChannel):
             "to_handle": to_handle,
             "sender_id": sender_id,
             "bot_mentioned": bot_mentioned,
+            "parent_id": str(raw_payload.get("parent_id") or ""),
+            "root_id": str(raw_payload.get("root_id") or ""),
             "mentions": mentions,
         }
         if thread_id:
@@ -1048,6 +1052,75 @@ class FeishuChannel(BaseChannel):
             metadata=metadata,
             timestamp=timestamp,
         )
+
+    async def _preprocess_inbound(self, message: InboundMessage) -> None:
+        """Attach one quoted message without changing activation or reply routing."""
+        parent_id = str(message.metadata.get("parent_id") or "")
+        if (
+            not parent_id
+            or parent_id == message.metadata.get("message_id")
+            or "quoted_message_status" in message.metadata
+        ):
+            return
+
+        quoted_parts: list[ContentPart] = []
+        try:
+            http = await self._ensure_http()
+            headers = await self._get_auth_headers()
+            url = f"{_API_BASE}/im/v1/messages/{quote(parent_id, safe='')}"
+            async with http.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+            if not isinstance(data, dict) or data.get("code") != 0:
+                raise ValueError("quoted_message_unavailable")
+            payload = data.get("data")
+            if not isinstance(payload, dict):
+                raise ValueError("quoted_message_invalid_response")
+            items = payload.get("items")
+            if not isinstance(items, list) or not items or not isinstance(items[0], dict):
+                raise ValueError("quoted_message_missing")
+            item = items[0]
+            if (
+                item.get("message_id") != parent_id
+                or not message.metadata.get("chat_id")
+                or item.get("chat_id") != message.metadata.get("chat_id")
+                or item.get("deleted")
+                or item.get("is_deleted")
+            ):
+                raise ValueError("quoted_message_not_readable_in_this_chat")
+            body = item.get("body")
+            if not isinstance(body, dict):
+                raise ValueError("quoted_message_invalid_body")
+            raw = body.get("content", "{}")
+            content = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(content, dict):
+                raise ValueError("quoted_message_invalid_content")
+            parts = self._parse_content_parts(str(item.get("msg_type") or "text"), content, message_id=parent_id)
+            remaining = 6000
+            for part in parts:
+                if isinstance(part, TextContent):
+                    text = part.text[:remaining]
+                    if len(part.text) > remaining:
+                        text += "\n[引用正文已截断]"
+                    remaining = max(0, remaining - len(part.text))
+                    if text:
+                        quoted_parts.append(TextContent(text=text))
+                else:
+                    quoted_parts.append(part)
+            if not quoted_parts:
+                raise ValueError("quoted_message_empty")
+        except (aiohttp.ClientError, TimeoutError, ValueError, RuntimeError):
+            message.metadata["quoted_message_status"] = "unavailable"
+            message.content.insert(0, TextContent(text="[引用消息暂不可读取：可能已删除、无权限或读取超时]"))  # noqa: RUF001
+            return
+
+        message.metadata["quoted_message_status"] = "loaded"
+        message.content = [
+            TextContent(text="[引用消息内容，仅作为上下文]"),  # noqa: RUF001
+            *quoted_parts,
+            TextContent(text="[/引用消息内容]\n[当前消息]"),
+            *message.content,
+        ]
 
     def _is_bot_mentioned(self, chat_type: str, mentions: list[Any]) -> bool:
         """Return whether this message @mentions the bot (group activation hint).

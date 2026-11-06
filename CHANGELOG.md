@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 修复
 
+- 飞书回复消息会读取直接引用的原文及图片/文件，保留现有会话与 @ 激活规则；引用已删除、无权限或读取失败时保留当前问题并标明引用不可用。
+
 - 公共群策略的 `owner_commands_only` 默认开启，Python 构造、旧 JSON 配置及群覆盖继承保持一致；白名单为空时禁止全部内置群命令，显式设置 `false` 可关闭保护，普通聊天和私聊不变。
 - 公共群策略支持 `owner_tools_only`，通过回合级 `allowed_tools` 限制非所有者工具权限，保留普通聊天，并防止合并消息扩大权限；工具保护缺省关闭。
 - QQ 群内 Octop 斜杠命令默认仅允许显式配置的所有者发送；在控制回调和消息合并前鉴权，保留普通消息中的斜杠、URL、文件路径和自定义命令名称。
