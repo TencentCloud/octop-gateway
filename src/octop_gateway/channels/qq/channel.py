@@ -1454,6 +1454,16 @@ class QQChannel(BaseChannel):
         ):
             payload.setdefault("message_reference", {"message_id": meta["msg_idx"]})
 
+    async def _post_with_quote_fallback(self, url: str, payload: dict[str, Any]) -> tuple[int, str]:
+        """Retry once without a quote only when QQ explicitly rejects the request."""
+        status, body = await self._qq_post(url, payload)
+        if status == 400 and "message_reference" in payload:
+            retry_payload = dict(payload)
+            retry_payload.pop("message_reference")
+            logger.info("QQ rejected message reference; retrying without quote: url=%s", url)
+            return await self._qq_post(url, retry_payload)
+        return status, body
+
     def _remember_reference(self, meta: dict[str, Any], body: str) -> None:
         group = str(meta.get("group_openid") or "")
         if not group:
@@ -1504,7 +1514,7 @@ class QQChannel(BaseChannel):
         url = f"{self._api_base}{endpoint}"
 
         try:
-            status, body = await self._qq_post(url, payload)
+            status, body = await self._post_with_quote_fallback(url, payload)
             if status not in (200, 201, 202, 204):
                 logger.error(
                     "QQChannel send failed: status=%d url=%s payload_keys=%s body=%s",
@@ -1541,7 +1551,7 @@ class QQChannel(BaseChannel):
         url = f"{self._api_base}{endpoint}"
 
         try:
-            status, body = await self._qq_post(url, payload)
+            status, body = await self._post_with_quote_fallback(url, payload)
             if status in (200, 201, 202, 204):
                 self._remember_reference(meta, body)
                 logger.debug("QQChannel message sent (try): endpoint=%s resp=%s", endpoint, body[:200])
