@@ -50,7 +50,7 @@ class DiscordConfig(ChannelConfig):
     allowed_user_ids: list[str] = field(default_factory=list)
     allowed_channel_ids: list[str] = field(default_factory=list)
     group_context: GroupContextConfig = field(
-        default_factory=lambda: GroupContextConfig(enabled=True, visibility="all", activation="mention")
+        default_factory=lambda: GroupContextConfig(enabled=False, visibility="all", activation="mention")
     )
 
     required_credentials = ("bot_token",)

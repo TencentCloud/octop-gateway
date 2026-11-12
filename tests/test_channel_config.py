@@ -87,10 +87,14 @@ def test_plugin_group_switch_retains_adapter_policy_defaults() -> None:
     from octop_gateway.channels.discord import DiscordConfig
 
     cfg = DiscordConfig.from_dict({"group_context": {"social_trigger_enabled": False}})
-    assert cfg.group_context.enabled
+    assert not cfg.group_context.enabled
     assert cfg.group_context.visibility == "all"
     assert cfg.group_context.activation == "mention"
     assert cfg.plugin_group_settings["social_trigger_enabled"] is False
+    assert "enabled" not in cfg.plugin_group_settings
+    assert "owner_tools_only" not in cfg.plugin_group_settings
+    opted_in = DiscordConfig.from_dict({"group_context": {"social_trigger_enabled": True}})
+    assert opted_in.group_context.enabled
     generic = FeishuConfig.from_dict(
         {"group_context": {"enabled": True, "social_trigger_enabled": True, "not_a_switch": "true"}}
     )

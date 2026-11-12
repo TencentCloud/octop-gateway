@@ -235,7 +235,9 @@ caller's responsibility.
 
 `group_context` separates platform visibility from agent activation. QQ enables
 the shared manager by default with a conservative `auto + mention + recent(10)`
-policy. It can be configured globally and overridden by native group ID:
+policy. Discord keeps group ingestion disabled unless explicitly enabled; a
+partial `group_context` such as `history_limit` alone does not enable it. It can
+be configured globally and overridden by native group ID:
 
 ```json
 {

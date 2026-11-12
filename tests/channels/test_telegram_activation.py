@@ -232,6 +232,8 @@ async def test_shared_group_policy_observes_unmentioned_humans_without_bypassing
     channel = TelegramChannel(processor, config=config)
     channel._bot_id, channel._bot_username = 99, "Our_Bot"
     ordinary = message()
+    assert not channel._accept(ordinary)
+    channel._set_inbound_admission_enabled(True)
     assert channel._accept(ordinary)
     native = await channel._build_message(ordinary)
     assert native is not None

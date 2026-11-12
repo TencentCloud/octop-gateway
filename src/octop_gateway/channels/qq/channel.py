@@ -240,11 +240,6 @@ class QQConfig(ChannelConfig):
             # ``c2c_streaming: false`` remains the only opt-out.
             config.c2c_streaming = True
         raw_group_context = data.get("group_context")
-        config.plugin_group_settings = {}
-        if isinstance(raw_group_context, dict):
-            config.plugin_group_settings = {
-                key: value for key, value in raw_group_context.items() if isinstance(key, str) and type(value) is bool
-            }
         if isinstance(raw_group_context, dict) and "enabled" not in raw_group_context:
             config.group_context.enabled = True
         if isinstance(raw_group_context, dict) and "owner_commands_only" not in raw_group_context:
@@ -318,7 +313,7 @@ class QQChannel(BaseChannel):
         self._last_sequence: int | None = None
         self._session_id_ws: str | None = None
         self._gateway_url: str | None = None
-        self._bot_user_id: str = ""
+        self._bot_user_id: str | None = None
 
         # Lifecycle control
         self._running = False
@@ -1254,7 +1249,7 @@ class QQChannel(BaseChannel):
             if event_type == "READY":
                 self._session_id_ws = data.get("session_id")
                 user = data.get("user")
-                self._bot_user_id = str(user.get("id") or "") if isinstance(user, dict) else ""
+                self._bot_user_id = str(user.get("id") or "") if isinstance(user, dict) else None
                 # Reconnect succeeded all the way through IDENTIFY → reset
                 # the geometric backoff so a healthy session doesn't carry
                 # an inflated delay from prior failures.

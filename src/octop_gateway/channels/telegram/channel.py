@@ -260,11 +260,16 @@ class TelegramChannel(BaseChannel):
 
     def _accept(self, message: Any) -> bool:
         shared = self._config.group_context.resolve(str(message.chat.id))
+        activation = self._config.group_activation
+        if shared.enabled and self.inbound_admission_enabled:
+            # Let the admission hook decide about passive group messages. Without
+            # a hook, preserve Telegram's configured activation policy.
+            activation = "always"
         return self._is_allowed_sender(message) and should_accept_message(
             message,
             bot_id=self._bot_id,
             bot_username=self._bot_username,
-            activation="always" if shared.enabled else self._config.group_activation,
+            activation=activation,
             allowed_user_ids=self._config.allowed_user_ids,
             allowed_chat_ids=self._config.allowed_chat_ids,
             allow_unaddressed_commands=self._config.allow_unaddressed_commands,

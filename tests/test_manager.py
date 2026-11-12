@@ -854,3 +854,28 @@ async def test_claimed_input_notifies_durable_adapter_without_starting_agent() -
     assert await manager._admit(channel.channel_id, channel, message)
     channel.on_inbound_claimed.assert_called_once_with(message)
     assert channel.sent == []
+
+
+@pytest.mark.asyncio
+async def test_admission_error_claim_notifies_durable_adapter() -> None:
+    from unittest.mock import Mock
+
+    from octop_gateway.group_context import GroupContextConfig, GroupContextManager
+
+    channel = MockChannel(_echo_processor)
+    channel._group_context = GroupContextManager(GroupContextConfig(enabled=True, visibility="all"))
+    channel.on_inbound_claimed = Mock()  # type: ignore[method-assign]
+
+    async def fail(*_args: Any) -> bool:
+        raise RuntimeError("admission unavailable")
+
+    manager = ChannelManager({channel.channel_id: channel}, inbound_handler=fail)
+    message = InboundMessage(
+        channel_id=channel.channel_id,
+        channel_type="mock",
+        content=[TextContent(text="ordinary")],
+        channel_subject=ChannelSubject(subject_id="group1", chat_type="group"),
+        metadata={"chat_type": "group", "sender_id": "user1", "bot_mentioned": False},
+    )
+    assert await manager._admit(channel.channel_id, channel, message)
+    channel.on_inbound_claimed.assert_called_once_with(message)

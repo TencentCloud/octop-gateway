@@ -115,8 +115,12 @@ def test_config_and_registration():
     assert DiscordConfig.from_dict({"allow_all_channels": False}).allow_all_channels is False
     assert cfg.allowed_channel_ids == ["200", "201", "202"]
     assert cfg.allowed_user_ids == ["10", "11"]
-    assert cfg.group_context.enabled
+    assert not cfg.group_context.enabled
     assert cfg.group_context.activation == "mention"
+    partial = DiscordConfig.from_dict({"group_context": {"history_limit": 5}})
+    assert not partial.group_context.enabled
+    assert partial.group_context.history_limit == 5
+    assert DiscordConfig.from_dict({"group_context": {"enabled": True}}).group_context.enabled
     assert ChannelKind("discord") is ChannelKind.DISCORD
     assert DiscordConfig().missing_credentials() == ["bot_token"]
     with pytest.raises(ValueError):

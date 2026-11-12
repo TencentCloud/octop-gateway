@@ -50,6 +50,18 @@ from octop_gateway.utils import Debouncer, close_event_stream, extract_media, ex
 
 logger = logging.getLogger(__name__)
 
+_GROUP_CONTEXT_FIELDS = frozenset(item.name for item in fields(GroupContextConfig))
+
+
+def _plugin_group_settings(data: dict[str, Any]) -> dict[str, bool]:
+    """Extract plugin switches without exposing core group-policy booleans."""
+    return {
+        key: value
+        for key, value in data.items()
+        if key not in _GROUP_CONTEXT_FIELDS and isinstance(key, str) and type(value) is bool
+    }
+
+
 # Type alias for the message processor: takes InboundMessage, yields MessageEvents
 MessageProcessor = Callable[[InboundMessage], AsyncIterator[MessageEvent]]
 
@@ -153,10 +165,13 @@ class ChannelConfig:
         if isinstance(group_context, dict):
             group_field = next(item for item in fields(cls) if item.name == "group_context")
             defaults = asdict(group_field.default_factory())  # type: ignore[misc]
+            plugin_settings = _plugin_group_settings(group_context)
+            if "enabled" not in group_context and any(plugin_settings.values()):
+                # An explicitly enabled plugin switch opts into group ingestion;
+                # unrelated partial policy fields keep the adapter's safe default.
+                defaults["enabled"] = True
             out["group_context"] = GroupContextConfig.from_dict({**defaults, **group_context})
-            out["plugin_group_settings"] = {
-                key: value for key, value in group_context.items() if isinstance(key, str) and type(value) is bool
-            }
+            out["plugin_group_settings"] = plugin_settings
         for alias, canonical in cls.field_aliases.items():  # type: ignore[attr-defined]
             if canonical in known and not out.get(canonical) and data.get(alias):
                 out[canonical] = _clean(data[alias])
@@ -265,6 +280,7 @@ class BaseChannel(ABC):
         self._http: aiohttp.ClientSession | None = None
         # Set by ChannelManager
         self._enqueue_callback: Callable[[Any], None] | None = None
+        self._inbound_admission_enabled = False
         self._group_context = GroupContextManager(config.group_context if config is not None else None)
         self._plugin_group_settings = dict(config.plugin_group_settings) if config is not None else {}
 
@@ -320,6 +336,14 @@ class BaseChannel(ABC):
     def plugin_group_settings(self) -> dict[str, bool]:
         """Return persisted switches contributed by inbound policy plugins."""
         return self._plugin_group_settings.copy()
+
+    @property
+    def inbound_admission_enabled(self) -> bool:
+        """Whether the manager has installed a pre-agent admission handler."""
+        return self._inbound_admission_enabled
+
+    def _set_inbound_admission_enabled(self, enabled: bool) -> None:
+        self._inbound_admission_enabled = enabled
 
     def on_inbound_claimed(self, message: InboundMessage) -> None:
         """Release transport intake after a policy plugin owns this input.

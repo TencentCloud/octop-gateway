@@ -199,6 +199,8 @@ MessageProcessor: InboundMessage → AsyncIterator[MessageEvent]
 
 ### 群命令权限（QQ 示例）
 
+Discord 群消息处理默认关闭；仅填写 `group_context.history_limit` 等部分选项不会开启群监听。显式设置 `group_context.enabled: true`，或启用明确的群插件开关，才会允许接收普通群消息。
+
 使用公共群策略的通道默认启用群内命令保护，Python 配置对象及未填写该字段的旧 JSON 配置也会启用。下面以 QQ 为例：
 
 ```json
