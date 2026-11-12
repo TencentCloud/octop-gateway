@@ -259,11 +259,17 @@ class TelegramChannel(BaseChannel):
         return False
 
     def _accept(self, message: Any) -> bool:
+        shared = self._config.group_context.resolve(str(message.chat.id))
+        activation = self._config.group_activation
+        if shared.enabled and self.inbound_admission_enabled:
+            # Let the admission hook decide about passive group messages. Without
+            # a hook, preserve Telegram's configured activation policy.
+            activation = "always"
         return self._is_allowed_sender(message) and should_accept_message(
             message,
             bot_id=self._bot_id,
             bot_username=self._bot_username,
-            activation=self._config.group_activation,
+            activation=activation,
             allowed_user_ids=self._config.allowed_user_ids,
             allowed_chat_ids=self._config.allowed_chat_ids,
             allow_unaddressed_commands=self._config.allow_unaddressed_commands,
@@ -451,6 +457,24 @@ class TelegramChannel(BaseChannel):
         return {
             "chat_id": chat_id,
             "user_id": user_id,
+            "sender_is_bot": bool(user.is_bot) if user and not message.sender_chat else None,
+            "has_mentions": any(
+                entity.type in ("mention", "text_mention")
+                for entity in (
+                    *(getattr(message, "entities", ()) or ()),
+                    *(getattr(message, "caption_entities", ()) or ()),
+                )
+            ),
+            "bot_mentioned": should_accept_message(
+                message,
+                bot_id=self._bot_id,
+                bot_username=self._bot_username,
+                activation="mention_or_reply" if self._config.group_activation == "mention_or_reply" else "mention",
+                allowed_user_ids=[],
+                allowed_chat_ids=[],
+            )
+            if is_group
+            else False,
             "message_id": str(getattr(message, "message_id", "")),
             "is_group": is_group,
             "message_thread_id": _topic_thread_id(message),
@@ -684,6 +708,9 @@ class TelegramChannel(BaseChannel):
             "is_group": is_group,
             "source_message_id": data.get("message_id", ""),
             "sender_id": user_id,
+            "sender_is_bot": data.get("sender_is_bot"),
+            "bot_mentioned": data.get("bot_mentioned"),
+            "has_mentions": bool(data.get("has_mentions")),
             "reply_to_message_id": data.get("reply_to_message_id"),
             "media": data.get("media", []),
             "edited": data.get("edited", False),

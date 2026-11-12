@@ -287,6 +287,7 @@ class TestQQChannelUnit:
 
     def test_parse_inbound_with_at_mention(self) -> None:
         ch = QQChannel(processor=_noop_processor, config=_make_config())
+        ch._bot_user_id = "12345"
         payload = {
             "t": "AT_MESSAGE_CREATE",
             "d": {
@@ -540,6 +541,64 @@ class TestQQChannelUnit:
         assert msg.metadata["sender_id"] == "member_2"
         assert msg.metadata["sender_name"] == "Alice"
         assert msg.metadata["bot_mentioned"] is False
+        assert msg.metadata["has_mentions"] is False
+
+    def test_full_group_message_about_another_member_is_not_a_bot_mention(self) -> None:
+        ch = QQChannel(processor=_noop_processor, config=_make_config())
+        ch._bot_user_id = "bot_openid"
+        payload = {
+            "t": "GROUP_MESSAGE_CREATE",
+            "d": {
+                "id": "msg_other_mention",
+                "content": "<@other_openid> please help",
+                "author": {"member_openid": "member_2"},
+                "group_openid": "group_open_abc",
+                "mentions": [{"id": "other_openid"}],
+            },
+        }
+        msg = ch.parse_inbound(payload)
+        assert msg.metadata["has_mentions"] is True
+        assert msg.metadata["bot_mentioned"] is False
+        assert msg.text == "<@other_openid> please help"
+
+    @pytest.mark.asyncio
+    async def test_ready_identity_matches_self_without_confusing_app_id(self) -> None:
+        ch = QQChannel(processor=_noop_processor, config=_make_config())
+        await ch._handle_op(
+            _SentWS(),
+            0,
+            {"op": 0, "t": "READY", "d": {"session_id": "session", "user": {"id": "bot_openid"}}},
+        )
+        self_mention = ch.parse_inbound(
+            {
+                "t": "GROUP_MESSAGE_CREATE",
+                "d": {
+                    "content": "<@other_openid> <@bot_openid> hello",
+                    "mentions": [{"id": "other_openid"}, {"id": "bot_openid"}],
+                    "author": {"member_openid": "member_2"},
+                    "group_openid": "group_open_abc",
+                },
+            }
+        )
+        assert ch._bot_user_id == "bot_openid"
+        assert self_mention.metadata["bot_mentioned"] is True
+        assert self_mention.metadata["has_mentions"] is True
+        assert self_mention.text == "<@other_openid> hello"
+
+        app_id_mention = ch.parse_inbound(
+            {
+                "t": "GROUP_MESSAGE_CREATE",
+                "d": {
+                    "content": f"<@{_QQ_APP_ID}> hello",
+                    "mentions": [{"id": _QQ_APP_ID}],
+                    "author": {"member_openid": "member_2"},
+                    "group_openid": "group_open_abc",
+                },
+            }
+        )
+        assert app_id_mention.metadata["has_mentions"] is True
+        assert app_id_mention.metadata["bot_mentioned"] is False
+        assert app_id_mention.text == f"<@{_QQ_APP_ID}> hello"
 
     @pytest.mark.asyncio
     async def test_group_context_only_invokes_processor_on_mention(self) -> None:

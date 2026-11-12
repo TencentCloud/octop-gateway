@@ -17,7 +17,8 @@ import re
 import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field, fields
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Self
 from urllib.parse import urlparse
 
@@ -49,8 +50,40 @@ from octop_gateway.utils import Debouncer, close_event_stream, extract_media, ex
 
 logger = logging.getLogger(__name__)
 
+_GROUP_CONTEXT_FIELDS = frozenset(item.name for item in fields(GroupContextConfig))
+
+
+def _plugin_group_settings(data: dict[str, Any]) -> dict[str, bool]:
+    """Extract plugin switches without exposing core group-policy booleans."""
+    return {
+        key: value
+        for key, value in data.items()
+        if key not in _GROUP_CONTEXT_FIELDS and isinstance(key, str) and type(value) is bool
+    }
+
+
 # Type alias for the message processor: takes InboundMessage, yields MessageEvents
 MessageProcessor = Callable[[InboundMessage], AsyncIterator[MessageEvent]]
+
+
+@dataclass
+class InboundReceipt:
+    """Track a dispatch and optionally filter its buffered text before delivery."""
+
+    attempted: bool = False
+    delivered: bool = False
+    text_filter: Callable[[str], str] | None = field(default=None, repr=False, compare=False)
+    input_filter: Callable[[InboundMessage], bool] | None = field(default=None, repr=False, compare=False)
+    suppress_thinking: bool = False
+
+
+_inbound_receipt: ContextVar[InboundReceipt | None] = ContextVar("inbound_receipt", default=None)
+_inbound_activation: ContextVar[bool] = ContextVar("inbound_activation", default=False)
+
+
+def current_inbound_receipt() -> InboundReceipt | None:
+    """Return the current managed inbound dispatch, if one exists."""
+    return _inbound_receipt.get()
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +125,7 @@ class ChannelConfig:
     show_thinking: bool = False
     show_tool_hints: bool = True
     group_context: GroupContextConfig = field(default_factory=GroupContextConfig)
+    plugin_group_settings: dict[str, bool] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
@@ -129,7 +163,15 @@ class ChannelConfig:
         out = {k: _clean(v) for k, v in data.items() if k in known}
         group_context = out.get("group_context")
         if isinstance(group_context, dict):
-            out["group_context"] = GroupContextConfig.from_dict(group_context)
+            group_field = next(item for item in fields(cls) if item.name == "group_context")
+            defaults = asdict(group_field.default_factory())  # type: ignore[misc]
+            plugin_settings = _plugin_group_settings(group_context)
+            if "enabled" not in group_context and any(plugin_settings.values()):
+                # An explicitly enabled plugin switch opts into group ingestion;
+                # unrelated partial policy fields keep the adapter's safe default.
+                defaults["enabled"] = True
+            out["group_context"] = GroupContextConfig.from_dict({**defaults, **group_context})
+            out["plugin_group_settings"] = plugin_settings
         for alias, canonical in cls.field_aliases.items():  # type: ignore[attr-defined]
             if canonical in known and not out.get(canonical) and data.get(alias):
                 out[canonical] = _clean(data[alias])
@@ -238,7 +280,9 @@ class BaseChannel(ABC):
         self._http: aiohttp.ClientSession | None = None
         # Set by ChannelManager
         self._enqueue_callback: Callable[[Any], None] | None = None
+        self._inbound_admission_enabled = False
         self._group_context = GroupContextManager(config.group_context if config is not None else None)
+        self._plugin_group_settings = dict(config.plugin_group_settings) if config is not None else {}
 
         # Platform constraints
         self._constraints = constraints or self._default_constraints()
@@ -308,10 +352,35 @@ class BaseChannel(ABC):
         """
         return self._constraints
 
+    def should_show_thinking(self) -> bool:
+        """Return the effective thinking visibility for the current dispatch."""
+        receipt = _inbound_receipt.get()
+        return self._constraints.show_thinking and not getattr(receipt, "suppress_thinking", False)
+
     @property
     def group_context_manager(self) -> GroupContextManager:
         """Expose group policy state for adapter capability-change hooks."""
         return self._group_context
+
+    @property
+    def plugin_group_settings(self) -> dict[str, bool]:
+        """Return persisted switches contributed by inbound policy plugins."""
+        return self._plugin_group_settings.copy()
+
+    @property
+    def inbound_admission_enabled(self) -> bool:
+        """Whether the manager has installed a pre-agent admission handler."""
+        return self._inbound_admission_enabled
+
+    def _set_inbound_admission_enabled(self, enabled: bool) -> None:
+        self._inbound_admission_enabled = enabled
+
+    def on_inbound_claimed(self, message: InboundMessage) -> None:
+        """Release transport intake after a policy plugin owns this input.
+
+        Durable adapters may acknowledge passive input here. Delayed agent
+        dispatch still uses the normal preparation and completion lifecycle.
+        """
 
     # =========================================================================
     # Lifecycle
@@ -380,17 +449,32 @@ class BaseChannel(ABC):
         (``subject.subject_id`` + ``subject.metadata``).
         """
         await self._acquire_rate_slot()
+        receipt = _inbound_receipt.get()
+        if receipt is not None:
+            receipt.attempted = True
         await self._send_text(subject, text)
+        if receipt is not None:
+            receipt.delivered = True
 
     async def reply_content(self, subject: ChannelSubject, parts: list[ContentPart]) -> None:
         """Reply with rich content (text + media)."""
         await self._acquire_rate_slot()
+        receipt = _inbound_receipt.get()
+        if receipt is not None:
+            receipt.attempted = True
         await self._send_content(subject, parts)
+        if receipt is not None:
+            receipt.delivered = True
 
     async def reply_media(self, subject: ChannelSubject, media: ContentPart) -> None:
         """Reply with a single media item."""
         await self._acquire_rate_slot()
+        receipt = _inbound_receipt.get()
+        if receipt is not None:
+            receipt.attempted = True
         await self._send_media(subject, media)
+        if receipt is not None:
+            receipt.delivered = True
 
     # ------- Push (bot-initiated) -------------------------------------------
 
@@ -764,11 +848,24 @@ class BaseChannel(ABC):
         5. Finalize the group-context lifecycle after a successful reply
         """
         prepared = await self._prepare_inbound(raw_payload)
-        if prepared is None:
-            return
-        message, subject = prepared
-        processing_succeeded = await self._process_inbound(message, subject)
-        self._finalize_inbound(message, processing_succeeded=processing_succeeded)
+        if prepared is not None:
+            message, subject = prepared
+            processing_succeeded = await self._process_inbound(message, subject)
+            self._finalize_inbound(message, processing_succeeded=processing_succeeded)
+
+    async def dispatch_inbound(
+        self, raw_payload: object, *, force_activation: bool = False, receipt: InboundReceipt | None = None
+    ) -> InboundReceipt:
+        """Deliver admitted input through the adapter's native inbound strategy."""
+        receipt = receipt if receipt is not None else InboundReceipt()
+        token = _inbound_receipt.set(receipt)
+        activation_token = _inbound_activation.set(force_activation)
+        try:
+            await self.handle_inbound(raw_payload)
+            return receipt
+        finally:
+            _inbound_activation.reset(activation_token)
+            _inbound_receipt.reset(token)
 
     async def _preprocess_inbound(self, message: InboundMessage) -> None:
         """Normalize platform-specific content before shared policy runs.
@@ -779,15 +876,34 @@ class BaseChannel(ABC):
         :meth:`handle_inbound` template.
         """
 
+    @staticmethod
+    def _accept_filtered_inbound(message: InboundMessage) -> bool:
+        receipt = current_inbound_receipt()
+        if receipt is None or receipt.input_filter is None:
+            return True
+        try:
+            return receipt.input_filter(message) is True
+        except Exception:
+            logger.warning("Inbound filter failed; message skipped")
+            return False
+
     async def _prepare_inbound(
         self,
         raw_payload: object,
+        *,
+        force_activation: bool = False,
     ) -> tuple[InboundMessage, ChannelSubject] | None:
         """Prepare one message for any channel-specific output strategy."""
+        force_activation = force_activation or _inbound_activation.get()
         message = self.parse_inbound(raw_payload)
         await self._preprocess_inbound(message)
         if not self._group_context.accepts(message):
             return None
+
+        if force_activation:
+            policy = self._group_context.policy_for(message)
+            if not policy.enabled or policy.visibility != "all":
+                return None
 
         # GroupContextManager owns short-lived passive chatter and activation
         # policy.  A non-triggering group message is intentionally observed but
@@ -799,10 +915,12 @@ class BaseChannel(ABC):
         if self._media_backend and self._group_context.should_persist_media(message):
             await self._persist_media(message)
 
-        prepared = self._group_context.prepare(message)
+        prepared = self._group_context.prepare(message, force_activation=force_activation)
         if prepared is None:
             return None
         message = prepared
+        if not self._accept_filtered_inbound(message):
+            return None
 
         # Look up or create subject
         subject_id = message.channel_subject.subject_id if message.channel_subject else ""
@@ -830,6 +948,7 @@ class BaseChannel(ABC):
         delta_buffer: list[str] = []
         # Thinking accumulation buffer (separate from content)
         thinking_buffer: list[str] = []
+        show_thinking = self.should_show_thinking()
 
         # --- Set up platform constraint helpers ---
         timeout_guard: ReplyTimeoutGuard | None = None
@@ -874,10 +993,11 @@ class BaseChannel(ABC):
                             delta_buffer.append(part.text)
                 elif event.type == MessageEventType.THINKING:
                     # Complete thinking block — format and send if show_thinking
-                    await self._on_thinking(subject, event)
+                    if show_thinking:
+                        await self._on_thinking(subject, event)
                 elif event.type == MessageEventType.THINKING_DELTA:
                     # Streaming thinking fragment — accumulate separately
-                    if self._constraints.show_thinking:
+                    if show_thinking:
                         for part in event.content:
                             if isinstance(part, TextContent) and part.text:
                                 thinking_buffer.append(part.text)
@@ -971,7 +1091,17 @@ class BaseChannel(ABC):
         rate-limit slot.
         """
         text = self._clean_output(text)
-        if not text:
+        receipt = _inbound_receipt.get()
+        text_filter = getattr(receipt, "text_filter", None)
+        if text and text_filter is not None:
+            try:
+                text = text_filter(text)
+                if not isinstance(text, str):
+                    raise TypeError("inbound text filter must return str")
+            except Exception:  # pylint: disable=broad-except
+                logger.warning("inbound text filter failed; reply suppressed")
+                return
+        if not text.strip():
             return
         await self.reply_text(subject, text)
 
@@ -1006,7 +1136,7 @@ class BaseChannel(ABC):
         if not text:
             return ""
 
-        if self._constraints.show_thinking:
+        if self.should_show_thinking():
             # Format thinking blocks with template prefix
             def _format_think(match: re.Match[str]) -> str:
                 content = match.group(1).strip()

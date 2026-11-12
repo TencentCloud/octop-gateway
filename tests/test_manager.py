@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor
+from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor, current_inbound_receipt
 from octop_gateway.manager import ChannelManager
 from octop_gateway.models import (
     ChannelSubject,
@@ -438,6 +438,91 @@ class TestChannelManager:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+async def test_admission_runs_for_each_batched_message() -> None:
+    processed = asyncio.Event()
+    admitted: list[str] = []
+    handled: list[str] = []
+
+    async def processor(message):
+        handled.append(message.text)
+        processed.set()
+        yield MessageEvent.completed()
+
+    async def admission(channel, message, dispatch):
+        admitted.append(message.text)
+        return message.text == "claim"
+
+    channel = MockChannel(processor)
+    manager = ChannelManager({channel.channel_id: channel}, workers_per_channel=1, inbound_handler=admission)
+    await manager.start()
+    try:
+        queue = manager._queues[channel.channel_id]
+        queue.put_nowait("keep")
+        queue.put_nowait("claim")
+        await asyncio.wait_for(processed.wait(), timeout=1)
+        assert admitted == ["keep", "claim"]
+        assert handled == ["keep"]
+    finally:
+        await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_admission_output_filter_does_not_leak_to_next_message() -> None:
+    started = asyncio.Event()
+
+    async def processor(message):
+        if message.text == "first":
+            started.set()
+        yield MessageEvent.text(message.text)
+        yield MessageEvent.completed()
+
+    async def admission(channel, message, dispatch):
+        receipt = current_inbound_receipt()
+        assert receipt is not None
+        if message.text == "first":
+            receipt.text_filter = lambda _: ""
+        return False
+
+    channel = MockChannel(processor)
+    manager = ChannelManager({channel.channel_id: channel}, workers_per_channel=1, inbound_handler=admission)
+    await manager.start()
+    try:
+        manager.enqueue(channel.channel_id, "first")
+        await asyncio.wait_for(started.wait(), timeout=1)
+        manager.enqueue(channel.channel_id, "second")
+        async with asyncio.timeout(1):
+            while not channel.sent:
+                await asyncio.sleep(0.005)
+        assert channel.sent == [("user1", "second")]
+    finally:
+        await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_delayed_admission_dispatch_does_not_revive_removed_channel() -> None:
+    captured = asyncio.Event()
+    pending = []
+
+    async def admission(channel, message, dispatch):
+        pending.append((message, dispatch))
+        captured.set()
+        return True
+
+    channel = MockChannel(_echo_processor)
+    manager = ChannelManager({channel.channel_id: channel}, workers_per_channel=1, inbound_handler=admission)
+    await manager.start()
+    try:
+        manager.enqueue(channel.channel_id, "delayed")
+        await asyncio.wait_for(captured.wait(), timeout=1)
+        await manager.remove_channel(channel.channel_id)
+        message, dispatch = pending[0]
+        assert await dispatch(message) is None
+        assert channel.sent == []
+    finally:
+        await manager.stop()
+
+
 class TestChannelConfig:
     """Tests for ChannelConfig base class."""
 
@@ -752,3 +837,45 @@ class TestDictConfigAndProbe:
         finally:
             await mgr.stop()
             BUILTIN_CHANNELS.pop("probe_mock", None)
+
+
+@pytest.mark.asyncio
+async def test_claimed_input_notifies_durable_adapter_without_starting_agent() -> None:
+    from unittest.mock import Mock
+
+    channel = MockChannel(_echo_processor)
+    channel.on_inbound_claimed = Mock()  # type: ignore[method-assign]
+
+    async def claim(*_args: Any) -> bool:
+        return True
+
+    manager = ChannelManager({channel.channel_id: channel}, inbound_handler=claim)
+    message = channel.parse_inbound("passive")
+    assert await manager._admit(channel.channel_id, channel, message)
+    channel.on_inbound_claimed.assert_called_once_with(message)
+    assert channel.sent == []
+
+
+@pytest.mark.asyncio
+async def test_admission_error_claim_notifies_durable_adapter() -> None:
+    from unittest.mock import Mock
+
+    from octop_gateway.group_context import GroupContextConfig, GroupContextManager
+
+    channel = MockChannel(_echo_processor)
+    channel._group_context = GroupContextManager(GroupContextConfig(enabled=True, visibility="all"))
+    channel.on_inbound_claimed = Mock()  # type: ignore[method-assign]
+
+    async def fail(*_args: Any) -> bool:
+        raise RuntimeError("admission unavailable")
+
+    manager = ChannelManager({channel.channel_id: channel}, inbound_handler=fail)
+    message = InboundMessage(
+        channel_id=channel.channel_id,
+        channel_type="mock",
+        content=[TextContent(text="ordinary")],
+        channel_subject=ChannelSubject(subject_id="group1", chat_type="group"),
+        metadata={"chat_type": "group", "sender_id": "user1", "bot_mentioned": False},
+    )
+    assert await manager._admit(channel.channel_id, channel, message)
+    channel.on_inbound_claimed.assert_called_once_with(message)
