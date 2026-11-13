@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Expose QQ group metadata with token refresh, safe platform error codes and a separate 30-request/minute budget per channel.
+
 ### 修复
 
 - 将 QQ 引用文本和引用身份作为独立元数据传递，保留斜杠命令正文；仅在明确的 Markdown 能力拒绝时降级重试，避免不确定送达造成重复消息。

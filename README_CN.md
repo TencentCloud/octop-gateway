@@ -268,3 +268,7 @@ make all              # 格式化 + 类型检查 + 测试
 <a href="https://github.com/TencentCloud/octop-gateway/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=TencentCloud/octop-gateway" />
 </a>
+
+## QQ 群资料
+
+QQChannel.get_group_info() 可查询具备平台白名单权限的群资料，包含群名，不包含 QQ 群号码。参见[权限、缓存与频控](docs/qq-group-info.md)。
