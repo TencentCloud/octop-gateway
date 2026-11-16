@@ -253,6 +253,36 @@ class BaseChannel(ABC):
         # Subject registry: auto-populated on first interaction
         self._known_subjects: dict[str, ChannelSubject] = {}
         self._on_new_subject: Callable[[ChannelSubject], None] | None = None
+        self.last_inbound_at: float | None = None
+        self.last_outbound_at: float | None = None
+        self.reconnect_count = 0
+        self.last_reconnect_at: float | None = None
+        self.dropped_duplicate = 0
+        self.dropped_stale = 0
+
+    def note_inbound(self) -> None:
+        """Record that a user message was accepted for processing."""
+        self.last_inbound_at = time.time()
+
+    def note_outbound(self) -> None:
+        """Record that a reply was handed to the platform."""
+        self.last_outbound_at = time.time()
+
+    def note_reconnect(self) -> None:
+        """Record one transport reconnect."""
+        self.reconnect_count += 1
+        self.last_reconnect_at = time.time()
+
+    def health_metrics(self) -> dict[str, Any]:
+        """Counters for /health and the channel card. No message content."""
+        return {
+            "last_inbound_at": self.last_inbound_at,
+            "last_outbound_at": self.last_outbound_at,
+            "reconnect_count": self.reconnect_count,
+            "last_reconnect_at": self.last_reconnect_at,
+            "dropped_duplicate": self.dropped_duplicate,
+            "dropped_stale": self.dropped_stale,
+        }
 
     @property
     def channel_id(self) -> str:
@@ -756,6 +786,8 @@ class BaseChannel(ABC):
         """Prepare one message for any channel-specific output strategy."""
         message = self.parse_inbound(raw_payload)
         await self._preprocess_inbound(message)
+        if not self._group_context.accepts(message):
+            return None
 
         # GroupContextManager owns short-lived passive chatter and activation
         # policy.  A non-triggering group message is intentionally observed but
@@ -1113,10 +1145,14 @@ class BaseChannel(ABC):
     def should_batch_inbound(self, message: InboundMessage) -> bool:
         """Return whether manager-level batching may merge this message.
 
-        Group-context-enabled messages must retain individual sender labels and
-        ordering, so they are processed one event at a time.
+        Group-context messages retain individual sender labels. Protected
+        commands must not absorb other senders' messages as arguments.
         """
-        return not self._group_context.handles(message)
+        return not (
+            self._group_context.handles(message)
+            or self._group_context.protects_command(message)
+            or self._group_context.protects_tools(message)
+        )
 
     def merge_inbound(self, messages: list[InboundMessage]) -> InboundMessage:
         """Merge multiple inbound messages into one (for batching).

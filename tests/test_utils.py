@@ -106,6 +106,21 @@ class TestContentHelpers:
 class TestMergeMessages:
     """Test message merging."""
 
+    @pytest.mark.parametrize(
+        "first, second, expected",
+        [(None, [], []), ([], None, []), (["read_file", "web_fetch"], ["web_fetch"], ["web_fetch"])],
+    )
+    def test_merging_never_widens_tool_permissions(
+        self, first: list[str] | None, second: list[str] | None, expected: list[str]
+    ) -> None:
+        messages = [
+            InboundMessage(channel_id="test", content=[TextContent(text="first")], allowed_tools=first),
+            InboundMessage(channel_id="test", content=[TextContent(text="second")], allowed_tools=second),
+        ]
+        merged = merge_messages(messages)
+        assert merged.allowed_tools == expected
+        assert merged.text == "first\nsecond"
+
     def test_merge_single(self) -> None:
         msg = InboundMessage(
             channel_id="test",
