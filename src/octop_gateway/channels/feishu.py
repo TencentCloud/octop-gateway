@@ -1242,7 +1242,7 @@ class FeishuChannel(BaseChannel):
             parts.append(TextContent(text=label))
 
         elif message_type == "post":
-            # Rich text post — extract text, emotions, and embedded images.
+            # Rich text post — extract text, embedded media, and attached files.
             text, media_parts = self._extract_post_parts(content_data, message_id=message_id)
             if text:
                 parts.append(TextContent(text=text))
@@ -1281,7 +1281,8 @@ class FeishuChannel(BaseChannel):
 
         Post content structure: ``{"title": str, "content": [[{tag, ...}]]}``.
         Text-like tags become plain text; ``img`` becomes :class:`ImageContent`
-        (downloadable); ``emotion`` becomes a textual emoji marker.
+        (downloadable); ``emotion`` becomes a textual emoji marker. Feishu
+        clients put files sent with a caption in a separate ``files`` array.
         """
         lines: list[str] = []
         media: list[ContentPart] = []
@@ -1291,10 +1292,12 @@ class FeishuChannel(BaseChannel):
 
         # Some Feishu post payloads nest under a language key (zh_cn / en_us).
         paragraphs = content_data.get("content", [])
+        file_lists = [content_data.get("files")]
         if not paragraphs:
             for value in content_data.values():
                 if isinstance(value, dict) and isinstance(value.get("content"), list):
                     paragraphs = value["content"]
+                    file_lists.append(value.get("files"))
                     if not title and value.get("title"):
                         lines.append(str(value["title"]))
                     break
@@ -1339,6 +1342,27 @@ class FeishuChannel(BaseChannel):
                     line_parts.append(fence)
             if line_parts:
                 lines.append("".join(line_parts))
+
+        if message_id:
+            files_by_url = {part.url: part for part in media if isinstance(part, FileContent)}
+            for files in file_lists:
+                if not isinstance(files, list):
+                    continue
+                for item in files:
+                    if not isinstance(item, dict) or item.get("is_folder"):
+                        continue
+                    key = item.get("file_key")
+                    if not isinstance(key, str) or not key.strip():
+                        continue
+                    url = FeishuChannel._build_resource_url(message_id, key, resource_type="file")
+                    filename = str(item.get("file_name") or "")
+                    if url in files_by_url:
+                        if not files_by_url[url].filename:
+                            files_by_url[url].filename = filename
+                        continue
+                    part = FileContent(url=url, filename=filename)
+                    files_by_url[url] = part
+                    media.append(part)
 
         return "\n".join(lines), media
 

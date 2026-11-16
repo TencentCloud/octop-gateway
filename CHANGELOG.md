@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 修复
 
+- 保留飞书富文本消息 `files` 数组中的附件，同一条消息的文字与文件一起传递给专家。
+
 - 将 QQ 引用文本和引用身份作为独立元数据传递，保留斜杠命令正文；仅在明确的 Markdown 能力拒绝时降级重试，避免不确定送达造成重复消息。
 
 - 公共群策略的 `owner_commands_only` 默认开启，Python 构造、旧 JSON 配置及群覆盖继承保持一致；白名单为空时禁止全部内置群命令，显式设置 `false` 可关闭保护，普通聊天和私聊不变。
