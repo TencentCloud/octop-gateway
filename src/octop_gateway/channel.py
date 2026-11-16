@@ -75,6 +75,7 @@ class InboundReceipt:
     text_filter: Callable[[str], str] | None = field(default=None, repr=False, compare=False)
     input_filter: Callable[[InboundMessage], bool] | None = field(default=None, repr=False, compare=False)
     suppress_thinking: bool = False
+    text_filter_finish: Callable[[], str] | None = field(default=None, repr=False, compare=False)
 
 
 _inbound_receipt: ContextVar[InboundReceipt | None] = ContextVar("inbound_receipt", default=None)
@@ -297,6 +298,36 @@ class BaseChannel(ABC):
         # Subject registry: auto-populated on first interaction
         self._known_subjects: dict[str, ChannelSubject] = {}
         self._on_new_subject: Callable[[ChannelSubject], None] | None = None
+        self.last_inbound_at: float | None = None
+        self.last_outbound_at: float | None = None
+        self.reconnect_count = 0
+        self.last_reconnect_at: float | None = None
+        self.dropped_duplicate = 0
+        self.dropped_stale = 0
+
+    def note_inbound(self) -> None:
+        """Record that a user message was accepted for processing."""
+        self.last_inbound_at = time.time()
+
+    def note_outbound(self) -> None:
+        """Record that a reply was handed to the platform."""
+        self.last_outbound_at = time.time()
+
+    def note_reconnect(self) -> None:
+        """Record one transport reconnect."""
+        self.reconnect_count += 1
+        self.last_reconnect_at = time.time()
+
+    def health_metrics(self) -> dict[str, Any]:
+        """Counters for /health and the channel card. No message content."""
+        return {
+            "last_inbound_at": self.last_inbound_at,
+            "last_outbound_at": self.last_outbound_at,
+            "reconnect_count": self.reconnect_count,
+            "last_reconnect_at": self.last_reconnect_at,
+            "dropped_duplicate": self.dropped_duplicate,
+            "dropped_stale": self.dropped_stale,
+        }
 
     @property
     def channel_id(self) -> str:
@@ -821,6 +852,20 @@ class BaseChannel(ABC):
         if prepared is not None:
             message, subject = prepared
             processing_succeeded = await self._process_inbound(message, subject)
+            receipt = current_inbound_receipt()
+            if processing_succeeded and receipt is not None and receipt.text_filter_finish is not None:
+                try:
+                    tail = receipt.text_filter_finish()
+                    if not isinstance(tail, str):
+                        raise TypeError("inbound text filter finish must return str")
+                except Exception:  # pylint: disable=broad-except
+                    logger.warning("inbound text filter finish failed; reply suppressed")
+                else:
+                    tail = self._clean_output(tail)
+                    if tail.strip():
+                        # The callback has already filtered this tail. Do not feed
+                        # it back into the filter and buffer the same text again.
+                        await self.reply_text(subject, tail)
             self._finalize_inbound(message, processing_succeeded=processing_succeeded)
 
     async def dispatch_inbound(

@@ -32,6 +32,8 @@ native commands, direct messages and mentions retain normal routing. The default
 without a hook preserves existing batching and routing behavior.
 
 The current dispatch receipt can be obtained with `current_inbound_receipt()`.
+
+`InboundReceipt.text_filter_finish` is an optional zero-argument callback returning an already-filtered text tail. The shared inbound template calls it only after successful processing, validates and cleans the result, and sends it without re-entering `text_filter`. Failure or cancellation never flushes a tail. Use it to release normal text buffered while recognizing a possible split marker. This callback applies to adapters using the shared template; custom delivery overrides must honor the same lifecycle explicitly.
 An admission handler may set its `input_filter` to accept or reject a prepared
 message, its `text_filter` to transform or suppress outbound text, and
 `suppress_thinking` to hide thinking for that dispatch. Filter exceptions fail

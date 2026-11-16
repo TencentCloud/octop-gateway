@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add an optional dispatch-scoped text_filter_finish callback to release filtered text tails only after successful processing; failures and cancellation never flush a tail.
+
 - 通用入站策略开关与接管回调，保留适配器默认群策略；补齐 Discord、飞书、Telegram 的群消息身份和 @ 状态。
 - 为 Discord、飞书、Telegram 和 QQ 入站消息提供独立的 `has_mentions` 元数据；QQ 使用 READY 中的机器人身份识别并移除自身 @，不再把 AppID 当作群成员 ID。
 - Discord 群监听默认关闭；部分 `group_context` 配置不会意外开启。显式开启群策略或启用群插件开关后才会接收普通群消息。Telegram 仅在群策略启用且已安装入站准入处理器时，才会在原激活策略前接收普通群消息。
@@ -18,10 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 修复
 
+- 将 QQ 引用文本和引用身份作为独立元数据传递，保留斜杠命令正文；仅在明确的 Markdown 能力拒绝时降级重试，避免不确定送达造成重复消息。
+
 - 公共群策略的 `owner_commands_only` 默认开启，Python 构造、旧 JSON 配置及群覆盖继承保持一致；白名单为空时禁止全部内置群命令，显式设置 `false` 可关闭保护，普通聊天和私聊不变。
 - 公共群策略支持 `owner_tools_only`，通过回合级 `allowed_tools` 限制非所有者工具权限，保留普通聊天，并防止合并消息扩大权限；工具保护缺省关闭。
 - QQ 群内 Octop 斜杠命令默认仅允许显式配置的所有者发送；在控制回调和消息合并前鉴权，保留普通消息中的斜杠、URL、文件路径和自定义命令名称。
 - Telegram 非论坛群里的回复线程不再被当作话题：只有 `is_topic_message` 为真时才取 `message_thread_id`。此前机器人按钮消息（对用户消息的回复）会带上线程 id，与注册时的 `None` 不一致，导致按钮点击被回调校验拒绝，且开启话题隔离时会把一次回复误当作独立话题。
+- 飞书事件去重改用 SQLite 持久化：通道重建或服务重启后仍能拦截重投事件，超过时间门限的旧消息直接丢弃，表情回应事件确认后不再进入重试队列。
+- 通道暴露入站、出站、重连与丢弃计数，便于查看通道健康状态。
 
 ## [1.0.3] - 2026-10-16
 

@@ -435,7 +435,7 @@ class TestQQChannelUnit:
             "t": "GROUP_AT_MESSAGE_CREATE",
             "d": {
                 "id": "msg_quote",
-                "content": "<@!99999> summarize this",
+                "content": "summarize this",
                 "author": {"member_openid": "member_1"},
                 "group_openid": "group_open_abc",
                 "message_scene": {"ext": ["msg_idx=current", "ref_msg_idx=previous"]},
@@ -458,7 +458,8 @@ class TestQQChannelUnit:
 
         msg = ch.parse_inbound(payload)
 
-        assert "[quoted message: quarterly report]" in msg.text
+        assert msg.text == "summarize this"
+        assert msg.metadata["reply_quote_text"] == "quarterly report"
         files = [part for part in msg.content if isinstance(part, FileContent)]
         assert len(files) == 1
         assert files[0].filename == "report.pdf"
@@ -1030,7 +1031,7 @@ class TestQQMsgSeq:
                 return self._status
 
             async def text(self):
-                return '{"id":"ok"}'
+                return '{"code":304036}' if self._status == 400 else '{"id":"ok"}'
 
             async def __aenter__(self):
                 return self
