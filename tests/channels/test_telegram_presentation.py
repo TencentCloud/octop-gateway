@@ -11,7 +11,7 @@ from telegram.error import BadRequest, InvalidToken, NetworkError
 
 from octop_gateway.channels.telegram import TelegramChannel, TelegramConfig
 from octop_gateway.channels.telegram.policy import strip_own_mention
-from octop_gateway.models import ChannelSubject, MessageEvent
+from octop_gateway.models import ChannelSubject, ImageContent, MessageEvent, TextContent
 
 TABLE = "| name | value |\n|---|---|\n| cpu | 80% |"
 
@@ -53,6 +53,8 @@ def channel(**options):
                 for name in (
                     "_post",
                     "send_message",
+                    "send_photo",
+                    "send_media_group",
                     "edit_message_text",
                     "edit_message_reply_markup",
                     "send_message_draft",
@@ -277,3 +279,56 @@ async def test_own_command_suffix_is_normalized():
         None,
     )
     assert ch.parse_inbound(await ch._extract_message(raw)).text == "/models"
+
+
+@pytest.mark.parametrize("origin", ["session", "cache"])
+@pytest.mark.parametrize("topic", [None, 12])
+@pytest.mark.parametrize("payload", ["text", "content", "image", "album", "table"])
+async def test_proactive_push_does_not_reply_to_last_message(origin, topic, payload):
+    ch = channel(albums=True)
+    inbound = ch.parse_inbound(
+        {
+            "chat_id": "-42" if topic else "42",
+            "user_id": "7",
+            "message_id": "123",
+            "message_thread_id": topic,
+            "is_group": topic is not None,
+            "content": [TextContent(text="unrelated previous question")],
+            "reply_to_message_id": 122,
+            "reply_to_text": "old reply",
+            "reply_quote_text": "old selection",
+            "reply_to_is_own_bot": True,
+        }
+    )
+    original = inbound.channel_subject
+    before = dict(original.metadata)
+    if origin == "cache":
+        ch._known_subjects[original.subject_id] = original
+        target = ChannelSubject(subject_id=original.subject_id)
+    else:
+        target = original
+
+    if payload in ("text", "table"):
+        await ch.push_text(target, TABLE if payload == "table" else "scheduled update")
+    elif payload == "content":
+        await ch.push_message(target, [TextContent(text="proactive care")])
+    else:
+        count = 2 if payload == "album" else 1
+        await ch.push_message(target, [ImageContent(url=f"https://example.com/{i}.png") for i in range(count)])
+
+    if payload == "table":
+        endpoint, sent = ch._app.bot._post.call_args.args
+        assert endpoint == "sendRichMessage"
+    else:
+        method = "send_photo" if payload == "image" else "send_media_group" if payload == "album" else "send_message"
+        sent = getattr(ch._app.bot, method).call_args.kwargs
+    assert "reply_parameters" not in sent
+    assert sent["chat_id"] == int(before["chat_id"])
+    assert sent.get("message_thread_id") == topic
+    assert original.metadata == before
+
+    # Preparing a push must not erase the inbound turn's normal reply target.
+    await ch.reply_text(original, "direct answer")
+    reply = ch._app.bot.send_message.call_args.kwargs
+    assert reply["reply_parameters"].message_id == 123
+    assert reply.get("message_thread_id") == topic
