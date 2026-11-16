@@ -886,6 +886,41 @@ def test_tool_protected_groups_are_not_batched_even_without_passive_context() ->
 
 
 @pytest.mark.asyncio
+async def test_text_filter_tail_is_sent_once_after_processing() -> None:
+    async def processor(message: InboundMessage) -> AsyncIterator[MessageEvent]:
+        yield MessageEvent.text("unfinished")
+        yield MessageEvent.completed()
+
+    channel = EchoChannel(processor)
+    calls = []
+    receipt = InboundReceipt(
+        text_filter=lambda text: calls.append(text) or "",
+        text_filter_finish=lambda: "released tail",
+    )
+    await channel.dispatch_inbound("hello", receipt=receipt)
+    assert calls == ["unfinished"]
+    assert channel.sent_messages == [("user1", "released tail")]
+    assert receipt.delivered
+
+
+@pytest.mark.asyncio
+async def test_text_filter_tail_is_not_flushed_after_failed_processing() -> None:
+    async def processor(message: InboundMessage) -> AsyncIterator[MessageEvent]:
+        yield MessageEvent.text("unfinished")
+        yield MessageEvent.error_event("failed")
+
+    channel = EchoChannel(processor)
+    finished = []
+    receipt = InboundReceipt(
+        text_filter=lambda text: "",
+        text_filter_finish=lambda: finished.append(True) or "must not send",
+    )
+    await channel.dispatch_inbound("hello", receipt=receipt)
+    assert finished == []
+    assert channel.sent_messages == []
+
+
+@pytest.mark.asyncio
 async def test_shared_pipeline_forwards_tool_policy_and_still_replies() -> None:
     seen: list[list[str] | None] = []
 

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- 入站回执新增可选 `text_filter_finish`，在适配器成功处理完成后发送已过滤的缓冲尾文，取消不补发，避免流式文本过滤吞掉未闭合的正常正文。
+
 - Preserve QQ command text by separating quote metadata; quote current group turns with reliable indices and avoid Markdown fallback on uncertain delivery.
 
 

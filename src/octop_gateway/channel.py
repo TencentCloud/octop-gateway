@@ -63,6 +63,7 @@ class InboundReceipt:
     text_filter: Callable[[str], str] | None = field(default=None, repr=False, compare=False)
     input_filter: Callable[[InboundMessage], bool] | None = field(default=None, repr=False, compare=False)
     suppress_thinking: bool = False
+    text_filter_finish: Callable[[], str] | None = field(default=None, repr=False, compare=False)
 
 
 _inbound_receipt: ContextVar[InboundReceipt | None] = ContextVar("inbound_receipt", default=None)
@@ -827,6 +828,20 @@ class BaseChannel(ABC):
         if prepared is not None:
             message, subject = prepared
             processing_succeeded = await self._process_inbound(message, subject)
+            receipt = current_inbound_receipt()
+            if processing_succeeded and receipt is not None and receipt.text_filter_finish is not None:
+                try:
+                    tail = receipt.text_filter_finish()
+                    if not isinstance(tail, str):
+                        raise TypeError("inbound text filter finish must return str")
+                except Exception:  # pylint: disable=broad-except
+                    logger.warning("inbound text filter finish failed; reply suppressed")
+                else:
+                    tail = self._clean_output(tail)
+                    if tail.strip():
+                        # The callback has already filtered this tail. Do not feed
+                        # it back into the filter and buffer the same text again.
+                        await self.reply_text(subject, tail)
             self._finalize_inbound(message, processing_succeeded=processing_succeeded)
 
     async def dispatch_inbound(
