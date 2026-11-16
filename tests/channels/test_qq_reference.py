@@ -16,6 +16,17 @@ def _channel():
     return QQChannel(processor=_processor, config=QQConfig(app_id="app", secret="secret", token="token"))
 
 
+@pytest.mark.asyncio
+async def test_ready_stores_authenticated_bot_identity():
+    channel = _channel()
+    await channel._handle_op(
+        AsyncMock(),
+        0,
+        {"op": 0, "t": "READY", "d": {"session_id": "session", "user": {"id": "bot-user"}}},
+    )
+    assert channel._bot_user_id == "bot-user"
+
+
 @pytest.mark.parametrize("command", ["/stop", "/model"])
 def test_quote_does_not_prefix_command(command):
     channel = _channel()
@@ -50,6 +61,38 @@ async def test_uncertain_or_unrelated_failure_does_not_retry(status, body):
         await channel._send_text(subject, "Reply")
     channel._send_message.assert_not_awaited()
     assert not channel._markdown_unsupported
+
+
+@pytest.mark.asyncio
+async def test_explicit_quote_rejection_retries_once_without_reference():
+    channel = _channel()
+    channel._qq_post = AsyncMock(side_effect=[(400, '{"code":40034006}'), (200, "{}")])
+    meta = {
+        "group_openid": "group",
+        "msg_id": "message",
+        "msg_idx": "current",
+        "bot_mentioned": True,
+    }
+
+    await channel._send_message("group", {"content": "Reply"}, "group", meta)
+
+    first_payload = channel._qq_post.await_args_list[0].args[1]
+    second_payload = channel._qq_post.await_args_list[1].args[1]
+    assert first_payload["message_reference"] == {"message_id": "current"}
+    assert "message_reference" not in second_payload
+    assert channel._qq_post.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_quote_transport_error_is_not_retried():
+    channel = _channel()
+    channel._qq_post = AsyncMock(side_effect=TimeoutError("delivery unknown"))
+    meta = {"group_openid": "group", "msg_id": "message", "msg_idx": "current", "bot_mentioned": True}
+
+    with pytest.raises(TimeoutError, match="delivery unknown"):
+        await channel._send_message("group", {"content": "Reply"}, "group", meta)
+
+    assert channel._qq_post.await_count == 1
 
 
 def test_quote_targets_current_message_and_never_leaks_into_push():
