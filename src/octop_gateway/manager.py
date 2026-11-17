@@ -6,9 +6,9 @@ import asyncio
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
-from octop_gateway.channel import BaseChannel, MessageProcessor
+from octop_gateway.channel import BaseChannel, InboundReceipt, MessageProcessor, _inbound_receipt
 from octop_gateway.media import FileSystemMediaBackend, MediaBackend
 from octop_gateway.models import ChannelSubject, ContentPart, InboundMessage
 
@@ -31,6 +31,15 @@ logger = logging.getLogger(__name__)
 PreLockHandler = Callable[[str, InboundMessage], Awaitable[None]]
 MessagePredicate = Callable[[InboundMessage], bool]
 T = TypeVar("T")
+
+
+class InboundDispatch(Protocol):
+    async def __call__(
+        self, message: InboundMessage, /, *, activate: bool = False, receipt: InboundReceipt | None = None
+    ) -> InboundReceipt | None: ...
+
+
+AdmissionHandler = Callable[[BaseChannel, InboundMessage, InboundDispatch], Awaitable[bool]]
 
 
 def _config_class_for(channel_cls: type[BaseChannel]) -> type | None:
@@ -97,6 +106,7 @@ class ChannelManager:
         on_pre_lock: PreLockHandler | None = None,
         control_message_predicate: MessagePredicate | None = None,
         interrupt_message_predicate: MessagePredicate | None = None,
+        inbound_handler: AdmissionHandler | None = None,
     ) -> None:
         self._channels: dict[str, BaseChannel] = channels or {}
         self._workers_per_channel = workers_per_channel
@@ -107,6 +117,9 @@ class ChannelManager:
         self._on_pre_lock = on_pre_lock
         self._control_message_predicate = control_message_predicate
         self._interrupt_message_predicate = interrupt_message_predicate
+        self._inbound_handler = inbound_handler
+        for channel in self._channels.values():
+            channel._set_inbound_admission_enabled(inbound_handler is not None)
 
         # Per-channel queues and workers
         self._queues: dict[str, asyncio.Queue[Any]] = {}
@@ -124,6 +137,16 @@ class ChannelManager:
     def set_pre_lock_handler(self, handler: PreLockHandler | None) -> None:
         """Install or clear the pre-session-lock inbound hook."""
         self._on_pre_lock = handler
+
+    def set_inbound_handler(self, handler: AdmissionHandler | None) -> None:
+        """Set the pre-agent hook; True claims input, False retains native routing.
+
+        The hook runs for every accepted message, including items later batched.
+        Delayed dispatch keeps the session lock and refuses removed channels.
+        """
+        self._inbound_handler = handler
+        for channel in self._channels.values():
+            channel._set_inbound_admission_enabled(handler is not None)
 
     # =========================================================================
     # Lifecycle
@@ -153,6 +176,7 @@ class ChannelManager:
 
         # Initialize queues and set enqueue callbacks
         for channel_id, channel in self._channels.items():
+            channel._set_inbound_admission_enabled(self._inbound_handler is not None)
             queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=self._queue_maxsize)
             self._queues[channel_id] = queue
             channel.set_enqueue_callback(
@@ -637,6 +661,7 @@ class ChannelManager:
             raise ValueError(f"Channel already exists: {channel_id}")
 
         self._channels[channel_id] = channel
+        channel._set_inbound_admission_enabled(self._inbound_handler is not None)
         queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=self._queue_maxsize)
         self._queues[channel_id] = queue
         channel.set_enqueue_callback(lambda payload, cid=channel_id: self.enqueue(cid, payload))  # type: ignore[misc]
@@ -707,6 +732,41 @@ class ChannelManager:
     # Worker loop
     # =========================================================================
 
+    async def _admit(self, channel_id: str, channel: BaseChannel, message: InboundMessage) -> bool:
+        handler = self._inbound_handler
+        if handler is None:
+            return False
+
+        async def dispatch(
+            item: InboundMessage, *, activate: bool = False, receipt: InboundReceipt | None = None
+        ) -> InboundReceipt | None:
+            if self._channels.get(channel_id) is not channel or not self._running:
+                return None
+            async with self._session_lock(channel_id, channel.get_debounce_key(item)):
+                if self._channels.get(channel_id) is not channel or not self._running:
+                    return None
+                return await channel.dispatch_inbound(item, force_activation=activate, receipt=receipt)
+
+        try:
+            claimed = await handler(channel, message, dispatch)
+            if not isinstance(claimed, bool):
+                raise TypeError("admission handlers must return bool")
+        except Exception:
+            logger.warning("inbound admission handler failed: channel=%s", channel_id)
+            # Ordinary group input fails closed. Native commands, DMs and
+            # mentions retain routing when an optional plugin fails.
+            claimed = (
+                channel.group_context_manager.handles(message)
+                and not message.metadata.get("bot_mentioned")
+                and not message.text.lstrip().startswith("/")
+            )
+        if claimed:
+            try:
+                channel.on_inbound_claimed(message)
+            except Exception:
+                logger.warning("inbound claimed callback failed: channel=%s", channel_id)
+        return claimed
+
     async def _worker_loop(self, channel_id: str) -> None:
         """Worker loop: drain queue, batch same-session, process sequentially."""
         queue = self._queues.get(channel_id)
@@ -723,18 +783,23 @@ class ChannelManager:
             except asyncio.CancelledError:
                 break
 
+            receipt_token = _inbound_receipt.set(InboundReceipt())
             try:
                 # Parse to get session key for locking
                 message = payload if isinstance(payload, InboundMessage) else channel.parse_inbound(payload)
                 if not channel.group_context_manager.accepts(message):
                     continue
                 session_key = channel.get_debounce_key(message)
+                if await self._admit(channel_id, channel, message):
+                    continue
 
                 # Drain additional same-session items from queue
                 batch = [message]
                 is_control = self._control_message_predicate is not None and self._control_message_predicate(message)
                 if not is_control and channel.should_batch_inbound(message):
-                    batch.extend(self._drain_same_session(queue, channel, session_key))
+                    for item in self._drain_same_session(queue, channel, session_key):
+                        if not await self._admit(channel_id, channel, item):
+                            batch.append(item)
 
                 # Merge batch if multiple
                 merged = channel.merge_inbound(batch) if len(batch) > 1 else batch[0]
@@ -762,6 +827,8 @@ class ChannelManager:
             except Exception:  # pylint: disable=broad-except
                 # One malformed payload or adapter failure must not stop the worker.
                 logger.exception("Worker error: channel=%s", channel_id)
+            finally:
+                _inbound_receipt.reset(receipt_token)
 
     def _session_lock(self, channel_id: str, session_key: str) -> asyncio.Lock:
         """Return the shared lock for one registered-channel session."""

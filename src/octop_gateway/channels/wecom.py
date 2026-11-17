@@ -401,6 +401,8 @@ class WeComChannel(BaseChannel):
         # We use ``asyncio.wait`` (not ``wait_for``) so the underlying
         # ``__anext__`` task is *not* cancelled on timeout — the placeholder
         # is streamed, then we await the in-flight first event normally.
+        if not self._accept_filtered_inbound(message):
+            return
         iterator = self._processor(message)
         first_event = None
         if self._constraints.reply_timeout > 0 and self._constraints.timeout_strategy == "placeholder":

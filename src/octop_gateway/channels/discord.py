@@ -50,7 +50,7 @@ class DiscordConfig(ChannelConfig):
     allowed_user_ids: list[str] = field(default_factory=list)
     allowed_channel_ids: list[str] = field(default_factory=list)
     group_context: GroupContextConfig = field(
-        default_factory=lambda: GroupContextConfig(enabled=True, visibility="all", activation="mention")
+        default_factory=lambda: GroupContextConfig(enabled=False, visibility="all", activation="mention")
     )
 
     required_credentials = ("bot_token",)
@@ -284,9 +284,15 @@ class DiscordChannel(BaseChannel):
             "channel_id_native": chat_id,
             "chat_type": chat_type,
             "sender_id": sender_id,
+            "sender_is_bot": bool(message.author.bot),
             "sender_name": message.author.display_name,
             "message_id": str(message.id),
             "bot_mentioned": mentioned,
+            "has_mentions": bool(
+                getattr(message, "mentions", [])
+                or getattr(message, "role_mentions", [])
+                or getattr(message, "mention_everyone", False)
+            ),
         }
         if is_group:
             metadata["guild_id"] = str(message.guild.id)
