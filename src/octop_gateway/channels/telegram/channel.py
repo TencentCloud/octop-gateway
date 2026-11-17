@@ -15,7 +15,7 @@ from io import BytesIO
 from typing import Any, Self
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, ReplyParameters
-from telegram.error import BadRequest, InvalidToken, NetworkError, TelegramError
+from telegram.error import BadRequest, EndPointNotFound, InvalidToken, NetworkError, TelegramError
 
 from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor
 from octop_gateway.channels.telegram.delivery import RequestScheduler, formatting_error, request, sanitized_errors
@@ -591,11 +591,11 @@ class TelegramChannel(BaseChannel):
             endpoint = "sendRichMessage"
 
         async def post(*, chat_id: int, endpoint: str, data: dict[str, Any]) -> Any:
-            return await self._app.bot._post(endpoint, data)
+            return await self._app.bot.do_api_request(endpoint, api_kwargs=data)
 
         try:
             await self._request(post, chat_id=chat, endpoint=endpoint, data=data)
-        except (BadRequest, InvalidToken):
+        except (BadRequest, EndPointNotFound, InvalidToken):
             logger.debug("Telegram rich table rejected; using aligned text")
             return False
         except NetworkError:
@@ -836,21 +836,37 @@ class TelegramChannel(BaseChannel):
         user, chat, topic = str(query.from_user.id), str(query.message.chat.id), _topic_thread_id(query.message)
         item = self.interactions.pending.get(token)
         # A foreign user's tap must not invalidate the intended user's keyboard.
-        can_settle = item is None or ((item.user, item.chat, item.topic) == (user, chat, topic) and item.settle)
+        running = token in self.interactions.running
+        can_settle = not running and (
+            item is None or ((item.user, item.chat, item.topic) == (user, chat, topic) and item.settle)
+        )
         label = ""
         markup = getattr(query.message, "reply_markup", None)
         for row in getattr(markup, "inline_keyboard", ()):
             for button in row:
                 if button.callback_data == token:
                     label = str(button.text)
-        async with sanitized_errors():
-            invoked = await self.interactions.invoke(token, user, chat, topic)
         language = getattr(query.from_user, "language_code", "") or ""
         expired = (
             "该选择已失效或已处理" if language.startswith("zh") else "This option has expired or was already processed."
         )
-        note = (f"✓ {label}" if label else "✓") if invoked else expired
-        await self._request(query.answer, text=note)
+        note = "操作未完成\uff0c请重试" if language.startswith("zh") else "Action did not complete; please retry."
+        invoked: bool | None = None
+        try:
+            async with sanitized_errors():
+                invoked = await self.interactions.invoke(token, user, chat, topic)
+            note = (f"✓ {label}" if label else "✓") if invoked else expired
+            if running:
+                note = "该选择正在处理中" if language.startswith("zh") else "This option is being processed."
+        finally:
+            # Always stop Telegram's spinner, including on host errors/cancellation.
+            try:
+                await self._request(query.answer, text=note)
+            except TelegramError:
+                if invoked is not None:
+                    raise
+                # Keep the original host failure when acknowledgement also fails.
+                logger.debug("Telegram failed-action acknowledgement unavailable")
         if not can_settle or not getattr(query.message, "message_id", None):
             return
         try:
