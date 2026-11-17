@@ -396,9 +396,11 @@ class TelegramChannel(BaseChannel):
 
     async def _extract_message(self, message: Any, *, edited: bool = False) -> dict[str, Any] | None:
         content_parts: list[ContentPart] = []
-        text = strip_own_mention(
-            (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip(), self._bot_username
-        )
+        raw_text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        text = strip_own_mention(raw_text, self._bot_username)
+        # Keep address-only messages visible to the processor instead of dropping them.
+        if not text.strip():
+            text = raw_text
         if text:
             content_parts.append(TextContent(text=text))
 

@@ -6,7 +6,6 @@ import re
 import unicodedata
 from collections.abc import Callable
 
-_ROW_SPLIT = re.compile(r"(?<!\\)\|")
 _SEPARATOR = re.compile(r"^:?-{2,}:?$")
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
@@ -25,7 +24,30 @@ def _pad(text: str, width: int, align: str) -> str:
 
 
 def _split_row(line: str) -> list[str]:
-    return [cell.replace(r"\|", "|").strip() for cell in _ROW_SPLIT.split(line.strip()[1:-1])]
+    cells: list[str] = []
+    cell = ""
+    source = line.strip()
+    index = 0
+    while index < len(source):
+        char = source[index]
+        if char == "\\" and index + 1 < len(source) and source[index + 1] in "\\|":
+            following = source[index + 1]
+            cell += "|" if following == "|" else "\\\\"
+            index += 2
+            continue
+        if char == "|":
+            cells.append(cell.strip())
+            cell = ""
+        else:
+            cell += char
+        index += 1
+    cells.append(cell.strip())
+    # Discard structural borders, never characters in an escaped final cell.
+    if source.startswith("|"):
+        cells.pop(0)
+    if not cells[-1] and source.endswith("|"):
+        cells.pop()
+    return cells
 
 
 def _render_aligned(rows: list[list[str]]) -> str:
@@ -49,7 +71,7 @@ def _render_plain(rows: list[list[str]]) -> str:
     header = rows[0]
     lines = []
     for row in rows[2:]:
-        fields = [f"{name}={value}" for name, value in zip(header, row, strict=False) if value]
+        fields = [f"{name}={value}" for name, value in zip(header, row, strict=False)]
         if fields:
             lines.append("- " + " | ".join(fields))
     return "\n".join(lines)
@@ -85,10 +107,11 @@ def convert_markdown_tables(text: str, *, renderer: Callable[[list[list[str]]], 
             rows.append(_split_row(lines[index]))
             index += 1
         if (
-            len(rows) >= 2
+            len(rows) >= 3
             and len(rows[0]) >= 2
             and len(rows[1]) == len(rows[0])
             and all(_SEPARATOR.fullmatch(cell) for cell in rows[1])
+            and all(len(row) <= len(rows[0]) for row in rows[2:])
         ):
             result.append(renderer(rows))
         else:
