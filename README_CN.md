@@ -79,6 +79,14 @@
 
 使用 Bot Token + Gateway 长连接；在开发者门户开启 Message Content Intent。`allow_all_channels` 默认 `True`（包括未填写此字段的旧配置），允许机器人有权限访问的所有服务器频道。设为 `False` 后仅允许 `allowed_channel_ids` 指定的频道，列表为空则拒绝服务器频道消息。私聊始终仅允许 `allowed_user_ids` 中的用户，列表为空则拒绝私聊。频道默认需要直接 @机器人，线程继承父频道权限。支持 HTTP 代理、附件、typing、长回复分段。参见 [`examples/discord_bot.py`](examples/discord_bot.py)。
 
+#### Telegram 投递与按钮回调
+
+代码围栏外的表格优先使用 Bot API 原生富消息；API 明确拒绝后回退为列对齐的代码块，网络超时等不确定错误不重发。QQ 和微信 iLink 将表格转换为带列名的列表行。
+
+Telegram 入站元数据提供 `reply_to_text`、`reply_quote_text`（各最多 2000 字符）和 `reply_to_is_own_bot`。宿主决定如何将引用用于提示词与历史。入站正文只移除本机器人的提及与命令后缀，保留其他提及、邮箱和正文内部空白。
+
+选择按钮显示点击反馈并收起旧键盘；其他用户或话题的点击不能关闭仍有效的按钮。`register_callback(..., settle=False)` 将消息清理留给调用方，流式 Stop 控件使用此方式。耗时操作必须入队；应用权限与待答问题有效性仍由宿主检查。
+
 #### 统一消息抽象
 - `InboundMessage` 携带文本、结构化的 `ContentPart`（文本 / 图片 / 视频 / 音频 / 文件）以及 `ChannelSubject`。
 - 你的处理器是 `Callable[[InboundMessage], AsyncIterator[MessageEvent]]`——可产出 `MESSAGE` 表示完整文本，`DELTA` 表示逐字流式，`COMPLETED` 表示刷出。
@@ -196,6 +204,37 @@ MessageProcessor: InboundMessage → AsyncIterator[MessageEvent]
 ```
 
 每个 `BaseChannel` 管理自己的传输；管理器负责调度、媒体、约束与分发。你的处理器只看到归一化后的事件流。
+
+### 群命令权限（QQ 示例）
+
+使用公共群策略的通道默认启用群内命令保护，Python 配置对象及未填写该字段的旧 JSON 配置也会启用。下面以 QQ 为例：
+
+```json
+{
+  "group_context": {
+    "enabled": true,
+    "owner_commands_only": true,
+    "owner_ids": []
+  }
+}
+```
+
+`owner_ids` 填写可信发送者的 `author.member_openid`，与消息元数据中的
+`sender_id` 匹配；不要填写 QQ 号、群 ID 或 Octop 用户 ID。白名单为空时，
+所有成员的群内命令都被忽略，可先通过 Dashboard/CLI 管理。
+两个字段均支持在现有 `group_context.groups` 中按群覆盖。
+
+仅匹配消息开头符合完整语法的 Octop 内置斜杠命令及别名，例如 `/model`、
+`/new`、`/help`、`/delete`、`/stop`。消息中间的 `/model`、URL、
+`/tmp/file` 等路径、代码块和未登记的自定义斜杠名称仍按普通消息处理。
+Octop 新增命令时，应同步 `group_context.py` 中的内置名称表。
+
+非所有者命令在宿主控制回调、媒体下载和处理器调用前静默丢弃，也不会进入
+临时群上下文。关闭 `group_context.enabled` 只关闭触发和上下文处理，命令
+保护继续生效；显式设置 `owner_commands_only: false` 才会放开群命令。
+私聊和消息发送流程沿用现有行为。该默认值同样适用于其他使用公共群策略的通道；如需放开群命令，应显式设置 `owner_commands_only: false`。
+
+该策略不限制自然语言请求或 Agent 工具权限，应用仍需配置适当的工具权限。
 
 ### 开发
 

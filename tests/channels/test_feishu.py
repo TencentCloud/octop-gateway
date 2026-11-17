@@ -13,12 +13,17 @@ Requires: FEISHU_APP_ID and FEISHU_APP_SECRET environment variables
 
 from __future__ import annotations
 
+import json
 import os
+import time
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from octop_gateway.channels.feishu import FeishuChannel, FeishuConfig
+from octop_gateway.channels.feishu_dedup import FeishuDedupStore
 from octop_gateway.constraints import ChannelConstraints
 from octop_gateway.models import (
     ChannelSubject,
@@ -311,6 +316,105 @@ class TestFeishuChannelUnit:
         resolved = ch.resolve_push_subject(subject)
         assert resolved.metadata.get("chat_type") == "dm"
         assert resolved.metadata.get("to_handle") == "ou_abc123"
+
+    def test_dedup_is_shared_by_channel_id(self) -> None:
+        first = FeishuChannel(processor=_noop_processor, config=_make_config(), channel_id="ch-mem")
+        second = FeishuChannel(processor=_noop_processor, config=_make_config(), channel_id="ch-mem")
+        other = FeishuChannel(processor=_noop_processor, config=_make_config(), channel_id="ch-other")
+        assert first._is_duplicate("om_mem_shared") is False
+        assert second._is_duplicate("om_mem_shared") is True
+        assert other._is_duplicate("om_mem_shared") is False
+
+    def test_dedup_survives_a_new_instance_when_sqlite_is_configured(self, tmp_path: Path) -> None:
+        config = FeishuConfig(
+            app_id=_FEISHU_APP_ID,
+            app_secret=_FEISHU_APP_SECRET,
+            dedup_db_path=str(tmp_path / "feishu-dedup.sqlite"),
+        )
+        first = FeishuChannel(processor=_noop_processor, config=config, channel_id="ch-db")
+        assert first._is_duplicate("om_db_shared") is False
+        with FeishuChannel._shared_seen_lock:
+            FeishuChannel._shared_seen_ids.pop(("ch-db", "om_db_shared"), None)
+        second = FeishuChannel(processor=_noop_processor, config=config, channel_id="ch-db")
+        assert second._is_duplicate("om_db_shared") is True
+        assert second.dropped_duplicate == 0
+
+    def test_stale_message_is_dropped_before_enqueue(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("OCTOP_FEISHU_MAX_MSG_AGE_SECONDS", raising=False)
+        channel = FeishuChannel(processor=_noop_processor, config=_make_config(), channel_id="ch-stale")
+        channel._running = True
+        enqueued: list[object] = []
+        channel._enqueue_callback = enqueued.append
+        old_ms = int((time.time() - 3600) * 1000)
+        channel._on_message_event(_feishu_event("om_stale", old_ms))
+        assert enqueued == []
+        assert channel.dropped_stale == 1
+
+    def test_fresh_message_is_enqueued(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("OCTOP_FEISHU_MAX_MSG_AGE_SECONDS", raising=False)
+        channel = FeishuChannel(processor=_noop_processor, config=_make_config(), channel_id="ch-fresh")
+        channel._running = True
+        enqueued: list[object] = []
+        channel._enqueue_callback = enqueued.append
+        channel._on_message_event(_feishu_event("om_fresh", int(time.time() * 1000)))
+        assert len(enqueued) == 1
+        assert channel.dropped_stale == 0
+        assert channel.last_inbound_at is not None
+
+    def test_age_gate_can_be_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OCTOP_FEISHU_MAX_MSG_AGE_SECONDS", "0")
+        channel = FeishuChannel(processor=_noop_processor, config=_make_config(), channel_id="ch-noge")
+        channel._running = True
+        enqueued: list[object] = []
+        channel._enqueue_callback = enqueued.append
+        old_ms = int((time.time() - 3600) * 1000)
+        channel._on_message_event(_feishu_event("om_old_allowed", old_ms))
+        assert len(enqueued) == 1
+
+    def test_reaction_event_is_acknowledged(self) -> None:
+        import lark_oapi as lark
+
+        channel = FeishuChannel(processor=_noop_processor, config=_make_config(), channel_id="ch-react")
+        handler = channel._build_event_handler(lark)
+        assert "p2.im.message.reaction.created_v1" in handler._processorMap
+        assert "p2.im.message.reaction.deleted_v1" in handler._processorMap
+        payload = json.dumps(
+            {
+                "schema": "2.0",
+                "header": {
+                    "event_id": "evt_reaction",
+                    "event_type": "im.message.reaction.created_v1",
+                    "create_time": "1716700000000",
+                    "token": "",
+                    "app_id": "cli_x",
+                    "tenant_key": "t",
+                },
+                "event": {"message_id": "om_1"},
+            }
+        ).encode()
+        assert handler._do_without_validation(payload) is None
+
+    def test_dedup_store_expires_ids(self, tmp_path: Path) -> None:
+        store = FeishuDedupStore(tmp_path / "seen.sqlite")
+        assert store.already_seen("c", "m", now=0, ttl_seconds=10) is False
+        assert store.already_seen("c", "m", now=5, ttl_seconds=10) is True
+        assert store.already_seen("c", "m", now=11, ttl_seconds=10) is False
+
+
+def _feishu_event(message_id: str, create_time: int) -> SimpleNamespace:
+    message = SimpleNamespace(
+        message_id=message_id,
+        message_type="text",
+        content='{"text":"hi"}',
+        chat_id="oc_chat",
+        chat_type="p2p",
+        thread_id="",
+        mentions=None,
+        create_time=create_time,
+    )
+    sender = SimpleNamespace(sender_type="user", sender_id=SimpleNamespace(open_id="ou_user"))
+    header = SimpleNamespace(create_time=str(create_time), event_id="evt")
+    return SimpleNamespace(event=SimpleNamespace(message=message, sender=sender), header=header)
 
 
 # ---------------------------------------------------------------------------

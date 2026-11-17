@@ -11,16 +11,25 @@ import contextlib
 import json
 import logging
 import re
+import sqlite3
+import threading
 import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import quote
 
 import aiohttp
 
 from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor
+from octop_gateway.channels.feishu_dedup import (
+    DEDUP_TTL_SECONDS,
+    max_message_age_seconds,
+    message_create_time_seconds,
+    open_dedup_store,
+    resolve_dedup_db_path,
+)
 from octop_gateway.models import (
     AudioContent,
     ChannelSubject,
@@ -70,6 +79,8 @@ class FeishuConfig(ChannelConfig):
     app_secret: str = ""
     verification_token: str = ""
     encrypt_key: str = ""
+    # Empty uses OCTOP_FEISHU_DEDUP_DB. When that is also empty, dedup stays in memory.
+    dedup_db_path: str = ""
 
     required_credentials = ("app_id", "app_secret")
 
@@ -83,6 +94,10 @@ class FeishuChannel(BaseChannel):
     """
 
     channel_type = "feishu"
+    # Shared across instances of the same channel id so a re-register in this
+    # process does not forget ids that SQLite also remembers.
+    _shared_seen_ids: ClassVar[OrderedDict[tuple[str, str], float]] = OrderedDict()
+    _shared_seen_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(
         self,
@@ -120,8 +135,10 @@ class FeishuChannel(BaseChannel):
         self._ws_session_id: str | None = None
         # Bot open_id used for group @mention activation (group_context)
         self._bot_open_id: str | None = None
-        # Deduplication: ordered dict acting as bounded LRU set
-        self._seen_message_ids: OrderedDict[str, float] = OrderedDict()
+        # Process-local cache is the class-level map above. This file survives
+        # restarts when Octop (or OCTOP_FEISHU_DEDUP_DB) supplies a path.
+        dedup_path = resolve_dedup_db_path(config.dedup_db_path)
+        self._dedup_store = open_dedup_store(dedup_path) if dedup_path else None
 
     # =========================================================================
     # Lifecycle
@@ -238,15 +255,7 @@ class FeishuChannel(BaseChannel):
         self._ws_reconnecting_since = None
         self._mark_ws_activity()
 
-        # Build event handler
-        event_handler = (
-            lark.EventDispatcherHandler.builder(
-                self._config.encrypt_key or "",
-                self._config.verification_token or "",
-            )
-            .register_p2_im_message_receive_v1(self._on_message_event)
-            .build()
-        )
+        event_handler = self._build_event_handler(lark)
 
         # Create WebSocket client (lark_oapi.ws.Client)
         self._ws_client = lark.ws.Client(
@@ -267,6 +276,30 @@ class FeishuChannel(BaseChannel):
         )
         self._ws_thread.start()
         logger.info("Feishu WebSocket client connecting (daemon thread, session=%s)", self._ws_session_id)
+
+    def _build_event_handler(self, lark: Any) -> Any:
+        """Register message delivery and the reaction events this bot creates.
+
+        Unregistered events make lark-oapi answer HTTP 500, and Feishu then
+        retries them on the same schedule as real messages. Reaction events
+        are acknowledged and ignored.
+        """
+        return (
+            lark.EventDispatcherHandler.builder(
+                self._config.encrypt_key or "",
+                self._config.verification_token or "",
+            )
+            .register_p2_im_message_receive_v1(self._on_message_event)
+            .register_p2_im_message_reaction_created_v1(self._on_reaction_event)
+            .register_p2_im_message_reaction_deleted_v1(self._on_reaction_event)
+            .build()
+        )
+
+    def _on_reaction_event(self, data: Any) -> None:
+        """Ack a reaction event so Feishu stops retrying it."""
+        header = getattr(data, "header", None)
+        event_id = str(getattr(header, "event_id", "") or "") if header is not None else ""
+        logger.debug("Feishu reaction event acknowledged: %s", event_id)
 
     def _run_ws_thread(self) -> None:
         """WebSocket client thread entry point."""
@@ -308,6 +341,7 @@ class FeishuChannel(BaseChannel):
         self._ws_reconnecting_since = None
         self._ws_session_id = str(uuid.uuid4())
         self._mark_ws_activity()
+        self.note_reconnect()
         logger.info("Feishu WebSocket reconnected (session=%s)", self._ws_session_id)
 
     async def _cancel_watchdog(self) -> None:
@@ -407,6 +441,7 @@ class FeishuChannel(BaseChannel):
                 return
             if self._running:
                 await self._start_ws_client()
+                self.note_reconnect()
 
     def _request_ws_thread_shutdown(self) -> None:
         """Ask the WS thread event loop to disconnect and cancel its tasks.
@@ -486,9 +521,12 @@ class FeishuChannel(BaseChannel):
             if sender_type == "bot":
                 return
 
-            message_id = message.message_id
-            if self._is_duplicate(message_id):
-                logger.debug("Duplicate Feishu message ignored: %s", message_id)
+            message_id = str(getattr(message, "message_id", "") or "")
+            if self._drop_if_stale(message, message_id):
+                return
+            if message_id and self._is_duplicate(message_id):
+                self.dropped_duplicate += 1
+                logger.info("Duplicate Feishu message ignored: %s", message_id)
                 return
 
             sender_id_obj = getattr(sender, "sender_id", None)
@@ -525,6 +563,7 @@ class FeishuChannel(BaseChannel):
             # Add "Typing" reaction to acknowledge receipt (non-blocking)
             self._add_reaction_async(message_id, "Typing")
 
+            self.note_inbound()
             # Enqueue for processing
             if self._enqueue_callback:
                 self._enqueue_callback(raw_payload)
@@ -581,18 +620,60 @@ class FeishuChannel(BaseChannel):
     # Deduplication
     # =========================================================================
 
+    def _drop_if_stale(self, message: Any, message_id: str) -> bool:
+        """Return True when the message's own create_time is past the age gate.
+
+        A normal return (no exception) lets lark-oapi acknowledge the event,
+        which stops Feishu from retrying an old delivery.
+        """
+        limit = max_message_age_seconds()
+        if limit <= 0:
+            return False
+        created = message_create_time_seconds(getattr(message, "create_time", None))
+        if created is None:
+            return False
+        age = time.time() - created
+        if age <= limit:
+            return False
+        self.dropped_stale += 1
+        logger.warning("Feishu dropped stale message: id=%s age=%.0fs", message_id, age)
+        return True
+
     def _is_duplicate(self, message_id: str) -> bool:
         """Check if a message_id has been seen recently.
 
-        Uses an OrderedDict as a bounded LRU cache to track IDs.
+        The process-wide map survives channel re-register. The SQLite store
+        survives process restarts for ``DEDUP_TTL_SECONDS``.
         """
-        if message_id in self._seen_message_ids:
-            return True
-        self._seen_message_ids[message_id] = time.time()
-        # Evict oldest entries when exceeding max size
-        while len(self._seen_message_ids) > _DEDUP_MAX_SIZE:
-            self._seen_message_ids.popitem(last=False)
+        if not message_id:
+            return False
+        key = (self.channel_id, message_id)
+        with self._shared_seen_lock:
+            if key in self._shared_seen_ids:
+                self._shared_seen_ids.move_to_end(key)
+                return True
+        if self._dedup_store is not None:
+            try:
+                if self._dedup_store.already_seen(
+                    self.channel_id,
+                    message_id,
+                    now=time.time(),
+                    ttl_seconds=DEDUP_TTL_SECONDS,
+                ):
+                    self._remember(message_id)
+                    return True
+            except sqlite3.Error:
+                logger.warning("Feishu dedup store failed for %s", message_id, exc_info=True)
+        self._remember(message_id)
         return False
+
+    def _remember(self, message_id: str) -> None:
+        key = (self.channel_id, message_id)
+        with self._shared_seen_lock:
+            self._shared_seen_ids[key] = time.time()
+            self._shared_seen_ids.move_to_end(key)
+            while len(self._shared_seen_ids) > _DEDUP_MAX_SIZE:
+                self._shared_seen_ids.popitem(last=False)
 
     # =========================================================================
     # Sending
@@ -795,6 +876,7 @@ class FeishuChannel(BaseChannel):
                         receive_id[:16],
                     )
                 else:
+                    self.note_outbound()
                     logger.info("Feishu message sent: receive_id=%s msg_type=%s", receive_id[:16], msg_type)
                 return data  # type: ignore[no-any-return]
         except (aiohttp.ClientError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError):
