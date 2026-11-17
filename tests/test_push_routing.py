@@ -25,9 +25,15 @@ def test_strip_ephemeral_push_meta_removes_webhook_and_reply_context() -> None:
     meta = {
         "chat_id": "c1",
         "msg_id": "m1",
+        "source_message_id": "m2",
+        "reply_to_message_id": "m0",
+        "reply_to_text": "old message",
+        "reply_quote_text": "old selection",
+        "reply_to_is_own_bot": True,
+        "message_thread_id": 12,
         "webhook_url": "https://example.com/hook",
         "context_token": "ctx",
     }
     strip_ephemeral_push_meta(meta)
-    assert meta == {"chat_id": "c1"}
+    assert meta == {"chat_id": "c1", "message_thread_id": 12}
     assert "webhook_url" in EPHEMERAL_PUSH_META

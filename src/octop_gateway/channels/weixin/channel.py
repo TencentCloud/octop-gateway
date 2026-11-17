@@ -26,6 +26,7 @@ from octop_gateway.channels.weixin.api import WeixinAPIClient
 from octop_gateway.channels.weixin.text import split_weixin_text
 from octop_gateway.channels.weixin.types import GetUpdatesResponse, WeixinAPIError, WeixinMessage
 from octop_gateway.constraints import ChannelConstraints
+from octop_gateway.format_tables import convert_tables_to_plain
 from octop_gateway.models import (
     ChannelSubject,
     ContentPart,
@@ -353,6 +354,7 @@ class WeixinChannel(BaseChannel):
 
     async def _send_text(self, subject: ChannelSubject, text: str) -> None:
         """Send a text message via the iLink sendMessage API."""
+        text = convert_tables_to_plain(text)
         user_id = self._user_key(subject)
         async with self._send_lock(user_id or "_"):
             await self._mark_content(user_id, subject)

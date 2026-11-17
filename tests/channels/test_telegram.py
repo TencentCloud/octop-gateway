@@ -85,6 +85,8 @@ class TestTelegramAllowedUsers:
         ch = TelegramChannel(processor=_noop_processor, config=cfg)
         handlers: list = []
         app = MagicMock()
+        app.bot.username = "OurBot"
+        app.bot.id = 99
         app.add_handler.side_effect = lambda h: handlers.append(h)
         app.initialize = AsyncMock()
         app.start = AsyncMock()
