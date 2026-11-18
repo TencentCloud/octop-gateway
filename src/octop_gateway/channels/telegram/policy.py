@@ -120,6 +120,6 @@ def strip_own_mention(text: str, username: str | None) -> str:
     if not username:
         return text
     name = re.escape(username.lstrip("@"))
-    text = re.sub(rf"^(\s*/[\w-]+)@{name}(?=\s|$)", r"\1", text, flags=re.IGNORECASE)
-    text = re.sub(rf"^[ \t]*@{name}(?!\w)[ \t]*[,\uFF0C]?[ \t]*", "", text, flags=re.IGNORECASE | re.MULTILINE)
-    return re.sub(rf"[ \t]*(?<![\w.])@{name}(?!\w)", "", text, flags=re.IGNORECASE).strip()
+    # Only the initial address is syntax; later mentions belong to the message.
+    text = re.sub(rf"^[ \t]*@{name}(?=[ \t,\uFF0C]|$)[ \t]*[,\uFF0C]?[ \t]*", "", text, flags=re.IGNORECASE)
+    return re.sub(rf"^(\s*/[\w-]+)@{name}(?=\s|$)", r"\1", text, flags=re.IGNORECASE)

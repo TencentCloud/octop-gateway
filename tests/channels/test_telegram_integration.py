@@ -853,3 +853,24 @@ async def test_callback_topic_matches_registration(thread, is_topic, registered)
     )
     await ch._handle_callback(update)
     assert handled == [True]
+
+
+@pytest.mark.parametrize("caption", [False, True])
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("@OurBot", "@OurBot"),
+        ("@OurBot /help@OurBot", "/help"),
+        ("@OurBot explain\n@OurBot literally", "explain\n@OurBot literally"),
+    ],
+)
+async def test_address_normalization_reaches_processor(caption, text, expected):
+    ch = channel(group_activation="mention")
+    ch.enqueue = MagicMock()
+    token = {"type": "mention", "offset": 0, "length": 7}
+    extra = {"caption": text, "caption_entities": [token]} if caption else {"text": text, "entities": [token]}
+    message = sdk_message(text=None, **extra) if caption else sdk_message(**extra)
+    await ch._handle_update(SimpleNamespace(message=message, edited_message=None))
+    ch.enqueue.assert_called_once()
+    message = ch.parse_inbound(ch.enqueue.call_args.args[0])
+    assert message.content[0].text == expected

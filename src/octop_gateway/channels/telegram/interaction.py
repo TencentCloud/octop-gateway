@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import time
 from collections import OrderedDict
@@ -26,6 +27,7 @@ class Interactions:
 
     def __init__(self) -> None:
         self.pending: OrderedDict[str, Callback] = OrderedDict()
+        self.running: set[str] = set()
 
     def register(
         self,
@@ -55,5 +57,16 @@ class Interactions:
         if (item.user, item.chat, item.topic) != (user, chat, topic):
             return False
         self.pending.pop(token)
-        await item.action()
+        self.running.add(token)
+        try:
+            await item.action()
+        except (Exception, asyncio.CancelledError):
+            # Allow an explicit retry, but never resurrect an expired capability.
+            if item.expires >= time.monotonic():
+                self.pending[token] = item
+                while len(self.pending) > 1000:
+                    self.pending.popitem(last=False)
+            raise
+        finally:
+            self.running.discard(token)
         return True
