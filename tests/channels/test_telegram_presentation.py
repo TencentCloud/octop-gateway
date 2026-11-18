@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
-from telegram.error import BadRequest, InvalidToken, NetworkError
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from telegram.error import BadRequest, EndPointNotFound, InvalidToken, NetworkError
 
 from octop_gateway.channels.telegram import TelegramChannel, TelegramConfig
 from octop_gateway.channels.telegram.policy import strip_own_mention
@@ -21,11 +23,17 @@ TABLE = "| name | value |\n|---|---|\n| cpu | 80% |"
     [
         ("@OurBot, hello", "hello"),
         ("@OurBot check the site", "check the site"),
-        ("does @ourbot know?", "does know?"),
-        ("line one\n@OurBot line two", "line one\nline two"),
+        ("does @ourbot know?", "does @ourbot know?"),
+        ("line one\n@OurBot line two", "line one\n@OurBot line two"),
         ("ask @OtherBot and @hr together", "ask @OtherBot and @hr together"),
         ("mail john@ourbot.com", "mail john@ourbot.com"),
         ("@robot please", "@robot please"),
+        ("@OurBot.com is a domain", "@OurBot.com is a domain"),
+        ("@OurBot /help@OurBot", "/help"),
+        ("@OurBot, /stop@OurBot", "/stop"),
+        ("/help@OurBot", "/help"),
+        ("@OurBot explain @OurBot", "explain @OurBot"),
+        ("@OurBot explain:\n@OurBot stays", "explain:\n@OurBot stays"),
         ("@OurBotX stays", "@OurBotX stays"),
         ("@OurBot fix:\ndef f():\n    return  1", "fix:\ndef f():\n    return  1"),
     ],
@@ -51,7 +59,7 @@ def channel(**options):
             **{
                 name: AsyncMock(return_value={"message_id": 50})
                 for name in (
-                    "_post",
+                    "do_api_request",
                     "send_message",
                     "send_photo",
                     "send_media_group",
@@ -86,7 +94,8 @@ def subject():
 async def test_rich_table_keeps_delivery_options():
     ch = channel(disable_notification=True, protect_content=True)
     await ch._send_text(subject(), TABLE)
-    endpoint, data = ch._app.bot._post.call_args.args
+    endpoint = ch._app.bot.do_api_request.call_args.args[0]
+    data = ch._app.bot.do_api_request.call_args.kwargs["api_kwargs"]
     assert endpoint == "sendRichMessage"
     assert data["rich_message"] == {"markdown": TABLE}
     assert data["message_thread_id"] == 12
@@ -102,14 +111,15 @@ async def test_rich_preview_released_before_next_segment():
     ch.interactions.pending["stop"] = object()
     ch._stream.set(state)
     await ch._send_text(subject(), TABLE)
-    endpoint, data = ch._app.bot._post.call_args.args
+    endpoint = ch._app.bot.do_api_request.call_args.args[0]
+    data = ch._app.bot.do_api_request.call_args.kwargs["api_kwargs"]
     assert endpoint == "editMessageText" and data["message_id"] == 99
     assert data["reply_markup"].inline_keyboard == ()
     assert "message_id" not in state and not state["finalizing"]
     assert not ch.interactions.pending
     state.update(text=TABLE, finalizing=True)
     await ch._send_text(subject(), TABLE)
-    assert ch._app.bot._post.call_args.args[0] == "sendRichMessage"
+    assert ch._app.bot.do_api_request.call_args.args[0] == "sendRichMessage"
 
 
 async def test_nonfinal_table_does_not_overwrite_preview():
@@ -117,7 +127,7 @@ async def test_nonfinal_table_does_not_overwrite_preview():
     state = {"text": TABLE, "finalizing": False, "message_id": 99}
     ch._stream.set(state)
     await ch._send_text(subject(), TABLE)
-    assert ch._app.bot._post.call_args.args[0] == "sendRichMessage"
+    assert ch._app.bot.do_api_request.call_args.args[0] == "sendRichMessage"
     assert state["message_id"] == 99
 
 
@@ -130,10 +140,12 @@ async def test_rich_final_clears_private_draft():
     assert not state["finalizing"] and not state.get("draft_sent")
 
 
-@pytest.mark.parametrize("error", [BadRequest("rich unsupported"), InvalidToken("unknown method")])
+@pytest.mark.parametrize(
+    "error", [BadRequest("rich unsupported"), EndPointNotFound("unknown endpoint"), InvalidToken("unknown method")]
+)
 async def test_explicit_rejection_uses_aligned_code_block(error):
     ch = channel()
-    ch._app.bot._post.side_effect = error
+    ch._app.bot.do_api_request.side_effect = error
     await ch._send_text(subject(), TABLE)
     sent = ch._app.bot.send_message.call_args.kwargs
     assert sent["parse_mode"] == "HTML" and "<pre>" in sent["text"]
@@ -144,19 +156,19 @@ async def test_network_failure_is_not_resent():
     ch = channel()
     state = {"text": TABLE}
     ch._stream.set(state)
-    ch._app.bot._post.side_effect = NetworkError("ambiguous timeout")
+    ch._app.bot.do_api_request.side_effect = NetworkError("ambiguous timeout")
     with pytest.raises(NetworkError):
         await ch._send_text(subject(), TABLE)
     assert state["delivery_failed"]
     await ch._send_text(subject(), TABLE)
-    ch._app.bot._post.assert_awaited_once()
+    ch._app.bot.do_api_request.assert_awaited_once()
     ch._app.bot.send_message.assert_not_awaited()
 
 
 async def test_fenced_table_uses_ordinary_delivery():
     ch = channel()
     await ch._send_text(subject(), f"```\n{TABLE}\n```")
-    ch._app.bot._post.assert_not_awaited()
+    ch._app.bot.do_api_request.assert_not_awaited()
     ch._app.bot.send_message.assert_awaited_once()
 
 
@@ -317,7 +329,8 @@ async def test_proactive_push_does_not_reply_to_last_message(origin, topic, payl
         await ch.push_message(target, [ImageContent(url=f"https://example.com/{i}.png") for i in range(count)])
 
     if payload == "table":
-        endpoint, sent = ch._app.bot._post.call_args.args
+        endpoint = ch._app.bot.do_api_request.call_args.args[0]
+        sent = ch._app.bot.do_api_request.call_args.kwargs["api_kwargs"]
         assert endpoint == "sendRichMessage"
     else:
         method = "send_photo" if payload == "image" else "send_media_group" if payload == "album" else "send_message"
@@ -332,3 +345,123 @@ async def test_proactive_push_does_not_reply_to_last_message(origin, topic, payl
     reply = ch._app.bot.send_message.call_args.kwargs
     assert reply["reply_parameters"].message_id == 123
     assert reply.get("message_thread_id") == topic
+
+
+@pytest.mark.parametrize(
+    "error", [ValueError("host failure"), NetworkError("https://example.com/private"), asyncio.CancelledError()]
+)
+async def test_failed_choice_is_acknowledged_and_retryable(error):
+    ch = channel()
+    action = AsyncMock(side_effect=[error, None])
+    token = ch.register_callback(subject(), action)
+    tap = query(token)
+    with pytest.raises(type(error)):
+        await ch._handle_callback(SimpleNamespace(callback_query=tap))
+    tap.answer.assert_awaited_once()
+    assert "retry" in tap.answer.call_args.kwargs["text"]
+    assert token in ch.interactions.pending
+    ch._app.bot.edit_message_text.assert_not_awaited()
+    ch._app.bot.edit_message_reply_markup.assert_not_awaited()
+    await ch._handle_callback(SimpleNamespace(callback_query=query(token)))
+    assert action.await_count == 2
+    assert token not in ch.interactions.pending
+
+
+async def test_duplicate_tap_during_failed_action_keeps_keyboard():
+    ch = channel()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def action():
+        entered.set()
+        await release.wait()
+        raise ValueError("host failure")
+
+    token = ch.register_callback(subject(), action)
+    task = asyncio.create_task(ch._handle_callback(SimpleNamespace(callback_query=query(token))))
+    try:
+        await entered.wait()
+        await ch._handle_callback(SimpleNamespace(callback_query=query(token)))
+        ch._app.bot.edit_message_text.assert_not_awaited()
+        ch._app.bot.edit_message_reply_markup.assert_not_awaited()
+    finally:
+        release.set()
+        with pytest.raises(ValueError, match="host failure"):
+            await task
+    assert token in ch.interactions.pending
+
+
+async def test_failed_acknowledgement_does_not_repeat_successful_action():
+    ch = channel()
+    action = AsyncMock()
+    token = ch.register_callback(subject(), action)
+    tap = query(token)
+    tap.answer.side_effect = NetworkError("acknowledgement timeout")
+    with pytest.raises(NetworkError):
+        await ch._handle_callback(SimpleNamespace(callback_query=tap))
+    assert token not in ch.interactions.pending
+    await ch._handle_callback(SimpleNamespace(callback_query=query(token)))
+    action.assert_awaited_once()
+
+
+async def test_failed_acknowledgement_preserves_original_action_error():
+    ch = channel()
+    token = ch.register_callback(subject(), AsyncMock(side_effect=ValueError("host failure")))
+    tap = query(token)
+    tap.answer.side_effect = NetworkError("acknowledgement timeout")
+    with pytest.raises(ValueError, match="host failure"):
+        await ch._handle_callback(SimpleNamespace(callback_query=tap))
+    assert token in ch.interactions.pending
+
+
+async def test_failed_action_does_not_restore_expired_token(monkeypatch):
+    from octop_gateway.channels.telegram.interaction import Interactions
+
+    now = [0.0]
+    monkeypatch.setattr("octop_gateway.channels.telegram.interaction.time.monotonic", lambda: now[0])
+    interactions = Interactions()
+
+    async def action():
+        now[0] = 2.0
+        raise ValueError("host failure")
+
+    token = interactions.register("7", "42", None, action, ttl=1)
+    with pytest.raises(ValueError):
+        await interactions.invoke(token, "7", "42", None)
+    assert token not in interactions.pending
+    assert not interactions.running
+
+
+async def test_failed_action_restore_keeps_pending_bound():
+    from octop_gateway.channels.telegram.interaction import Interactions
+
+    interactions = Interactions()
+
+    async def action():
+        for _ in range(1000):
+            interactions.register("7", "42", None, AsyncMock())
+        raise ValueError("host failure")
+
+    token = interactions.register("7", "42", None, action)
+    with pytest.raises(ValueError):
+        await interactions.invoke(token, "7", "42", None)
+    assert token in interactions.pending
+    assert len(interactions.pending) == 1000
+    assert not interactions.running
+
+
+async def test_rich_table_uses_real_public_sdk_serialization():
+    from telegram.request import BaseRequest
+
+    transport = MagicMock(spec=BaseRequest)
+    transport.post = AsyncMock(return_value={"id": 99, "is_bot": True, "first_name": "Bot"})
+    async with Bot("123456:TEST", request=transport, get_updates_request=transport) as bot:
+        ch = channel(disable_notification=True, protect_content=True)
+        ch._app.bot = bot
+        await ch._send_text(subject(), TABLE)
+        sent = transport.post.call_args.kwargs
+        assert sent["url"].endswith("/sendRichMessage")
+        parameters = sent["request_data"].json_parameters
+        assert json.loads(parameters["rich_message"]) == {"markdown": TABLE}
+        assert json.loads(parameters["reply_parameters"])["message_id"] == 1
+        assert parameters["message_thread_id"] == "12"
+        assert parameters["disable_notification"] == "true"

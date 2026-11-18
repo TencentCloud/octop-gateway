@@ -37,7 +37,7 @@ def test_code_fences_preserved(fence, closed):
 
 def test_escaped_pipes_short_rows_and_non_tables():
     text = "| a | b |\n|---|---|\n| one\\|two |\n| | |"
-    assert convert_tables_to_plain(text) == "- a=one|two"
+    assert convert_tables_to_plain(text) == "- a=one|two\n- a= | b="
     for text in ("a || b", "single | pipe", "| a | b |\n| | |"):
         assert convert_markdown_tables(text) == text
 
@@ -63,3 +63,23 @@ async def test_weixin_outbound_flattens_before_splitting():
     ch._dispatch_text = AsyncMock()
     await ch._send_content(ChannelSubject(subject_id="user"), [TextContent(text=TABLE)])
     assert ch._dispatch_text.call_args.args[1] == PLAIN
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "| a | b |\n|---|---|\n| one | two | do not lose |",
+        "| a | b |\n|---|---|",
+    ],
+)
+def test_unrepresentable_tables_preserve_original(text):
+    assert convert_markdown_tables(text) == text
+    assert convert_tables_to_plain(text) == text
+    assert not has_gfm_table(text)
+
+
+def test_backslash_parity_and_escaped_final_pipe():
+    text = "| a | b |\n|---|---|\n| path" + "\\" * 2 + "| value |"
+    assert "b=value" in convert_tables_to_plain(text)
+    text = "| a | b |\n|---|---|\n| value | final\\|"
+    assert convert_tables_to_plain(text) == "- a=value | b=final|"
