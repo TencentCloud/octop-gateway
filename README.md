@@ -77,6 +77,7 @@ Harness Gateway sits between your agent and the outside world. Each platform is 
 | Yuanbao (元宝) | `yuanbao` | — | ✅ | ✅ |
 | Xiaoyi (小艺) | `xiaoyi` | — | ✅ | ✅ |
 | MQTT | `mqtt` | MQTT | ✅ | ✅ |
+| NATS | `nats` | NATS | ✅ | ✅ |
 | Telegram | `telegram` | Long-polling | ✅ | ✅ |
 
 ##### Discord

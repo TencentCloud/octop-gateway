@@ -73,6 +73,7 @@
 | 元宝 | `yuanbao` | — | ✅ | ✅ |
 | 小艺 | `xiaoyi` | — | ✅ | ✅ |
 | MQTT | `mqtt` | MQTT | ✅ | ✅ |
+| NATS | `nats` | NATS | ✅ | ✅ |
 | Telegram | `telegram` | 长轮询 | ✅ | ✅ |
 
 ##### Discord
