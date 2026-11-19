@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 修复
+- 动态移除或重载通道时，先取消并等待该通道的入站 worker 与控制消息处理任务清理，再关闭连接；相似通道 ID 不再误取消彼此的任务，移除调用方被取消时仍会尝试通道关闭，关闭失败会记录日志且不覆盖调用方取消。
+
 ## [1.0.4] - 2026-11-17
 
 ### 新增
