@@ -83,6 +83,14 @@ Harness Gateway sits between your agent and the outside world. Each platform is 
 
 Use a Bot Token and enable Message Content Intent in the developer portal. `allow_all_channels` defaults to `True`, including configurations without this field, allowing all guild channels accessible to the bot. Set it to `False` to restrict access to `allowed_channel_ids` (empty denies guild messages). DMs always require `allowed_user_ids`; an empty user list denies DMs. Guild messages require a direct bot mention by default, and threads inherit parent-channel access. Supports HTTP proxying, attachments, typing and split replies. See [`examples/discord_bot.py`](examples/discord_bot.py).
 
+#### Telegram delivery and callbacks
+
+Tables outside code fences use native rich messages when supported by the Bot API, with aligned code blocks after an explicit API rejection. Ambiguous network failures are not resent. QQ and WeChat iLink flatten tables into keyed list rows.
+
+Telegram inbound metadata includes `reply_to_text`, `reply_quote_text` (each capped at 2000 characters), and `reply_to_is_own_bot`. The host decides how to use quotes in its prompt and history. Only this bot's mention and command suffix are removed from inbound text; other mentions, email addresses and internal spacing are preserved.
+
+Choice callbacks show feedback and settle the old keyboard. A foreign user or topic cannot dismiss a live choice. `register_callback(..., settle=False)` leaves message cleanup to the caller, as used by streaming Stop controls. Callback actions must enqueue long work; application permissions and pending-question validity remain host responsibilities.
+
 #### Unified message abstraction
 - `InboundMessage` carries the text, structured `ContentPart`s (text / image / video / audio / file), and a `ChannelSubject`.
 - Your processor is a `Callable[[InboundMessage], AsyncIterator[MessageEvent]]` — emit `MESSAGE` for complete text, `DELTA` for token streaming, and `COMPLETED` to flush.
