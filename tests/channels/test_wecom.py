@@ -97,6 +97,8 @@ class TestWeComChannelUnit:
         assert msg.text == "hello"
         assert msg.metadata["msgid"] == "msg_wecom_001"
         assert msg.metadata["chat_type"] == "single"
+        assert msg.metadata["sender_id"] == "T48500024A"
+        assert msg.metadata["sender_name"] == ""
         assert msg.metadata["response_url"] == "https://qyapi.weixin.qq.com/callback/reply"
 
     def test_parse_inbound_text_with_chat_id(self) -> None:
@@ -115,6 +117,36 @@ class TestWeComChannelUnit:
         assert msg.channel_subject is not None
         assert msg.channel_subject.subject_id == "user_abc"
         assert msg.text == "group msg"
+        assert msg.metadata["sender_id"] == "user_abc"
+        assert msg.metadata["sender_name"] == ""
+
+    def test_parse_inbound_sender_name_from_payload(self) -> None:
+        """from.name flows into sender_name so hosts can label the speaker."""
+        ch = WeComChannel(processor=_noop_processor, config=_make_config())
+        payload = {
+            "msgid": "msg_003",
+            "msgtype": "text",
+            "text": {"content": "hi"},
+            "from": {"userid": "user_abc", "name": "Alice"},
+            "chattype": "group",
+            "chatid": "chat_room_123",
+        }
+        msg = ch.parse_inbound(payload)
+        assert msg.metadata["sender_id"] == "user_abc"
+        assert msg.metadata["sender_name"] == "Alice"
+
+    def test_parse_inbound_sender_id_user_id_fallback(self) -> None:
+        """from.user_id is the legacy fallback identifier for sender_id."""
+        ch = WeComChannel(processor=_noop_processor, config=_make_config())
+        payload = {
+            "msgid": "msg_004",
+            "msgtype": "text",
+            "text": {"content": "hello"},
+            "from": {"user_id": "legacy_9"},
+            "chattype": "single",
+        }
+        msg = ch.parse_inbound(payload)
+        assert msg.metadata["sender_id"] == "legacy_9"
 
     def test_parse_inbound_returns_existing(self) -> None:
         """Passing an InboundMessage directly returns it unchanged."""
