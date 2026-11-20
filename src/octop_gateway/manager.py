@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from octop_gateway.channels.telegram import TelegramConfig
     from octop_gateway.channels.wecom import WeComConfig
     from octop_gateway.channels.weixin.channel import WeixinConfig
+    from octop_gateway.channels.whatsapp import WhatsAppConfig
     from octop_gateway.channels.xiaoyi import XiaoyiConfig
     from octop_gateway.channels.yuanbao import YuanbaoConfig
 
@@ -1060,3 +1061,13 @@ class ChannelManager:
     ) -> str:
         """Add a Discord Bot channel (Gateway WebSocket)."""
         return await self.add_channel("discord", config, processor=processor, **kwargs)
+
+    async def add_whatsapp_channel(
+        self,
+        config: WhatsAppConfig,
+        *,
+        processor: MessageProcessor | None = None,
+        **kwargs: Any,
+    ) -> str:
+        """Add a WhatsApp channel (Official Meta Cloud API or self-hosted WAHA/Evolution QR bridge)."""
+        return await self.add_channel("whatsapp", config, processor=processor, **kwargs)

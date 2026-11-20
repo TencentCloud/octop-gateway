@@ -16,6 +16,7 @@ from __future__ import annotations
 from octop_gateway.channel import BaseChannel, ChannelConfig, ChannelCredentialsError, MessageProcessor
 from octop_gateway.channels import SUPPORTED_CHANNEL_KINDS, ChannelKind
 from octop_gateway.channels.discord import DiscordChannel, DiscordConfig
+from octop_gateway.channels.whatsapp import WhatsAppChannel, WhatsAppConfig
 from octop_gateway.constraints import ChannelConstraints, RateLimiter, ReplyTimeoutGuard, TypingKeepalive
 from octop_gateway.group_context import (
     GroupActivation,
@@ -80,6 +81,8 @@ __all__ = [
     "TextContent",
     "TypingKeepalive",
     "VideoContent",
+    "WhatsAppChannel",
+    "WhatsAppConfig",
     "extract_media",
     "extract_text",
     "has_media",
