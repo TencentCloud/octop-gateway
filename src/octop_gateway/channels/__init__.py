@@ -20,6 +20,7 @@ _CHANNEL_MAP: dict[str, str] = {
     "xiaoyi": "octop_gateway.channels.xiaoyi",
     "mqtt": "octop_gateway.channels.mqtt",
     "telegram": "octop_gateway.channels.telegram",
+    "slack": "octop_gateway.channels.slack",
 }
 
 
@@ -40,6 +41,7 @@ class ChannelKind(StrEnum):
     XIAOYI = "xiaoyi"
     MQTT = "mqtt"
     TELEGRAM = "telegram"
+    SLACK = "slack"
 
 
 #: All channel kinds that :class:`~octop_gateway.manager.ChannelManager` can build.
@@ -56,6 +58,7 @@ _CLASS_NAMES: dict[str, str] = {
     "xiaoyi": "XiaoyiChannel",
     "mqtt": "MQTTChannel",
     "telegram": "TelegramChannel",
+    "slack": "SlackChannel",
 }
 
 

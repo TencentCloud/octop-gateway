@@ -16,6 +16,7 @@ from __future__ import annotations
 from octop_gateway.channel import BaseChannel, ChannelConfig, ChannelCredentialsError, MessageProcessor
 from octop_gateway.channels import SUPPORTED_CHANNEL_KINDS, ChannelKind
 from octop_gateway.channels.discord import DiscordChannel, DiscordConfig
+from octop_gateway.channels.slack import SlackChannel, SlackConfig
 from octop_gateway.constraints import ChannelConstraints, RateLimiter, ReplyTimeoutGuard, TypingKeepalive
 from octop_gateway.group_context import (
     GroupActivation,
@@ -77,6 +78,8 @@ __all__ = [
     "MessageProcessor",
     "RateLimiter",
     "ReplyTimeoutGuard",
+    "SlackChannel",
+    "SlackConfig",
     "TextContent",
     "TypingKeepalive",
     "VideoContent",
