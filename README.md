@@ -36,7 +36,7 @@
 
 | | Feature | Description |
 |---|---------|-------------|
-| 🔌 | **10 platforms, one processor** | Feishu, DingTalk, QQ, WeCom, WeChat iLink, Yuanbao, Xiaoyi, MQTT, Telegram, Discord — all behind one interface |
+| 🔌 | **12 platforms, one processor** | Feishu, DingTalk, QQ, WeCom, WeChat iLink, Yuanbao, Xiaoyi, MQTT, Telegram, Discord, Slack, WhatsApp — all behind one interface |
 | 🧩 | **Unified abstraction** | `BaseChannel` turns each platform's quirks into a common `InboundMessage` / `MessageEvent` model |
 | 📨 | **Streaming events** | Your processor is an async generator yielding `MessageEvent` — first-class token streaming |
 | 💾 | **Pluggable media** | `MediaBackend` stores attachments; `FileSystemMediaBackend` ships by default |
@@ -56,7 +56,7 @@ Harness Gateway sits between your agent and the outside world. Each platform is 
 | Layer | Technology |
 |-------|-----------|
 | **Language** | Python 3.12+ |
-| **Channel model** | `BaseChannel` + per-platform adapter (10 built-in) |
+| **Channel model** | `BaseChannel` + per-platform adapter (12 built-in) |
 | **Messaging model** | `InboundMessage` / `MessageEvent` / `ContentPart` |
 | **Orchestration** | `ChannelManager` (async queues, worker pools) |
 | **Media** | `MediaBackend` (`FileSystemMediaBackend` default) |
@@ -78,6 +78,9 @@ Harness Gateway sits between your agent and the outside world. Each platform is 
 | Xiaoyi (小艺) | `xiaoyi` | — | ✅ | ✅ |
 | MQTT | `mqtt` | MQTT | ✅ | ✅ |
 | Telegram | `telegram` | Long-polling | ✅ | ✅ |
+| Discord | `discord` | Gateway WebSocket + REST | ✅ | ✅ |
+| Slack | `slack` | Socket Mode WebSocket + Web API | ✅ | ✅ |
+| WhatsApp | `whatsapp` | Meta Cloud API / WAHA / Evolution QR Bridge | ✅ | ✅ |
 
 ##### Discord
 

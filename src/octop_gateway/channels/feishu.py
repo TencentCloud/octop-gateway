@@ -43,8 +43,9 @@ from octop_gateway.push_routing import alias_subject_fields
 
 logger = logging.getLogger(__name__)
 
-# Feishu API base URL
+# Feishu / Lark API base URLs
 _API_BASE = "https://open.feishu.cn/open-apis"
+_LARK_API_BASE = "https://open.larksuite.com/open-apis"
 
 # Maximum number of message IDs to track for deduplication
 _DEDUP_MAX_SIZE = 2000
@@ -79,6 +80,7 @@ class FeishuConfig(ChannelConfig):
     app_secret: str = ""
     verification_token: str = ""
     encrypt_key: str = ""
+    domain: str = "feishu"
     # Empty uses OCTOP_FEISHU_DEDUP_DB. When that is also empty, dedup stays in memory.
     dedup_db_path: str = ""
 
@@ -140,6 +142,32 @@ class FeishuChannel(BaseChannel):
         dedup_path = resolve_dedup_db_path(config.dedup_db_path)
         self._dedup_store = open_dedup_store(dedup_path) if dedup_path else None
 
+    @property
+    def _api_base(self) -> str:
+        """Resolve Feishu vs international Lark OpenAPI base URL."""
+        raw = (self._config.domain or "feishu").strip()
+        lower = raw.lower()
+        if lower in ("lark", "larksuite", "international", "global"):
+            return _LARK_API_BASE
+        if lower.startswith(("http://", "https://")):
+            trimmed = raw.rstrip("/")
+            return trimmed if trimmed.endswith("/open-apis") else f"{trimmed}/open-apis"
+        return _API_BASE
+
+    @property
+    def _ws_domain(self) -> str | None:
+        """Return custom domain URL for lark_oapi.ws.Client when non-default."""
+        raw = (self._config.domain or "feishu").strip()
+        lower = raw.lower()
+        if lower in ("", "feishu", "cn"):
+            return None
+        if lower in ("lark", "larksuite", "international", "global"):
+            return "https://open.larksuite.com"
+        if lower.startswith(("http://", "https://")):
+            trimmed = raw.rstrip("/")
+            return trimmed[: -len("/open-apis")] if trimmed.endswith("/open-apis") else trimmed
+        return None
+
     # =========================================================================
     # Lifecycle
     # =========================================================================
@@ -172,7 +200,7 @@ class FeishuChannel(BaseChannel):
         try:
             http = await self._ensure_http()
             headers = await self._get_auth_headers()
-            async with http.get(f"{_API_BASE}/bot/v3/info", headers=headers) as resp:
+            async with http.get(f"{self._api_base}/bot/v3/info", headers=headers) as resp:
                 data = await resp.json()
             if data.get("code") != 0:
                 logger.warning("Feishu bot info failed: %s", data.get("msg", "unknown"))
@@ -201,7 +229,7 @@ class FeishuChannel(BaseChannel):
                 return self._tenant_token
 
             http = await self._ensure_http()
-            url = f"{_API_BASE}/auth/v3/tenant_access_token/internal"
+            url = f"{self._api_base}/auth/v3/tenant_access_token/internal"
             payload = {
                 "app_id": self._config.app_id,
                 "app_secret": self._config.app_secret,
@@ -258,11 +286,16 @@ class FeishuChannel(BaseChannel):
         event_handler = self._build_event_handler(lark)
 
         # Create WebSocket client (lark_oapi.ws.Client)
+        ws_kwargs: dict[str, Any] = {
+            "event_handler": event_handler,
+            "log_level": lark.LogLevel.INFO,
+        }
+        if self._ws_domain:
+            ws_kwargs["domain"] = self._ws_domain
         self._ws_client = lark.ws.Client(
             self._config.app_id,
             self._config.app_secret,
-            event_handler=event_handler,
-            log_level=lark.LogLevel.INFO,
+            **ws_kwargs,
         )
         # SDK reconnect hooks (fire on the WS thread's loop).
         self._ws_client.on_reconnecting = self._on_ws_reconnecting
@@ -537,6 +570,8 @@ class FeishuChannel(BaseChannel):
             mentions = self._normalize_mentions(getattr(message, "mentions", None))
 
             # Build raw payload dict for parse_inbound
+            parent_id = getattr(message, "parent_id", "") or ""
+            root_id = getattr(message, "root_id", "") or ""
             raw_payload = {
                 "message_id": message_id,
                 "message_type": message.message_type,
@@ -551,6 +586,10 @@ class FeishuChannel(BaseChannel):
                 },
                 "create_time": data.header.create_time if data.header else "",
             }
+            if parent_id and isinstance(parent_id, str):
+                raw_payload["parent_id"] = parent_id
+            if root_id and isinstance(root_id, str):
+                raw_payload["root_id"] = root_id
 
             logger.info(
                 "Feishu received message: id=%s type=%s sender=%s",
@@ -813,7 +852,7 @@ class FeishuChannel(BaseChannel):
         """Reply to a message inside its thread via the Feishu reply API."""
         http = await self._ensure_http()
         headers = await self._get_auth_headers()
-        url = f"{_API_BASE}/im/v1/messages/{quote(message_id, safe='')}/reply"
+        url = f"{self._api_base}/im/v1/messages/{quote(message_id, safe='')}/reply"
         payload = {
             "msg_type": msg_type,
             "content": content,
@@ -857,7 +896,7 @@ class FeishuChannel(BaseChannel):
         """
         http = await self._ensure_http()
         headers = await self._get_auth_headers()
-        url = f"{_API_BASE}/im/v1/messages?receive_id_type={receive_id_type}"
+        url = f"{self._api_base}/im/v1/messages?receive_id_type={receive_id_type}"
         payload = {
             "receive_id": receive_id,
             "msg_type": msg_type,
@@ -891,7 +930,7 @@ class FeishuChannel(BaseChannel):
         """Download a URL, attaching tenant_access_token for Feishu API URLs."""
         http = await self._ensure_http()
         headers: dict[str, str] = {}
-        if "open.feishu.cn" in url or "open-apis" in url:
+        if "open.feishu.cn" in url or "open.larksuite.com" in url or "open-apis" in url:
             token = await self._refresh_token()
             headers["Authorization"] = f"Bearer {token}"
         async with http.get(url, headers=headers) as resp:
@@ -908,7 +947,7 @@ class FeishuChannel(BaseChannel):
         data, mime = await self.load_media_bytes(media)
         http = await self._ensure_http()
         token = await self._refresh_token()
-        url = f"{_API_BASE}/im/v1/images"
+        url = f"{self._api_base}/im/v1/images"
         headers = {"Authorization": f"Bearer {token}"}
 
         form = _build_multipart_form(
@@ -949,7 +988,7 @@ class FeishuChannel(BaseChannel):
 
         http = await self._ensure_http()
         token = await self._refresh_token()
-        api_url = f"{_API_BASE}/im/v1/files"
+        api_url = f"{self._api_base}/im/v1/files"
         headers = {"Authorization": f"Bearer {token}"}
 
         form = _build_multipart_form(
@@ -1023,7 +1062,7 @@ class FeishuChannel(BaseChannel):
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
             }
-            url = f"{_API_BASE}/im/v1/messages/{message_id}/reactions"
+            url = f"{self._api_base}/im/v1/messages/{message_id}/reactions"
             payload = {"reaction_type": {"emoji_type": emoji_type}}
 
             async with aiohttp.ClientSession() as session, session.post(url, headers=headers, json=payload) as resp:
@@ -1119,6 +1158,14 @@ class FeishuChannel(BaseChannel):
         }
         if thread_id:
             metadata["thread_id"] = thread_id
+        parent_id = str(raw_payload.get("parent_id", "") or "")
+        if parent_id:
+            metadata["parent_id"] = parent_id
+            metadata["reply_to_message_id"] = parent_id
+        reply_quote_text = str(raw_payload.get("reply_quote_text", "") or "").strip()
+        if reply_quote_text:
+            metadata["reply_quote_text"] = reply_quote_text
+            metadata["reply_to_text"] = reply_quote_text
 
         return InboundMessage(
             channel_id=self.channel_id,

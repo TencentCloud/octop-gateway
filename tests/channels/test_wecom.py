@@ -100,7 +100,7 @@ class TestWeComChannelUnit:
         assert msg.metadata["response_url"] == "https://qyapi.weixin.qq.com/callback/reply"
 
     def test_parse_inbound_text_with_chat_id(self) -> None:
-        """When chatid is present, session_id is still the connection session."""
+        """When chattype is group and chatid is present, subject_id routes to the group chatid."""
         ch = WeComChannel(processor=_noop_processor, config=_make_config())
         payload = {
             "msgid": "msg_002",
@@ -109,12 +109,19 @@ class TestWeComChannelUnit:
             "from": {"userid": "user_abc"},
             "chattype": "group",
             "chatid": "chat_room_123",
+            "quote": {"text": {"content": "quoted text"}},
         }
         msg = ch.parse_inbound(payload)
 
         assert msg.channel_subject is not None
-        assert msg.channel_subject.subject_id == "user_abc"
+        assert msg.channel_subject.subject_id == "chat_room_123"
+        assert msg.channel_subject.chat_type == "group"
+        assert msg.metadata["sender_id"] == "user_abc"
+        assert msg.metadata["reply_quote_text"] == "quoted text"
         assert msg.text == "group msg"
+        assert ch._is_duplicate("msg_002") is False
+        assert ch._is_duplicate("msg_002") is True
+        assert ch.dropped_duplicate == 1
 
     def test_parse_inbound_returns_existing(self) -> None:
         """Passing an InboundMessage directly returns it unchanged."""

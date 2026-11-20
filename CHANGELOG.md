@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- 新增 `SlackChannel`（`slack`）：支持 Socket Mode 长连接（免公网 IP）与 HTTP Events API Webhook 验签、Slack v2 外部文件上传与私有文件下载、频道线程自动回复（`reply_in_thread`）与可选话题会话隔离（`thread_isolation`）。
+- 新增 `WhatsAppChannel`（`whatsapp`）：同时支持官方 Meta WhatsApp Business Cloud API（Graph API v21.0+、Webhook 验签、媒体上传下载、已读与正在输入指示、引用回复）与自建免企业资质个人号扫码桥接服务（WAHA WebSocket/REST 与 Evolution API，内置扫码二维码获取与连接状态轮询助手）。
+- 增强与修复既有通道：`DiscordConfig` 新增 `allow_all_dms` 与回复引用上下文提取（`reply_quote_text` / `reply_to_is_own_bot`）；`FeishuConfig` 新增 `domain`（支持国际版 Lark `open.larksuite.com`）与 `parent_id` 引用元数据；修复 `DingTalkChannel` 与 `WeComChannel` 群聊消息误用 `sender_id` 作为 `subject_id` 的路由问题，补齐 `msg_id` LRU 去重与钉钉群聊 OpenAPI 媒体发送。
 - 入站回执新增可选 `text_filter_finish`，在适配器成功处理完成后发送已过滤的缓冲尾文，取消不补发，避免流式文本过滤吞掉未闭合的正常正文。
 
 - Preserve QQ command text by separating quote metadata; quote current group turns with reliable indices and avoid Markdown fallback on uncertain delivery.
