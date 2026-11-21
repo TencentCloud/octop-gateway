@@ -18,6 +18,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Self
+from urllib.parse import quote
 
 from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor
 from octop_gateway.channels.qq.login_qr import QQBotQRCredentials
@@ -28,7 +29,7 @@ from octop_gateway.channels.qq.stream import (
     reconcile_stream_text,
 )
 from octop_gateway.channels.qq.stream_blocks import stable_markdown_prefix
-from octop_gateway.constraints import ChannelConstraints, tool_hint_message
+from octop_gateway.constraints import ChannelConstraints, RateLimiter, tool_hint_message
 from octop_gateway.format_tables import convert_tables_to_plain
 from octop_gateway.group_context import GroupContextConfig
 from octop_gateway.models import (
@@ -101,8 +102,8 @@ _IMG_TAG_RE = re.compile(r"<qqimg\s+[^>]*?src\s*=\s*[\"']([^\"']+)[\"'][^>]*?>",
 _VIDEO_TAG_RE = re.compile(r"<qqvideo\s+[^>]*?src\s*=\s*[\"']([^\"']+)[\"'][^>]*?>", re.IGNORECASE)
 _AUDIO_TAG_RE = re.compile(r"<qqaudio\s+[^>]*?src\s*=\s*[\"']([^\"']+)[\"'][^>]*?>", re.IGNORECASE)
 _FILE_TAG_RE = re.compile(r"<qqfile\s+[^>]*?src\s*=\s*[\"']([^\"']+)[\"'][^>]*?>", re.IGNORECASE)
-# Strip @bot mentions
-_AT_MENTION_RE = re.compile(r"<@!?[A-Za-z0-9_-]+>\s*", re.IGNORECASE)
+# Detect addressing before confirmed self mentions are stripped.
+_AT_MENTION_RE = re.compile(r"<@!?[^>]+>")
 _THINK_BLOCK_RE = re.compile(
     r"<(?:think|thinking)>(.*?)</(?:think|thinking)>",
     re.IGNORECASE | re.DOTALL,
@@ -207,6 +208,8 @@ class QQConfig(ChannelConfig):
     sandbox: bool = False
     intents: int | None = None
     c2c_streaming: bool = True
+    social_trigger_enabled: bool = True
+    plugin_group_settings: dict[str, bool] = field(default_factory=dict)
     show_tool_hints: bool = False
     stream_throttle_ms: int = 150
     stream_hold_keepalive_s: float = 3.0
@@ -240,6 +243,15 @@ class QQConfig(ChannelConfig):
             # ``c2c_streaming: false`` remains the only opt-out.
             config.c2c_streaming = True
         raw_group_context = data.get("group_context")
+        config.plugin_group_settings = {}
+        if isinstance(raw_group_context, dict):
+            config.plugin_group_settings = {
+                key: value for key, value in raw_group_context.items() if isinstance(key, str) and type(value) is bool
+            }
+            social_trigger_enabled = raw_group_context.get("social_trigger_enabled", True)
+            if type(social_trigger_enabled) is not bool:
+                raise ValueError("social_trigger_enabled must be a boolean")
+            config.social_trigger_enabled = social_trigger_enabled
         if isinstance(raw_group_context, dict) and "enabled" not in raw_group_context:
             config.group_context.enabled = True
         if isinstance(raw_group_context, dict) and "owner_commands_only" not in raw_group_context:
@@ -278,6 +290,16 @@ class QQChannel(BaseChannel):
 
     channel_type = "qq"
 
+    @property
+    def social_trigger_enabled(self) -> bool:
+        """Whether the QQ channel permits the optional group participation plugin."""
+        return self._config.social_trigger_enabled
+
+    @property
+    def plugin_group_settings(self) -> dict[str, bool]:
+        """Return a copy of the QQ group-policy switches available to plugins."""
+        return self._config.plugin_group_settings.copy()
+
     def __init__(
         self,
         processor: MessageProcessor,
@@ -299,6 +321,7 @@ class QQChannel(BaseChannel):
         self._config = config
         self._intents = config.intents if config.intents is not None else _DEFAULT_INTENTS
         self._api_base = _SANDBOX_API_BASE if config.sandbox else _API_BASE
+        self._group_info_limiter = RateLimiter(max_calls=30, window_seconds=60)
 
         # WebSocket state
         self._ws: Any = None  # websockets connection
@@ -1088,7 +1111,7 @@ class QQChannel(BaseChannel):
 
         sender_id = self._extract_sender_id(data, event_type)
         session_id = self._resolve_session_from_event(data, event_type)
-        content_parts = self._parse_content(data, event_type=event_type)
+        content_parts = self._parse_content(data)
         msg_type = self._classify_msg_type(event_type)
         is_group = msg_type == "group"
         conversation_id = self._extract_to_handle(data, event_type) if is_group else ""
@@ -1104,9 +1127,16 @@ class QQChannel(BaseChannel):
             "sender_id": sender_id,
             "sender_name": sender_name,
         }
+        if isinstance(sender, dict) and type(sender.get("bot")) is bool:
+            metadata["sender_is_bot"] = sender["bot"]
         if is_group:
             metadata["conversation_id"] = conversation_id
             metadata["bot_mentioned"] = self._is_bot_mentioned(data, event_type)
+            metadata["has_mentions"] = bool(
+                metadata["bot_mentioned"]
+                or data.get("mentions")
+                or _AT_MENTION_RE.search(str(data.get("content") or ""))
+            )
 
         scene = data.get("message_scene")
         ext = scene.get("ext") if isinstance(scene, dict) else []
@@ -1643,6 +1673,45 @@ class QQChannel(BaseChannel):
             status, body = await _do(headers)
         return status, body
 
+    async def get_group_info(self, group_openid: str) -> dict[str, Any]:
+        """Fetch group metadata for a platform-allowlisted bot.
+
+        QQ limits this API to 30 requests/minute. This channel waits for a
+        slot, including token retries; callers may cancel or set a timeout.
+        Cache metadata at the caller rather than querying on every message.
+        QQ returns the group OpenID and name, not the numeric QQ group ID.
+        """
+        if not group_openid.strip():
+            raise ValueError("group_openid must not be empty")
+        http = await self._ensure_http()
+        url = f"{self._api_base}/v2/groups/{quote(group_openid, safe='')}/info"
+
+        async def _do(headers: dict[str, str]) -> tuple[int, str]:
+            await self._group_info_limiter.acquire()
+            async with http.get(url, headers=headers) as resp:
+                return resp.status, await resp.text()
+
+        headers = await self._fresh_auth_headers()
+        status, body = await _do(headers)
+        if self._is_access_token_error(status, body):
+            self._invalidate_access_token()
+            status, body = await _do(await self._fresh_auth_headers())
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"QQ group info lookup returned invalid JSON: HTTP {status}") from exc
+        if status != 200:
+            code = data.get("code") if isinstance(data, dict) else None
+            detail = (
+                f", QQ code={code}" if isinstance(code, int) or (isinstance(code, str) and code.isdecimal()) else ""
+            )
+            if str(code) == "11253":
+                detail += " (platform allowlist permission required)"
+            raise RuntimeError(f"QQ group info lookup failed: HTTP {status}{detail}")
+        if not isinstance(data, dict):
+            raise RuntimeError("QQ group info lookup returned an invalid response")
+        return data
+
     async def _ensure_access_token(self) -> str:
         """Ensure a valid OAuth2 access token is available.
 
@@ -1691,7 +1760,7 @@ class QQChannel(BaseChannel):
     # Internal: Content parsing helpers
     # =========================================================================
 
-    def _parse_content(self, data: dict[str, object], *, event_type: str = "") -> list[ContentPart]:
+    def _parse_content(self, data: dict[str, object]) -> list[ContentPart]:
         """Parse message content from QQ event data into ContentPart list."""
         parts: list[ContentPart] = []
         raw_content = str(data.get("content") or "")
@@ -1712,7 +1781,7 @@ class QQChannel(BaseChannel):
 
         # Strip media tags and @bot mentions to get clean text
         clean_text = _MEDIA_TAG_RE.sub("", raw_content)
-        clean_text = self._strip_bot_mention(clean_text, data, event_type=event_type)
+        clean_text = self._strip_bot_mention(clean_text, data)
 
         quoted = self._find_quoted_element(data)
         if quoted is not None:
@@ -1778,10 +1847,9 @@ class QQChannel(BaseChannel):
             existing_urls.add(att_url)
         return voice_transcripts
 
-    @staticmethod
-    def _strip_bot_mention(text: str, data: dict[str, object], *, event_type: str) -> str:
-        """Remove only the bot's QQ mention token from agent-facing text."""
-        bot_ids: set[str] = set()
+    def _bot_mention_ids(self, data: dict[str, object]) -> set[str]:
+        """Use authenticated user identity and event-local self markers, never AppID."""
+        bot_ids = {self._bot_user_id} if self._bot_user_id else set()
         mentions = data.get("mentions")
         if isinstance(mentions, list):
             for mention in mentions:
@@ -1791,14 +1859,15 @@ class QQChannel(BaseChannel):
                     value = mention.get(key)
                     if value:
                         bot_ids.add(str(value))
+        return bot_ids
 
+    def _strip_bot_mention(self, text: str, data: dict[str, object]) -> str:
+        """Remove only the bot's QQ mention token from agent-facing text."""
         clean = text
-        for bot_id in bot_ids:
+        for bot_id in self._bot_mention_ids(data):
             token = re.compile(rf"<@!?{re.escape(bot_id)}>\s*", re.IGNORECASE)
             clean = token.sub("", clean)
 
-        if event_type in ("GROUP_AT_MESSAGE_CREATE", "AT_MESSAGE_CREATE"):
-            clean = _AT_MENTION_RE.sub("", clean, count=1)
         return clean.strip()
 
     @staticmethod
@@ -1876,6 +1945,11 @@ class QQChannel(BaseChannel):
             author = element.get("author")
             author = author if isinstance(author, dict) else {}
             sender_id = str(author.get("member_openid") or author.get("user_openid") or author.get("id") or "unknown")
+            try:
+                timestamp = self._parse_event_timestamp(element.get("timestamp"))
+            except ValueError:
+                logger.warning("QQChannel ignored group context with an invalid or ambiguous timestamp")
+                continue
             messages.append(
                 GroupContextMessage(
                     message_id=str(element.get("id") or element_idx),
@@ -1883,7 +1957,7 @@ class QQChannel(BaseChannel):
                     sender_name=str(author.get("username") or ""),
                     text=text,
                     content=media,
-                    timestamp=self._parse_event_timestamp(element.get("timestamp")),
+                    timestamp=timestamp,
                 )
             )
         if not messages:
@@ -1959,6 +2033,7 @@ class QQChannel(BaseChannel):
         """Use QQ's event/structured mention markers as the source of truth."""
         if event_type == "GROUP_AT_MESSAGE_CREATE":
             return True
+        bot_ids = self._bot_mention_ids(data)
         mentions = data.get("mentions")
         if isinstance(mentions, list):
             for mention in mentions:
@@ -1966,21 +2041,25 @@ class QQChannel(BaseChannel):
                     continue
                 if mention.get("is_you") is True:
                     return True
-                mention_id = mention.get("id") or mention.get("user_openid") or mention.get("member_openid")
-                if mention_id is not None and str(mention_id) == self._config.app_id:
+                if any(str(mention.get(key) or "") in bot_ids for key in ("id", "user_openid", "member_openid")):
                     return True
         content = str(data.get("content") or "")
-        return f"<@!{self._config.app_id}>" in content or f"<@{self._config.app_id}>" in content
+        return any(f"<@!{bot_id}>" in content or f"<@{bot_id}>" in content for bot_id in bot_ids)
 
     @staticmethod
     def _parse_event_timestamp(value: object) -> float:
         if isinstance(value, int | float):
             return float(value)
         if isinstance(value, str) and value:
-            with contextlib.suppress(ValueError):
-                from datetime import datetime
+            from datetime import datetime
 
-                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError("QQ event timestamp is invalid") from exc
+            if parsed.utcoffset() is None:
+                raise ValueError("QQ event timestamp is missing a timezone")
+            return parsed.timestamp()
         return time.time()
 
     @staticmethod

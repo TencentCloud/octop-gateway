@@ -212,3 +212,39 @@ def test_sdk_entities_really_use_utf16() -> None:
     assert text[item.offset : item.offset + item.length] != "@Our_Bot"
     assert msg.parse_entity(item) == "@Our_Bot"
     assert accepts(msg)
+
+
+@pytest.mark.asyncio
+async def test_shared_group_policy_observes_unmentioned_humans_without_bypassing_access() -> None:
+    from octop_gateway.channels.telegram.channel import TelegramChannel, TelegramConfig
+    from octop_gateway.group_context import GroupContextConfig
+
+    async def processor(_message: Any) -> Any:
+        if False:
+            yield
+
+    config = TelegramConfig(
+        group_activation="mention",
+        group_context=GroupContextConfig(
+            enabled=True, visibility="all", activation="mention", owner_commands_only=False
+        ),
+    )
+    channel = TelegramChannel(processor, config=config)
+    channel._bot_id, channel._bot_username = 99, "Our_Bot"
+    ordinary = message()
+    assert channel._accept(ordinary)
+    native = await channel._build_message(ordinary)
+    assert native is not None
+    inbound = channel.parse_inbound(native)
+    assert inbound.metadata["sender_is_bot"] is False
+    assert inbound.metadata["bot_mentioned"] is False
+    assert inbound.metadata["has_mentions"] is False
+    directed = message(message_id=2, text="@Someone hello", entities=[entity("@Someone hello", "@Someone")])
+    native = await channel._build_message(directed)
+    assert native is not None
+    directed_inbound = channel.parse_inbound(native)
+    assert directed_inbound.metadata["has_mentions"] is True
+    assert directed_inbound.metadata["bot_mentioned"] is False
+    assert channel.group_context_manager.prepare(inbound) is None
+    config.allowed_user_ids = ["8"]
+    assert not channel._accept(ordinary)

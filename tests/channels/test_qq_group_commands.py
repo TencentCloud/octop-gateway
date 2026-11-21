@@ -26,6 +26,7 @@ def _payload(text: str, sender: str = "member", *, mentioned: bool = True) -> di
             "content": f"<@!99999> {text}" if mentioned else text,
             "author": {"member_openid": sender},
             "group_openid": "group-1",
+            "mentions": [{"id": "99999", "is_you": True}] if mentioned else [],
         },
     }
 

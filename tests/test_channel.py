@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
-from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor
+from octop_gateway.channel import BaseChannel, ChannelConfig, InboundReceipt, MessageProcessor
 from octop_gateway.group_context import GroupContextConfig
 from octop_gateway.models import (
     ChannelSubject,
@@ -66,6 +68,131 @@ class PreprocessingEchoChannel(EchoChannel):
 
     async def _preprocess_inbound(self, message: InboundMessage) -> None:
         message.metadata["bot_mentioned"] = True
+
+
+@pytest.mark.asyncio
+async def test_inbound_receipt_reports_actual_delivery() -> None:
+    channel = EchoChannel(make_echo_processor)
+    receipt = await channel.dispatch_inbound("hello")
+    assert receipt.attempted and receipt.delivered
+    assert channel.sent_messages
+
+
+@pytest.mark.asyncio
+async def test_inbound_text_filter_is_scoped_to_its_dispatch() -> None:
+    channel = EchoChannel(make_echo_processor)
+    receipt = InboundReceipt(text_filter=lambda _: "")
+    await channel.dispatch_inbound("suppressed", receipt=receipt)
+    assert not receipt.attempted and not receipt.delivered
+    assert channel.sent_messages == []
+
+    await channel.handle_inbound("normal")
+    assert channel.sent_messages == [("user1", "Echo: normal")]
+
+
+@pytest.mark.asyncio
+async def test_inbound_text_filter_failure_does_not_send_unfiltered_text() -> None:
+    def fail(_text: str) -> str:
+        raise ValueError("filter failure")
+
+    channel = EchoChannel(make_echo_processor)
+    receipt = InboundReceipt(text_filter=fail)
+    await channel.dispatch_inbound("private", receipt=receipt)
+    assert channel.sent_messages == []
+    assert not receipt.attempted
+
+
+@pytest.mark.asyncio
+async def test_input_filter_checks_preprocessed_input_and_fails_closed() -> None:
+    class EnrichingChannel(EchoChannel):
+        async def _preprocess_inbound(self, message: InboundMessage) -> None:
+            message.content.append(TextContent(text="enriched"))
+
+    channel = EnrichingChannel(make_echo_processor)
+    receipt = InboundReceipt(input_filter=lambda message: "enriched" not in message.text)
+    await channel.dispatch_inbound("message", receipt=receipt)
+    assert channel.sent_messages == []
+
+    def fail(_message: InboundMessage) -> bool:
+        raise ValueError("do not log private input")
+
+    await channel.dispatch_inbound("message", receipt=InboundReceipt(input_filter=fail))
+    assert channel.sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_inbound_receipt_can_hide_thinking_only_for_its_dispatch() -> None:
+    async def processor(_message: InboundMessage) -> AsyncIterator[MessageEvent]:
+        yield MessageEvent.thinking("complete reasoning")
+        yield MessageEvent.thinking_delta("streamed reasoning")
+        yield MessageEvent.flush()
+        yield MessageEvent.delta("<think>embedded reasoning</think>visible answer")
+        yield MessageEvent.completed()
+
+    channel = EchoChannel(processor, ChannelConfig(show_thinking=True))
+    await channel.dispatch_inbound("automatic", receipt=InboundReceipt(suppress_thinking=True))
+    assert channel.sent_messages == [("user1", "visible answer")]
+
+    channel.sent_messages.clear()
+    await channel.handle_inbound("normal")
+    assert any("complete reasoning" in text for _, text in channel.sent_messages)
+    assert any("streamed reasoning" in text for _, text in channel.sent_messages)
+    assert any("embedded reasoning" in text for _, text in channel.sent_messages)
+
+
+@pytest.mark.asyncio
+async def test_admitted_dispatch_preserves_adapter_override_and_resets_on_cancel() -> None:
+    calls = []
+
+    class NativeChannel(EchoChannel):
+        async def handle_inbound(self, raw_payload: Any) -> None:
+            calls.append(raw_payload)
+            await super().handle_inbound(raw_payload)
+
+    channel = NativeChannel(make_echo_processor)
+    channel._send_text = AsyncMock(side_effect=asyncio.CancelledError())
+    receipt = InboundReceipt()
+    with pytest.raises(asyncio.CancelledError):
+        await channel.dispatch_inbound("cancelled", receipt=receipt)
+    assert receipt.attempted and not receipt.delivered
+    channel._send_text = AsyncMock()
+    assert await channel.handle_inbound("native") is None
+    assert calls == ["cancelled", "native"]
+    assert not receipt.delivered
+
+
+@pytest.mark.asyncio
+async def test_forced_activation_keeps_visibility_and_tool_permissions() -> None:
+    channel = EchoChannel(
+        make_echo_processor,
+        ChannelConfig(
+            group_context=GroupContextConfig.from_dict(
+                {
+                    "enabled": True,
+                    "visibility": "all",
+                    "activation": "mention",
+                    "owner_tools_only": True,
+                }
+            )
+        ),
+    )
+    message = InboundMessage(
+        channel_id=channel.channel_id,
+        channel_type="echo",
+        content=[TextContent(text="hello")],
+        channel_subject=ChannelSubject(subject_id="group", chat_type="group"),
+        metadata={"chat_type": "group", "sender_id": "member"},
+    )
+    receipt = await channel.dispatch_inbound(message, force_activation=True)
+    assert receipt.delivered
+    assert message.allowed_tools == []
+
+    channel._group_context = channel.group_context_manager.__class__(
+        GroupContextConfig.from_dict({"enabled": True, "visibility": "mention_only"})
+    )
+    blocked = InboundReceipt()
+    await channel.dispatch_inbound(message, force_activation=True, receipt=blocked)
+    assert not blocked.attempted
 
 
 # --- Tests ---
@@ -756,6 +883,41 @@ def test_tool_protected_groups_are_not_batched_even_without_passive_context() ->
         metadata={"sender_id": "member"},
     )
     assert channel.should_batch_inbound(message) is False
+
+
+@pytest.mark.asyncio
+async def test_text_filter_tail_is_sent_once_after_processing() -> None:
+    async def processor(message: InboundMessage) -> AsyncIterator[MessageEvent]:
+        yield MessageEvent.text("unfinished")
+        yield MessageEvent.completed()
+
+    channel = EchoChannel(processor)
+    calls = []
+    receipt = InboundReceipt(
+        text_filter=lambda text: calls.append(text) or "",
+        text_filter_finish=lambda: "released tail",
+    )
+    await channel.dispatch_inbound("hello", receipt=receipt)
+    assert calls == ["unfinished"]
+    assert channel.sent_messages == [("user1", "released tail")]
+    assert receipt.delivered
+
+
+@pytest.mark.asyncio
+async def test_text_filter_tail_is_not_flushed_after_failed_processing() -> None:
+    async def processor(message: InboundMessage) -> AsyncIterator[MessageEvent]:
+        yield MessageEvent.text("unfinished")
+        yield MessageEvent.error_event("failed")
+
+    channel = EchoChannel(processor)
+    finished = []
+    receipt = InboundReceipt(
+        text_filter=lambda text: "",
+        text_filter_finish=lambda: finished.append(True) or "must not send",
+    )
+    await channel.dispatch_inbound("hello", receipt=receipt)
+    assert finished == []
+    assert channel.sent_messages == []
 
 
 @pytest.mark.asyncio

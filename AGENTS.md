@@ -53,11 +53,13 @@ Multi-platform IM channel bridge with a unified message abstraction for AI agent
 
 Core pattern: a `MessageProcessor` (async generator) feeds events through a `BaseChannel` managed by `ChannelManager`.
 
-Built-in channels: Discord, QQ, Feishu (Lark), DingTalk, WeCom (Enterprise WeChat), WeChat iLink, Yuanbao, Xiaoyi, MQTT, Telegram.
+Built-in channels: Discord, Slack, WhatsApp, QQ, Feishu (Lark), DingTalk, WeCom (Enterprise WeChat), WeChat iLink, Yuanbao, Xiaoyi, MQTT, Telegram.
 
 | Platform | Channel kind | Transport | Text | Media |
 |----------|--------------|-----------|------|-------|
 | Discord | `discord` | Gateway WebSocket + REST | ✅ | ✅ |
+| Slack | `slack` | Socket Mode WebSocket + Web API | ✅ | ✅ |
+| WhatsApp | `whatsapp` | Meta Cloud API / WAHA / Evolution QR Bridge | ✅ | ✅ |
 | 飞书（Lark） | `feishu` | WebSocket + REST | ✅ | ✅ |
 | 钉钉 | `dingtalk` | Stream | ✅ | ✅ |
 | QQ | `qq` | WebSocket | ✅ | ✅ |
@@ -93,7 +95,7 @@ src/octop_gateway/
 ├── media.py           # MediaBackend ABC + FileSystemMediaBackend
 ├── utils.py           # Debouncer, content helpers
 └── channels/          # one module per platform; lazy-loaded via channels/__init__.py
-    ├── discord.py  feishu.py  dingtalk.py  wecom.py  mqtt.py
+    ├── discord.py  slack.py  whatsapp.py  feishu.py  dingtalk.py  wecom.py  mqtt.py
     ├── qq/            # channel.py + stream.py
     ├── telegram/      # channel.py
     ├── weixin/        # api.py + login_qr.py + media.py

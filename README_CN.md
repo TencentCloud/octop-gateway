@@ -38,7 +38,7 @@
 
 | | 特性 | 说明 |
 |---|------|------|
-| 🔌 | **10 个平台，一个处理器** | 飞书、钉钉、QQ、企业微信、微信 iLink、元宝、小艺、MQTT、Telegram、Discord —— 全部共用一套接口 |
+| 🔌 | **12 个平台，一个处理器** | 飞书、钉钉、QQ、企业微信、微信 iLink、元宝、小艺、MQTT、Telegram、Discord、Slack、WhatsApp —— 全部共用一套接口 |
 | 🧩 | **统一抽象** | `BaseChannel` 把各平台的差异，收敛为通用的 `InboundMessage` / `MessageEvent` 模型 |
 | 📨 | **流式事件** | 你的处理器是异步生成器，产出 `MessageEvent`，原生支持逐字流式输出 |
 | 💾 | **可插拔媒体** | `MediaBackend` 负责附件存储，默认提供 `FileSystemMediaBackend` |
@@ -52,7 +52,7 @@
 | 层级 | 技术 |
 |------|------|
 | **语言** | Python 3.12+ |
-| **通道模型** | `BaseChannel` + 10 个内置平台适配器 |
+| **通道模型** | `BaseChannel` + 12 个内置平台适配器 |
 | **消息模型** | `InboundMessage` / `MessageEvent` / `ContentPart` |
 | **编排** | `ChannelManager`（异步队列 + 工作池） |
 | **媒体** | `MediaBackend`（默认 `FileSystemMediaBackend`） |
@@ -74,6 +74,9 @@
 | 小艺 | `xiaoyi` | — | ✅ | ✅ |
 | MQTT | `mqtt` | MQTT | ✅ | ✅ |
 | Telegram | `telegram` | 长轮询 | ✅ | ✅ |
+| Discord | `discord` | Gateway WebSocket + REST | ✅ | ✅ |
+| Slack | `slack` | Socket Mode WebSocket + Web API | ✅ | ✅ |
+| WhatsApp | `whatsapp` | Meta Cloud API / WAHA / Evolution 扫码桥接 | ✅ | ✅ |
 
 ##### Discord
 
@@ -276,3 +279,7 @@ make all              # 格式化 + 类型检查 + 测试
 <a href="https://github.com/TencentCloud/octop-gateway/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=TencentCloud/octop-gateway" />
 </a>
+
+## 入站插件与 QQ 群资料
+
+宿主可注册逐条消息的前置处理钩子，并查询具备平台白名单权限的 QQ 群资料。接口、取消行为和频控见[使用说明](docs/inbound-admission.md)。
