@@ -23,6 +23,7 @@ EPHEMERAL_PUSH_META = frozenset(
         "response_url",
         "context_token",
         "webhook_url",
+        "ts",
     },
 )
 
