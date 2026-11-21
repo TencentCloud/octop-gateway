@@ -87,6 +87,29 @@ class TestDingTalkChannelUnit:
         assert "hello dingtalk" in msg.text
         assert msg.channel_subject is not None
         assert msg.channel_subject.subject_id == "staff_001"
+        assert msg.channel_subject.chat_type == "direct"
+
+    def test_parse_inbound_group_routes_by_conversation_id_and_deduplicates(self) -> None:
+        config = DingTalkConfig(app_key="test_key", app_secret="test_secret")
+        ch = DingTalkChannel(processor=_noop_processor, config=config)
+        payload = {
+            "msgtype": "text",
+            "text": {"content": "@Bot hello group"},
+            "sender_id": "staff_group_member",
+            "sender_nick": "Group Member",
+            "conversation_id": "cid_group_999",
+            "conversation_type": "2",
+            "msg_id": "msg_dt_grp_1",
+        }
+        msg = ch.parse_inbound(payload)
+        assert msg.channel_subject is not None
+        assert msg.channel_subject.subject_id == "cid_group_999"
+        assert msg.channel_subject.chat_type == "group"
+        assert msg.metadata["sender_id"] == "staff_group_member"
+        assert msg.metadata["bot_mentioned"] is True
+        assert ch._is_duplicate("msg_dt_grp_1") is False
+        assert ch._is_duplicate("msg_dt_grp_1") is True
+        assert ch.dropped_duplicate == 1
 
     def test_parse_inbound_with_webhook(self) -> None:
         config = DingTalkConfig(app_key="test_key", app_secret="test_secret")

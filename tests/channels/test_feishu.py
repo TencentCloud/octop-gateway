@@ -68,6 +68,35 @@ class TestFeishuChannelUnit:
         config = _make_config()
         assert config.app_id == _FEISHU_APP_ID
         assert config.app_secret == _FEISHU_APP_SECRET
+        assert config.domain == "feishu"
+
+    def test_lark_international_domain_resolution(self) -> None:
+        lark_cfg = FeishuConfig(app_id="cli_1", app_secret="sec_1", domain="lark")
+        ch = FeishuChannel(processor=_noop_processor, config=lark_cfg)
+        assert ch._api_base == "https://open.larksuite.com/open-apis"
+        assert ch._ws_domain == "https://open.larksuite.com"
+
+        custom_cfg = FeishuConfig(app_id="cli_1", app_secret="sec_1", domain="https://open.larksuite.com")
+        ch2 = FeishuChannel(processor=_noop_processor, config=custom_cfg)
+        assert ch2._api_base == "https://open.larksuite.com/open-apis"
+        assert ch2._ws_domain == "https://open.larksuite.com"
+
+    def test_parse_inbound_parent_id_and_quote(self) -> None:
+        ch = FeishuChannel(processor=_noop_processor, config=_make_config())
+        payload = {
+            "message_id": "om_child",
+            "parent_id": "om_parent",
+            "reply_quote_text": "Quoted parent text",
+            "message_type": "text",
+            "content": '{"text":"my reply"}',
+            "chat_id": "oc_chat001",
+            "chat_type": "p2p",
+            "sender": {"sender_id": "ou_abc123", "sender_type": "user"},
+        }
+        msg = ch.parse_inbound(payload)
+        assert msg.metadata["parent_id"] == "om_parent"
+        assert msg.metadata["reply_to_message_id"] == "om_parent"
+        assert msg.metadata["reply_quote_text"] == "Quoted parent text"
 
     def test_parse_inbound_text(self) -> None:
         ch = FeishuChannel(processor=_noop_processor, config=_make_config())
