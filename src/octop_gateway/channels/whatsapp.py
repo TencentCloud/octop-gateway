@@ -27,7 +27,9 @@ import json
 import logging
 import re
 import time
+import uuid
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Self
 from urllib.parse import urlencode, urlparse, urlunparse
@@ -170,12 +172,15 @@ class WhatsAppConfig(ChannelConfig):
     use_websocket: bool = True
 
     # Access & reply policy
+    owner_only: bool = False
     allow_all_dms: bool = True
     allowed_user_ids: list[str] = field(default_factory=list)
     allow_all_groups: bool = True
     allowed_group_ids: list[str] = field(default_factory=list)
+    ignore_mention_all: bool = False
     reply_to_message: bool = True
     show_typing: bool = True
+    status_reactions: bool = False
     http_proxy: str = ""
     probe_mode: str = ""
     group_context: GroupContextConfig = field(
@@ -243,6 +248,20 @@ WhatsAppConfig.field_aliases = {  # type: ignore[attr-defined]
 # =========================================================================
 
 
+_BRIDGE_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15.0)
+
+
+def _validate_bridge_url(bridge_url: str) -> str:
+    """Validate and normalize a WAHA / Evolution API bridge base URL."""
+    base = bridge_url.strip().rstrip("/")
+    if not base:
+        raise ValueError("bridge_url is required")
+    parsed = urlparse(base)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("bridge_url must be a valid http:// or https:// URL")
+    return base
+
+
 def _bridge_headers(provider: str, api_key: str) -> dict[str, str]:
     headers: dict[str, str] = {"Accept": "application/json"}
     key = api_key.strip()
@@ -271,15 +290,13 @@ async def fetch_whatsapp_bridge_qr(
       - ``session_name``: active session/instance name
       - ``provider``: ``"waha"`` or ``"evolution"``
     """
-    base = bridge_url.rstrip("/")
-    if not base:
-        raise ValueError("bridge_url is required to fetch WhatsApp QR code")
+    base = _validate_bridge_url(bridge_url)
     mode = "evolution" if provider.strip().lower() == "evolution" else "waha"
     session = session_name.strip() or "default"
     headers = _bridge_headers(mode, api_key)
 
     owns_session = http is None
-    client = http or aiohttp.ClientSession()
+    client = http or aiohttp.ClientSession(timeout=_BRIDGE_HTTP_TIMEOUT)
     try:
         if mode == "evolution":
             async with client.get(f"{base}/instance/connect/{session}", headers=headers) as resp:
@@ -304,7 +321,8 @@ async def fetch_whatsapp_bridge_qr(
                 resp.raise_for_status()
                 data: dict[str, Any] = await resp.json()
                 code = str(data.get("base64") or data.get("code") or "")
-                state = str((data.get("instance") or {}).get("state") or ("SCAN_QR_CODE" if code else "CONNECTED"))
+                instance_obj = _as_dict(data.get("instance"))
+                state = str(instance_obj.get("state") or ("SCAN_QR_CODE" if code else "CONNECTED"))
                 return {
                     "status": state.upper(),
                     "qrcode": code,
@@ -377,15 +395,13 @@ async def check_whatsapp_bridge_status(
     http: aiohttp.ClientSession | None = None,
 ) -> dict[str, Any]:
     """Poll the connection status of a WAHA or Evolution API WhatsApp session."""
-    base = bridge_url.rstrip("/")
-    if not base:
-        raise ValueError("bridge_url is required")
+    base = _validate_bridge_url(bridge_url)
     mode = "evolution" if provider.strip().lower() == "evolution" else "waha"
     session = session_name.strip() or "default"
     headers = _bridge_headers(mode, api_key)
 
     owns_session = http is None
-    client = http or aiohttp.ClientSession()
+    client = http or aiohttp.ClientSession(timeout=_BRIDGE_HTTP_TIMEOUT)
     try:
         if mode == "evolution":
             async with client.get(f"{base}/instance/connectionState/{session}", headers=headers) as resp:
@@ -450,6 +466,7 @@ class WhatsAppChannel(BaseChannel):
         )
         self._display_phone_number: str = ""
         self._self_jid: str = ""
+        self._connection_session: str | None = None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._ws_task: asyncio.Task[None] | None = None
         self._stopping = False
@@ -458,7 +475,7 @@ class WhatsAppChannel(BaseChannel):
     def _default_constraints(self) -> ChannelConstraints:
         return ChannelConstraints(
             send_rate_limit=(10, 1.0),
-            typing_keepalive_interval=0.0,
+            typing_keepalive_interval=5.0 if self._config.show_typing else 0.0,
             show_tool_hints=True,
         )
 
@@ -522,6 +539,7 @@ class WhatsAppChannel(BaseChannel):
                 )
         elif mode == "evolution":
             await self._verify_evolution_bridge()
+        self._connection_session = f"whatsapp-{uuid.uuid4().hex[:12]}"
 
     async def stop(self) -> None:
         """Stop WebSocket listener and close HTTP session."""
@@ -610,6 +628,7 @@ class WhatsAppChannel(BaseChannel):
                     proxy=self._proxy(),
                 ) as ws:
                     self._ws = ws
+                    self._connection_session = f"whatsapp-{uuid.uuid4().hex[:12]}"
                     backoff = 1.0
                     async for msg in ws:
                         if self._stopping:
@@ -645,23 +664,73 @@ class WhatsAppChannel(BaseChannel):
     # Webhook Verification & Event Extraction
     # =========================================================================
 
-    def verify_webhook_challenge(self, mode: str, token: str, challenge: str) -> str | None:
+    def verify_webhook_challenge(
+        self,
+        mode: str,
+        token: str,
+        challenge: str,
+        *,
+        require_token: bool = False,
+    ) -> str | None:
         """Verify Meta Cloud API GET webhook subscription challenge."""
         expected = self._config.verify_token.strip()
-        if mode == "subscribe" and (not expected or hmac.compare_digest(expected, token.strip())):
+        if not expected:
+            return challenge if (mode == "subscribe" and not require_token) else None
+        if mode == "subscribe" and hmac.compare_digest(expected, token.strip()):
             return challenge
         return None
 
-    def verify_webhook_signature(self, signature_header: str, raw_body: bytes | str) -> bool:
+    def verify_webhook_signature(
+        self,
+        signature_header: str,
+        raw_body: bytes | str,
+        *,
+        require_secret: bool = False,
+    ) -> bool:
         """Verify Meta ``X-Hub-Signature-256`` HMAC-SHA256 webhook signature."""
         secret = self._config.app_secret.strip()
         if not secret:
-            return True
+            return not require_secret
         if not signature_header or not signature_header.startswith("sha256="):
             return False
         body_bytes = raw_body.encode("utf-8") if isinstance(raw_body, str) else raw_body
         expected = "sha256=" + hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
         return hmac.compare_digest(expected, signature_header.strip())
+
+    def verify_webhook_request(
+        self,
+        headers: Mapping[str, str],
+        raw_body: bytes | str,
+        *,
+        require_secret: bool = True,
+    ) -> bool:
+        """Verify an inbound HTTP webhook request across Cloud API and bridge modes.
+
+        - If ``app_secret`` is configured, validates ``X-Hub-Signature-256``.
+        - For WAHA / Evolution bridge modes without ``app_secret``, accepts a matching
+          ``bridge_api_key`` supplied via ``X-Api-Key``, ``apikey``, or ``Authorization: Bearer``.
+        - When ``require_secret=True`` (default for unauthenticated HTTP endpoints),
+          rejects requests if no webhook verification secret / key is configured.
+        """
+        lower_headers = {k.lower(): v for k, v in headers.items()}
+        if self._config.app_secret.strip():
+            return self.verify_webhook_signature(
+                lower_headers.get("x-hub-signature-256", ""),
+                raw_body,
+                require_secret=True,
+            )
+        if self.provider in ("waha", "evolution"):
+            expected_key = self._config.bridge_api_key.strip()
+            if expected_key:
+                auth_header = lower_headers.get("authorization", "").strip()
+                bearer_token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else ""
+                candidates = (
+                    lower_headers.get("x-api-key", "").strip(),
+                    lower_headers.get("apikey", "").strip(),
+                    bearer_token,
+                )
+                return any(c and hmac.compare_digest(expected_key, c) for c in candidates)
+        return not require_secret
 
     def extract_webhook_messages(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         """Extract actionable inbound message events from Cloud API, WAHA, or Evolution payloads.
@@ -725,9 +794,13 @@ class WhatsAppChannel(BaseChannel):
 
         # Case 3: Evolution API webhook envelope (event == "messages.upsert" and "data" dict)
         if payload.get("event") == "messages.upsert" and isinstance(payload.get("data"), dict):
+            evo_sender = str(payload.get("sender") or "")
+            if evo_sender:
+                self._self_jid = evo_sender
             enriched = {
                 "_format": "evolution",
                 "instance": str(payload.get("instance") or self._config.session_name),
+                "sender": evo_sender,
                 "data": payload["data"],
             }
             if self._should_accept_normalized(enriched):
@@ -741,22 +814,59 @@ class WhatsAppChannel(BaseChannel):
 
     def _is_allowed_sender(self, sender_id: str, chat_id: str, *, is_group: bool) -> bool:
         norm_sender = normalize_whatsapp_identifier(sender_id)
-        if is_group:
-            if self._config.allowed_group_ids:
+        if self._config.owner_only:
+            owner_pool = {
+                normalize_whatsapp_identifier(u)
+                for u in (
+                    *(self._config.group_context.owner_ids or []),
+                    *(self._config.allowed_user_ids or []),
+                )
+                if str(u).strip()
+            }
+            if not owner_pool or norm_sender not in owner_pool:
+                return False
+            if is_group and not self._config.allow_all_groups:
+                if not self._config.allowed_group_ids:
+                    return False
                 allowed_groups = {g.strip() for g in self._config.allowed_group_ids if g.strip()}
                 if chat_id not in allowed_groups and normalize_whatsapp_identifier(chat_id) not in allowed_groups:
                     return False
-            elif not self._config.allow_all_groups:
-                return False
+            return True
+
+        if is_group:
+            if not self._config.allow_all_groups:
+                if not self._config.allowed_group_ids:
+                    return False
+                allowed_groups = {g.strip() for g in self._config.allowed_group_ids if g.strip()}
+                if chat_id not in allowed_groups and normalize_whatsapp_identifier(chat_id) not in allowed_groups:
+                    return False
             if self._config.allowed_user_ids:
                 allowed_users = {normalize_whatsapp_identifier(u) for u in self._config.allowed_user_ids if u.strip()}
                 return norm_sender in allowed_users
             return True
 
+        if not self._config.allow_all_dms:
+            if not self._config.allowed_user_ids:
+                return False
+            allowed_users = {normalize_whatsapp_identifier(u) for u in self._config.allowed_user_ids if u.strip()}
+            return norm_sender in allowed_users
         if self._config.allowed_user_ids:
             allowed_users = {normalize_whatsapp_identifier(u) for u in self._config.allowed_user_ids if u.strip()}
             return norm_sender in allowed_users
-        return self._config.allow_all_dms
+        return True
+
+    async def _preprocess_inbound(self, message: InboundMessage) -> None:
+        meta = message.metadata
+        if isinstance(meta, dict) and self._config.group_context.owner_ids:
+            sender = str(meta.get("sender_id") or "").strip()
+            norm_sender = normalize_whatsapp_identifier(sender)
+            if norm_sender:
+                for raw_owner in self._config.group_context.owner_ids:
+                    owner_str = str(raw_owner).strip()
+                    if owner_str and normalize_whatsapp_identifier(owner_str) == norm_sender:
+                        meta["sender_id"] = owner_str
+                        break
+        await super()._preprocess_inbound(message)
 
     def _should_accept_normalized(self, item: dict[str, Any]) -> bool:
         fmt = item.get("_format")
@@ -898,16 +1008,22 @@ class WhatsAppChannel(BaseChannel):
         reply_to_id = str(context_obj.get("id") or "")
         reply_quote_text = str(context_obj.get("quoted_text") or "").strip()
 
+        has_mass_mention = bool(re.search(r"@(all|everyone|here)\b", raw_text, re.IGNORECASE))
+        bot_mentioned = not is_group or bool(msg.get("bot_mentioned"))
+        if is_group and self._config.ignore_mention_all and has_mass_mention and not msg.get("bot_mentioned"):
+            bot_mentioned = False
+
         metadata: dict[str, Any] = {
             "provider": "cloud",
             "message_id": msg_id,
             "chat_id": chat_id,
+            "conversation_id": chat_id,
             "recipient_id": chat_id,
             "sender_id": sender_id,
             "sender_name": sender_name,
             "is_dm": not is_group,
             "is_group": is_group,
-            "bot_mentioned": not is_group or bool(msg.get("bot_mentioned")),
+            "bot_mentioned": bot_mentioned,
             "has_mentions": "@" in raw_text,
         }
         if reply_to_id:
@@ -928,7 +1044,7 @@ class WhatsAppChannel(BaseChannel):
             channel_id=self._channel_id,
             channel_type=self.channel_type,
             tenant_id=self._tenant_id,
-            channel_session_id=chat_id,
+            channel_session_id=self._connection_session or f"{self._channel_id}-unconnected",
             channel_subject=subject,
             content=parts,
             timestamp=timestamp,
@@ -966,13 +1082,15 @@ class WhatsAppChannel(BaseChannel):
             mentioned_jids = [str(x) for x in data_ext["mentionedJidList"]]
 
         has_mentions = bool(mentioned_jids) or ("@" in raw_text)
-        bot_mentioned = not is_group
-        if is_group and (
+        has_mass_mention = bool(re.search(r"@(all|everyone|here)\b", raw_text, re.IGNORECASE))
+        explicit_self_mention = bool(
             (self_jid and self_jid in mentioned_jids)
             or (self_num and any(normalize_whatsapp_identifier(m) == self_num for m in mentioned_jids))
             or (self_num and f"@{self_num}" in raw_text)
-        ):
-            bot_mentioned = True
+        )
+        if self._config.ignore_mention_all and has_mass_mention and not (self_num and f"@{self_num}" in raw_text):
+            explicit_self_mention = False
+        bot_mentioned = (not is_group) or explicit_self_mention
 
         cleaned_text = raw_text
         if is_group and self_num:
@@ -1015,6 +1133,7 @@ class WhatsAppChannel(BaseChannel):
             "session_name": str(envelope.get("session") or self._config.session_name),
             "message_id": msg_id,
             "chat_id": chat_id,
+            "conversation_id": chat_id,
             "recipient_id": chat_id,
             "sender_id": sender_id,
             "sender_name": sender_name,
@@ -1041,7 +1160,7 @@ class WhatsAppChannel(BaseChannel):
             channel_id=self._channel_id,
             channel_type=self.channel_type,
             tenant_id=self._tenant_id,
-            channel_session_id=chat_id,
+            channel_session_id=self._connection_session or f"{self._channel_id}-unconnected",
             channel_subject=subject,
             content=parts,
             timestamp=timestamp,
@@ -1079,13 +1198,27 @@ class WhatsAppChannel(BaseChannel):
             or _as_dict(msg_obj.get("imageMessage")).get("contextInfo")
         )
 
+        self_jid = str(envelope.get("sender") or self._self_jid or "")
+        self_num = normalize_whatsapp_identifier(self_jid)
         mentioned_jids = [str(x) for x in _as_list(context_info.get("mentionedJid"))]
         has_mentions = bool(mentioned_jids) or ("@" in raw_text)
-        bot_mentioned = not is_group or bool(mentioned_jids)
+        has_mass_mention = bool(re.search(r"@(all|everyone|here)\b", raw_text, re.IGNORECASE))
+        explicit_self_mention = bool(
+            (self_jid and self_jid in mentioned_jids)
+            or (self_num and any(normalize_whatsapp_identifier(m) == self_num for m in mentioned_jids))
+            or (self_num and f"@{self_num}" in raw_text)
+        )
+        if self._config.ignore_mention_all and has_mass_mention and not (self_num and f"@{self_num}" in raw_text):
+            explicit_self_mention = False
+        bot_mentioned = (not is_group) or explicit_self_mention
+
+        cleaned_text = raw_text
+        if is_group and self_num:
+            cleaned_text = re.sub(rf"@{re.escape(self_num)}\b", "", cleaned_text).strip()
 
         parts: list[ContentPart] = []
-        if raw_text:
-            parts.append(TextContent(text=raw_text))
+        if cleaned_text:
+            parts.append(TextContent(text=cleaned_text))
 
         media_b64 = str(msg_obj.get("base64") or data.get("base64") or "")
         media_url = str(data.get("mediaUrl") or "")
@@ -1129,6 +1262,7 @@ class WhatsAppChannel(BaseChannel):
             "session_name": str(envelope.get("instance") or self._config.session_name),
             "message_id": msg_id,
             "chat_id": chat_id,
+            "conversation_id": chat_id,
             "recipient_id": chat_id,
             "sender_id": sender_id,
             "sender_name": sender_name,
@@ -1155,7 +1289,7 @@ class WhatsAppChannel(BaseChannel):
             channel_id=self._channel_id,
             channel_type=self.channel_type,
             tenant_id=self._tenant_id,
-            channel_session_id=chat_id,
+            channel_session_id=self._connection_session or f"{self._channel_id}-unconnected",
             channel_subject=subject,
             content=parts,
             timestamp=timestamp,
@@ -1223,6 +1357,82 @@ class WhatsAppChannel(BaseChannel):
                     proxy=self._proxy(),
                 ) as resp:
                     await resp.read()
+
+    async def _send_reaction(self, subject: ChannelSubject, emoji: str) -> None:
+        meta = subject.metadata or {}
+        chat_id = str(meta.get("chat_id") or meta.get("recipient_id") or subject.subject_id or "").strip()
+        msg_id = str(meta.get("message_id") or "").strip()
+        if not chat_id or not msg_id:
+            return
+        mode = self.provider
+        http = await self._ensure_http()
+        with contextlib.suppress(Exception):
+            if mode == "cloud":
+                headers = {
+                    "Authorization": f"Bearer {self._config.access_token}",
+                    "Content-Type": "application/json",
+                }
+                to_number = normalize_whatsapp_identifier(chat_id) if not chat_id.endswith("@g.us") else chat_id
+                payload: dict[str, Any] = {
+                    "messaging_product": "whatsapp",
+                    "recipient_type": "individual",
+                    "to": to_number,
+                    "type": "reaction",
+                    "reaction": {"message_id": msg_id, "emoji": emoji},
+                }
+                async with http.post(
+                    self._cloud_url(f"{self._config.phone_number_id}/messages"),
+                    headers=headers,
+                    json=payload,
+                    proxy=self._proxy(),
+                ) as resp:
+                    await resp.read()
+            elif mode == "waha":
+                headers = _bridge_headers("waha", self._config.bridge_api_key)
+                payload = {
+                    "session": self._config.session_name.strip() or "default",
+                    "messageId": msg_id,
+                    "reaction": emoji,
+                }
+                async with http.put(
+                    self._bridge_url("api/reaction"),
+                    headers=headers,
+                    json=payload,
+                    proxy=self._proxy(),
+                ) as resp:
+                    await resp.read()
+            elif mode == "evolution":
+                headers = _bridge_headers("evolution", self._config.bridge_api_key)
+                session = self._config.session_name.strip() or "default"
+                payload = {
+                    "key": {
+                        "remoteJid": chat_id,
+                        "fromMe": False,
+                        "id": msg_id,
+                    },
+                    "reaction": emoji,
+                }
+                async with http.post(
+                    self._bridge_url(f"message/sendReaction/{session}"),
+                    headers=headers,
+                    json=payload,
+                    proxy=self._proxy(),
+                ) as resp:
+                    await resp.read()
+
+    async def _process_inbound(self, message: InboundMessage, subject: ChannelSubject) -> bool:
+        use_reactions = bool(self._config.status_reactions and (subject.metadata or {}).get("message_id"))
+        if use_reactions:
+            await self._send_reaction(subject, "⏳")
+        try:
+            ok = await super()._process_inbound(message, subject)
+            if use_reactions:
+                await self._send_reaction(subject, "✅" if ok else "")
+            return ok
+        except Exception:
+            if use_reactions:
+                await self._send_reaction(subject, "")
+            raise
 
     async def _send_text(self, subject: ChannelSubject, text: str) -> None:
         if not text:
@@ -1511,11 +1721,30 @@ class WhatsAppChannel(BaseChannel):
                 data = await bin_resp.read()
                 return data, content_type
 
-        # Bridge or external URL download
+        # Bridge or external URL download — use strict parsed host/origin checks
+        # so credentials are never leaked via substring or prefix confusion.
         headers: dict[str, str] = {}
-        if self._config.bridge_url and url.startswith(self._config.bridge_url.rstrip("/")):
-            headers.update(_bridge_headers(self.provider, self._config.bridge_api_key))
-        elif self._config.access_token and ("facebook.com" in url or "fbcdn.net" in url or "whatsapp.net" in url):
+        parsed_url = urlparse(url)
+        url_host = (parsed_url.hostname or "").lower()
+        if self._config.bridge_url.strip():
+            bridge_parsed = urlparse(self._config.bridge_url.strip().rstrip("/"))
+            bridge_path = bridge_parsed.path.rstrip("/")
+            same_origin = (
+                parsed_url.scheme == bridge_parsed.scheme
+                and parsed_url.netloc.lower() == bridge_parsed.netloc.lower()
+                and (not bridge_path or parsed_url.path == bridge_path or parsed_url.path.startswith(f"{bridge_path}/"))
+            )
+            if same_origin:
+                headers.update(_bridge_headers(self.provider, self._config.bridge_api_key))
+        if (
+            not headers
+            and self._config.access_token
+            and parsed_url.scheme == "https"
+            and (
+                url_host in ("facebook.com", "fbcdn.net", "fbsbx.com", "whatsapp.net")
+                or url_host.endswith((".facebook.com", ".fbcdn.net", ".fbsbx.com", ".whatsapp.net"))
+            )
+        ):
             headers["Authorization"] = f"Bearer {self._config.access_token}"
 
         async with http.get(url, headers=headers, proxy=self._proxy()) as resp:

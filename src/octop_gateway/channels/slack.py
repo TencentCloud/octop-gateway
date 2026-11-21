@@ -22,6 +22,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Literal, Self
@@ -29,8 +30,14 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor, _guess_content_type
-from octop_gateway.constraints import ChannelConstraints
+from octop_gateway.channel import (
+    BaseChannel,
+    ChannelConfig,
+    MessageProcessor,
+    _guess_content_type,
+    current_inbound_receipt,
+)
+from octop_gateway.constraints import ChannelConstraints, ReplyTimeoutGuard, tool_hint_message
 from octop_gateway.group_context import GroupContextConfig
 from octop_gateway.models import (
     AudioContent,
@@ -39,11 +46,12 @@ from octop_gateway.models import (
     FileContent,
     ImageContent,
     InboundMessage,
+    MessageEventType,
     TextContent,
     VideoContent,
 )
 from octop_gateway.push_routing import alias_subject_fields
-from octop_gateway.utils import extract_media, extract_text
+from octop_gateway.utils import close_event_stream, extract_media, extract_text
 
 logger = logging.getLogger(__name__)
 
@@ -120,12 +128,16 @@ class SlackConfig(ChannelConfig):
     app_token: str = ""
     signing_secret: str = ""
     api_base: str = "https://slack.com/api"
+    owner_only: bool = False
     allow_all_channels: bool = True
     allowed_channel_ids: list[str] = field(default_factory=list)
     allow_all_dms: bool = True
     allowed_user_ids: list[str] = field(default_factory=list)
+    ignore_mention_all: bool = False
     reply_in_thread: bool = True
     thread_isolation: bool = False
+    streaming_mode: str = "off"
+    status_reactions: bool = False
     http_proxy: str = ""
     probe_mode: str = ""
     group_context: GroupContextConfig = field(
@@ -182,6 +194,7 @@ class SlackChannel(BaseChannel):
         )
         self._bot_user_id: str = ""
         self._team_id: str = ""
+        self._connection_session: str | None = None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._ws_task: asyncio.Task[None] | None = None
         self._stopping = False
@@ -234,6 +247,7 @@ class SlackChannel(BaseChannel):
 
         self._stopping = False
         await self._verify_auth()
+        self._connection_session = f"slack-{uuid.uuid4().hex[:12]}"
 
         if self._config.app_token:
             ws_url = await self._open_socket_connection()
@@ -305,6 +319,7 @@ class SlackChannel(BaseChannel):
                     proxy=self._proxy(),
                 ) as ws:
                     self._ws = ws
+                    self._connection_session = f"slack-{uuid.uuid4().hex[:12]}"
                     ws_url = None  # Force fresh URL on next reconnect
                     backoff = 1.0
                     async for msg in ws:
@@ -371,11 +386,12 @@ class SlackChannel(BaseChannel):
         raw_body: bytes | str,
         *,
         max_skew_seconds: int = 300,
+        require_secret: bool = False,
     ) -> bool:
         """Verify ``X-Slack-Signature`` HMAC-SHA256 signature."""
         secret = self._config.signing_secret.strip()
         if not secret:
-            return True
+            return not require_secret
         if not timestamp or not signature:
             return False
         try:
@@ -412,15 +428,28 @@ class SlackChannel(BaseChannel):
         return channel_type in ("im", "mpim") or channel_id.startswith("D")
 
     def _is_allowed(self, channel_id: str, user_id: str, *, is_dm: bool) -> bool:
+        if self._config.owner_only:
+            owners = {
+                u.strip() for u in [*self._config.group_context.owner_ids, *self._config.allowed_user_ids] if u.strip()
+            }
+            if user_id not in owners:
+                return False
+            if is_dm:
+                return True
+            if not self._config.allow_all_channels:
+                return bool(self._config.allowed_channel_ids) and channel_id in self._config.allowed_channel_ids
+            return True
         if is_dm:
+            if not self._config.allow_all_dms:
+                return bool(self._config.allowed_user_ids) and user_id in self._config.allowed_user_ids
             if self._config.allowed_user_ids:
                 return user_id in self._config.allowed_user_ids
-            return self._config.allow_all_dms
+            return True
         if self._config.allowed_user_ids and user_id not in self._config.allowed_user_ids:
             return False
-        if self._config.allowed_channel_ids:
-            return channel_id in self._config.allowed_channel_ids
-        return self._config.allow_all_channels
+        if not self._config.allow_all_channels:
+            return bool(self._config.allowed_channel_ids) and channel_id in self._config.allowed_channel_ids
+        return True
 
     def _should_handle_event(self, event: dict[str, Any]) -> bool:
         event_type = str(event.get("type") or "")
@@ -465,8 +494,10 @@ class SlackChannel(BaseChannel):
         is_group = not is_dm
 
         mentions = _MENTION_RE.findall(raw_text)
-        has_mentions = bool(mentions)
-        bot_mentioned = event_type == "app_mention" or (bool(self._bot_user_id) and self._bot_user_id in mentions)
+        broadcast_mentioned = any(tag in raw_text for tag in ("<!channel>", "<!here>", "<!everyone>"))
+        has_mentions = bool(mentions) or broadcast_mentioned
+        direct_bot_mention = event_type == "app_mention" or (bool(self._bot_user_id) and self._bot_user_id in mentions)
+        bot_mentioned = direct_bot_mention or (is_group and not self._config.ignore_mention_all and broadcast_mentioned)
 
         # Strip own bot mention from text
         cleaned_text = raw_text
@@ -539,6 +570,7 @@ class SlackChannel(BaseChannel):
 
         metadata: dict[str, Any] = {
             "channel_id": channel_id,
+            "conversation_id": channel_id,
             "sender_id": user_id,
             "sender_name": sender_name,
             "ts": ts_str,
@@ -566,7 +598,7 @@ class SlackChannel(BaseChannel):
             channel_id=self._channel_id,
             channel_type=self.channel_type,
             tenant_id=self._tenant_id,
-            channel_session_id=subject_id,
+            channel_session_id=self._connection_session or f"{self._channel_id}-unconnected",
             channel_subject=subject,
             content=parts,
             timestamp=timestamp,
@@ -598,6 +630,253 @@ class SlackChannel(BaseChannel):
                 thread_ts = ts_val
 
         return channel_id, thread_ts
+
+    async def _set_reaction(self, channel_id: str, ts: str, name: str, *, remove: bool = False) -> None:
+        if not channel_id or not ts or not name:
+            return
+        http = await self._ensure_http()
+        headers = {
+            "Authorization": f"Bearer {self._config.bot_token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        endpoint = "reactions.remove" if remove else "reactions.add"
+        payload = {"channel": channel_id, "timestamp": ts, "name": name}
+        with contextlib.suppress(Exception):
+            async with http.post(
+                self._api_url(endpoint),
+                headers=headers,
+                json=payload,
+                proxy=self._proxy(),
+            ) as resp:
+                await resp.read()
+
+    async def _post_or_update_stream_text(
+        self,
+        channel_id: str,
+        thread_ts: str | None,
+        text: str,
+        *,
+        message_ts: str | None = None,
+    ) -> str | None:
+        if not text.strip():
+            return message_ts
+        http = await self._ensure_http()
+        headers = {
+            "Authorization": f"Bearer {self._config.bot_token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        chunks = split_slack_text(text, limit=_SLACK_MAX_MESSAGE_LEN)
+        first_chunk = chunks[0]
+        receipt = current_inbound_receipt()
+        if message_ts:
+            payload: dict[str, Any] = {
+                "channel": channel_id,
+                "ts": message_ts,
+                "text": first_chunk,
+            }
+            if receipt is not None:
+                receipt.attempted = True
+            try:
+                async with http.post(
+                    self._api_url("chat.update"),
+                    headers=headers,
+                    json=payload,
+                    proxy=self._proxy(),
+                ) as resp:
+                    resp.raise_for_status()
+                    data: dict[str, Any] = await resp.json()
+                    if data.get("ok"):
+                        self.note_outbound()
+                        if receipt is not None:
+                            receipt.delivered = True
+                    else:
+                        logger.warning("Slack chat.update failed: %s", data.get("error", "unknown_error"))
+            except Exception:
+                logger.warning("Slack chat.update request error", exc_info=True)
+            return message_ts
+
+        await self._acquire_rate_slot()
+        if receipt is not None:
+            receipt.attempted = True
+        post_payload: dict[str, Any] = {"channel": channel_id, "text": first_chunk}
+        if thread_ts:
+            post_payload["thread_ts"] = thread_ts
+        try:
+            async with http.post(
+                self._api_url("chat.postMessage"),
+                headers=headers,
+                json=post_payload,
+                proxy=self._proxy(),
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                if data.get("ok"):
+                    self.note_outbound()
+                    if receipt is not None:
+                        receipt.delivered = True
+                    return str(data.get("ts") or "") or None
+                logger.warning("Slack chat.postMessage failed: %s", data.get("error", "unknown_error"))
+        except Exception:
+            logger.warning("Slack chat.postMessage request error", exc_info=True)
+        return None
+
+    async def _process_inbound(self, message: InboundMessage, subject: ChannelSubject) -> bool:
+        meta = message.metadata or {}
+        src_channel = str(meta.get("channel_id") or "")
+        src_ts = str(meta.get("ts") or "")
+        use_reactions = bool(self._config.status_reactions and src_channel and src_ts)
+        receipt = current_inbound_receipt()
+        # Fall back to buffered delivery when an inbound plugin installs a text_filter
+        # (e.g. [NO_REPLY] suppression) so partial tokens never bypass output filtering.
+        use_stream_edit = (self._config.streaming_mode or "").strip().lower() == "edit" and (
+            receipt is None or receipt.text_filter is None
+        )
+
+        if use_reactions:
+            await self._set_reaction(src_channel, src_ts, "hourglass_flowing_sand")
+
+        if not use_stream_edit:
+            try:
+                ok = await super()._process_inbound(message, subject)
+                if use_reactions:
+                    await self._set_reaction(src_channel, src_ts, "hourglass_flowing_sand", remove=True)
+                    if ok:
+                        await self._set_reaction(src_channel, src_ts, "white_check_mark")
+                return ok
+            except Exception:
+                if use_reactions:
+                    await self._set_reaction(src_channel, src_ts, "hourglass_flowing_sand", remove=True)
+                raise
+
+        channel_id, thread_ts = self._resolve_target(subject)
+        stream_ts: str | None = None
+        delta_buffer: list[str] = []
+        thinking_buffer: list[str] = []
+        show_thinking = self.should_show_thinking()
+        last_edit_at = 0.0
+        succeeded = False
+        timeout_guard: ReplyTimeoutGuard | None = None
+
+        async def _flush_thinking() -> None:
+            if not thinking_buffer:
+                return
+            thinking_text = "".join(thinking_buffer).strip()
+            thinking_buffer.clear()
+            if thinking_text:
+                formatted = self._constraints.thinking_template.format(content=thinking_text)
+                await self._rate_limited_send(subject, formatted)
+
+        async def _flush_deltas(*, reset_stream: bool = False) -> None:
+            nonlocal stream_ts
+            if not delta_buffer:
+                return
+            final_text = self._clean_output("".join(delta_buffer))
+            delta_buffer.clear()
+            if final_text:
+                chunks = split_slack_text(final_text, limit=_SLACK_MAX_MESSAGE_LEN)
+                stream_ts = await self._post_or_update_stream_text(
+                    channel_id, thread_ts, chunks[0], message_ts=stream_ts
+                )
+                for extra_chunk in chunks[1:]:
+                    await self.reply_text(subject, extra_chunk)
+            if reset_stream:
+                stream_ts = None
+
+        if self._constraints.reply_timeout > 0:
+
+            async def _on_reply_timeout() -> None:
+                if self._constraints.timeout_strategy == "placeholder":
+                    await self._rate_limited_send(subject, self._constraints.placeholder_text)
+
+            timeout_guard = ReplyTimeoutGuard(
+                timeout=self._constraints.reply_timeout,
+                on_timeout=_on_reply_timeout,
+            )
+            timeout_guard.start()
+
+        events: Any = None
+        try:
+            events = self._processor(message)
+            async for event in events:
+                ev_text = extract_text(event.content)
+                ev_media = extract_media(event.content)
+                if event.type == MessageEventType.DELTA and ev_text:
+                    if timeout_guard:
+                        timeout_guard.cancel()
+                    delta_buffer.append(ev_text)
+                    now = time.monotonic()
+                    if now - last_edit_at >= 0.5:
+                        current_text = self._clean_output("".join(delta_buffer))
+                        if current_text:
+                            stream_ts = await self._post_or_update_stream_text(
+                                channel_id, thread_ts, current_text, message_ts=stream_ts
+                            )
+                            last_edit_at = now
+                elif event.type == MessageEventType.THINKING and show_thinking:
+                    await self._on_thinking(subject, event)
+                elif event.type == MessageEventType.THINKING_DELTA and show_thinking:
+                    for part in event.content:
+                        if isinstance(part, TextContent) and part.text:
+                            thinking_buffer.append(part.text)
+                elif event.type == MessageEventType.FLUSH:
+                    await _flush_thinking()
+                    await _flush_deltas(reset_stream=True)
+                elif event.type == MessageEventType.MESSAGE:
+                    if timeout_guard:
+                        timeout_guard.cancel()
+                    await _flush_thinking()
+                    await _flush_deltas(reset_stream=True)
+                    cleaned = self._clean_output(ev_text) if ev_text else ""
+                    if cleaned:
+                        await self._rate_limited_send(subject, cleaned)
+                    for m in ev_media:
+                        await self.reply_media(subject, m)
+                elif event.type == MessageEventType.TOOL_START:
+                    if self._constraints.show_tool_hints:
+                        hint = tool_hint_message(event.metadata, self._constraints, phase="start")
+                        await self._rate_limited_send(subject, hint)
+                elif event.type == MessageEventType.TOOL_END:
+                    if self._constraints.show_tool_hints:
+                        hint = tool_hint_message(event.metadata, self._constraints, phase="end")
+                        await self._rate_limited_send(subject, hint)
+                elif event.type == MessageEventType.ERROR:
+                    if timeout_guard:
+                        timeout_guard.cancel()
+                    await _flush_deltas(reset_stream=True)
+                    error_text = event.error or "An unexpected error occurred."
+                    await self._rate_limited_send(subject, error_text)
+                    break
+                elif event.type == MessageEventType.COMPLETED:
+                    if timeout_guard:
+                        timeout_guard.cancel()
+                    await _flush_thinking()
+                    await _flush_deltas()
+                    succeeded = True
+                    break
+
+            await _flush_thinking()
+            await _flush_deltas()
+            return succeeded
+        except Exception:
+            logger.exception(
+                "Error processing Slack stream message: channel=%s session=%s",
+                self.channel_id,
+                message.channel_session_id,
+            )
+            if timeout_guard:
+                timeout_guard.cancel()
+            await _flush_deltas(reset_stream=True)
+            await self._rate_limited_send(subject, "An error occurred while processing your message.")
+            return False
+        finally:
+            if timeout_guard:
+                timeout_guard.cancel()
+            if events is not None:
+                await close_event_stream(events)
+            if use_reactions:
+                await self._set_reaction(src_channel, src_ts, "hourglass_flowing_sand", remove=True)
+                if succeeded:
+                    await self._set_reaction(src_channel, src_ts, "white_check_mark")
 
     async def _send_text(self, subject: ChannelSubject, text: str) -> None:
         if not text:

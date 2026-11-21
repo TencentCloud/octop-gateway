@@ -286,3 +286,198 @@ async def test_slack_socket_mode_frame_ack_and_outbound_send() -> None:
     assert get_kwargs["headers"]["Authorization"] == "Bearer xoxb-1"
 
     await channel.stop()
+
+
+@pytest.mark.asyncio
+async def test_slack_security_policies_streaming_and_reactions() -> None:
+    from octop_gateway.group_context import GroupContextConfig
+
+    async def _stream_processor(msg: InboundMessage) -> AsyncIterator[MessageEvent]:
+        yield MessageEvent.delta("Hello ")
+        yield MessageEvent.delta("Slack!")
+        yield MessageEvent.completed()
+
+    cfg = SlackConfig(
+        bot_token="xoxb-sec",
+        owner_only=True,
+        ignore_mention_all=True,
+        streaming_mode="edit",
+        status_reactions=True,
+        group_context=GroupContextConfig(
+            enabled=True,
+            visibility="all",
+            activation="mention",
+            owner_commands_only=True,
+            owner_tools_only=True,
+            owner_ids=["U_ADMIN"],
+        ),
+    )
+    channel = SlackChannel(_stream_processor, cfg)
+    channel._bot_user_id = "UBOT"
+
+    # 1. owner_only blocks non-owner users in both DM and group
+    assert not channel._should_handle_event({"type": "message", "channel": "D1", "user": "U_GUEST", "ts": "1.0"})
+    assert channel._should_handle_event({"type": "message", "channel": "D1", "user": "U_ADMIN", "ts": "1.1"})
+
+    # 2. ignore_mention_all prevents <!channel> / <!here> from counting as bot mention
+    mass_msg = channel.parse_inbound(
+        {
+            "type": "message",
+            "channel": "C100",
+            "channel_type": "channel",
+            "user": "U_ADMIN",
+            "text": "<!channel> please check",
+            "ts": "2.0",
+        }
+    )
+    assert mass_msg.metadata["bot_mentioned"] is False
+    assert mass_msg.metadata["conversation_id"] == "C100"
+
+    # 3. GroupContextManager enforces owner_commands_only and owner_tools_only even with thread_isolation
+    cfg_group = SlackConfig(
+        bot_token="xoxb-sec",
+        thread_isolation=True,
+        group_context=GroupContextConfig(
+            enabled=True,
+            visibility="all",
+            activation="mention",
+            owner_commands_only=True,
+            owner_tools_only=True,
+            owner_ids=["U_ADMIN"],
+        ),
+    )
+    group_channel = SlackChannel(_stream_processor, cfg_group)
+    group_channel._bot_user_id = "UBOT"
+
+    guest_cmd = {
+        "type": "app_mention",
+        "channel": "C100",
+        "channel_type": "channel",
+        "user": "U_GUEST",
+        "text": "<@UBOT> /model gpt-5",
+        "ts": "3.1",
+        "thread_ts": "3.0",
+    }
+    assert await group_channel._prepare_inbound(guest_cmd) is None
+
+    guest_chat = {
+        "type": "app_mention",
+        "channel": "C100",
+        "channel_type": "channel",
+        "user": "U_GUEST",
+        "text": "<@UBOT> run a tool for me",
+        "ts": "3.2",
+        "thread_ts": "3.0",
+    }
+    prepared_guest_res = await group_channel._prepare_inbound(guest_chat)
+    assert prepared_guest_res is not None
+    prepared_guest, _ = prepared_guest_res
+    assert prepared_guest.allowed_tools == []
+
+    admin_chat = {
+        "type": "app_mention",
+        "channel": "C100",
+        "channel_type": "channel",
+        "user": "U_ADMIN",
+        "text": "<@UBOT> /model gpt-5",
+        "ts": "3.3",
+        "thread_ts": "3.0",
+    }
+    prepared_admin_res = await group_channel._prepare_inbound(admin_chat)
+    assert prepared_admin_res is not None
+    prepared_admin, _ = prepared_admin_res
+    assert prepared_admin.allowed_tools is None
+
+    # 4. streaming_mode="edit" + status_reactions posts initial message, updates in place, and toggles reactions
+    api_calls: list[tuple[str, Any]] = []
+
+    def _fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        api_calls.append((url, kwargs.get("json")))
+        if url.endswith("/chat.postMessage"):
+            return _FakeResponse(200, {"ok": True, "ts": "999.001"})
+        return _FakeResponse(200, {"ok": True})
+
+    fake_http = MagicMock()
+    fake_http.closed = False
+    fake_http.post = MagicMock(side_effect=_fake_post)
+    fake_http.close = AsyncMock()
+    channel._http = fake_http
+
+    dm_inbound = channel.parse_inbound(
+        {
+            "type": "message",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U_ADMIN",
+            "text": "Stream test",
+            "ts": "10.0",
+        }
+    )
+    assert dm_inbound.channel_subject is not None
+    ok = await channel._process_inbound(dm_inbound, dm_inbound.channel_subject)
+    assert ok is True
+
+    endpoints = [u.rsplit("/", 1)[-1] for u, _ in api_calls]
+    assert "reactions.add" in endpoints
+    assert "reactions.remove" in endpoints
+    assert "chat.postMessage" in endpoints
+    assert "chat.update" in endpoints
+    update_payloads = [p for u, p in api_calls if u.endswith("/chat.update")]
+    assert update_payloads[-1]["text"] == "Hello Slack!"
+
+    await channel.stop()
+    await group_channel.stop()
+
+
+@pytest.mark.asyncio
+async def test_slack_review_fixes_auth_allowlist_and_text_filter() -> None:
+    from octop_gateway.channel import InboundReceipt
+    from octop_gateway.group_context import GroupContextConfig
+
+    # 1. verify_signature fails closed when require_secret=True and signing_secret is empty
+    no_secret = SlackChannel(_echo_processor, SlackConfig(bot_token="xoxb-1"))
+    assert no_secret.verify_signature("123", "v0=abc", "{}", require_secret=True) is False
+    assert no_secret.verify_signature("123", "v0=abc", "{}", require_secret=False) is True
+
+    # 2. allow_all_channels=True ignores stale allowed_channel_ids; owner_only + allow_all_dms=False allows owner_ids
+    cfg = SlackConfig(
+        bot_token="xoxb-1",
+        owner_only=True,
+        allow_all_dms=False,
+        allow_all_channels=True,
+        allowed_channel_ids=["C_OLD"],
+        group_context=GroupContextConfig(enabled=True, owner_ids=["U_OWNER"]),
+    )
+    ch = SlackChannel(_echo_processor, cfg)
+    assert ch._should_handle_event(
+        {"type": "message", "channel": "D1", "channel_type": "im", "user": "U_OWNER", "ts": "1"}
+    )
+    assert ch._should_handle_event(
+        {"type": "message", "channel": "C_NEW", "channel_type": "channel", "user": "U_OWNER", "ts": "2"}
+    )
+    assert not ch._should_handle_event(
+        {"type": "message", "channel": "D1", "channel_type": "im", "user": "U_OTHER", "ts": "3"}
+    )
+
+    # 3. streaming_mode="edit" honors InboundReceipt.text_filter (e.g. [NO_REPLY] suppression)
+    async def _silent_processor(msg: InboundMessage) -> AsyncIterator[MessageEvent]:
+        yield MessageEvent.delta("[NO_REPLY]")
+        yield MessageEvent.completed()
+
+    stream_ch = SlackChannel(_silent_processor, SlackConfig(bot_token="xoxb-1", streaming_mode="edit"))
+    posts: list[str] = []
+    fake_http = MagicMock()
+    fake_http.closed = False
+    fake_http.post = MagicMock(
+        side_effect=lambda url, **kw: (posts.append(url), _FakeResponse(200, {"ok": True, "ts": "1"}))[1]
+    )
+    fake_http.close = AsyncMock()
+    stream_ch._http = fake_http
+
+    receipt = InboundReceipt(text_filter=lambda text: "" if "[NO_REPLY]" in text else text)
+    await stream_ch.dispatch_inbound(
+        {"type": "message", "channel": "D1", "channel_type": "im", "user": "U1", "text": "ping", "ts": "9.0"},
+        receipt=receipt,
+    )
+    assert posts == []
+    await stream_ch.stop()

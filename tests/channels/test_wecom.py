@@ -123,6 +123,60 @@ class TestWeComChannelUnit:
         assert ch._is_duplicate("msg_002") is True
         assert ch.dropped_duplicate == 1
 
+    @pytest.mark.asyncio
+    async def test_handle_inbound_enforces_group_context_owner_commands(self) -> None:
+        """WeCom WS streaming path enforces group_context owner_commands_only."""
+        from octop_gateway.group_context import GroupContextConfig
+
+        called: list[str] = []
+
+        async def _rec_processor(msg: InboundMessage):
+            called.append(msg.text)
+            yield MessageEvent.delta("ok")
+            yield MessageEvent.completed()
+
+        cfg = WeComConfig(
+            bot_id="b1",
+            secret="s1",
+            group_context=GroupContextConfig(
+                enabled=True,
+                visibility="all",
+                activation="mention",
+                owner_commands_only=True,
+                owner_ids=["owner_1"],
+            ),
+        )
+        ch = WeComChannel(processor=_rec_processor, config=cfg)
+        ws_client = AsyncMock()
+        ws_client.reply_stream = AsyncMock()
+        ch._ws_client = ws_client
+
+        guest_payload = {
+            "msgid": "m1",
+            "msgtype": "text",
+            "text": {"content": "/new"},
+            "from": {"userid": "guest_1"},
+            "chattype": "group",
+            "chatid": "room_1",
+            "_frame": {"req_id": "f1"},
+        }
+        await ch.handle_inbound(guest_payload)
+        assert called == []
+        ws_client.reply_stream.assert_not_awaited()
+
+        owner_payload = {
+            "msgid": "m2",
+            "msgtype": "text",
+            "text": {"content": "/new"},
+            "from": {"userid": "owner_1"},
+            "chattype": "group",
+            "chatid": "room_1",
+            "_frame": {"req_id": "f2"},
+        }
+        await ch.handle_inbound(owner_payload)
+        assert called == ["/new"]
+        ws_client.reply_stream.assert_awaited()
+
     def test_parse_inbound_returns_existing(self) -> None:
         """Passing an InboundMessage directly returns it unchanged."""
         ch = WeComChannel(processor=_noop_processor, config=_make_config())
