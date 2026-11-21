@@ -368,3 +368,242 @@ async def test_whatsapp_cloud_and_waha_outbound_and_qr_helpers() -> None:
 
     await cloud_channel.stop()
     await waha_channel.stop()
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_security_policies_and_status_reactions() -> None:
+    from octop_gateway.group_context import GroupContextConfig
+
+    cfg = WhatsAppConfig(
+        provider="waha",
+        bridge_url="http://127.0.0.1:3000",
+        use_websocket=False,
+        owner_only=False,
+        allow_all_groups=False,
+        allowed_group_ids=["120363000@g.us"],
+        ignore_mention_all=True,
+        status_reactions=True,
+        group_context=GroupContextConfig(
+            enabled=True,
+            visibility="all",
+            activation="mention",
+            owner_commands_only=True,
+            owner_tools_only=True,
+            owner_ids=["+86 138-1111-2222"],
+        ),
+    )
+    channel = WhatsAppChannel(_echo_processor, cfg)
+    channel._self_jid = "8619900009999@c.us"
+
+    # 1. Disallowed group is rejected when allow_all_groups=False
+    assert (
+        channel.extract_webhook_messages(
+            {
+                "event": "message",
+                "payload": {
+                    "id": "m_other_group",
+                    "from": "999999@g.us",
+                    "fromMe": False,
+                    "participant": "8613811112222@c.us",
+                    "body": "@8619900009999 hi",
+                },
+            }
+        )
+        == []
+    )
+
+    # 2. ignore_mention_all ignores @all even if self_jid is in mentionedIds
+    mass_events = channel.extract_webhook_messages(
+        {
+            "event": "message",
+            "payload": {
+                "id": "m_mass",
+                "from": "120363000@g.us",
+                "fromMe": False,
+                "participant": "8613899990000@c.us",
+                "body": "@all hello everyone",
+                "mentionedIds": ["8619900009999@c.us"],
+            },
+        }
+    )
+    assert len(mass_events) == 1
+    mass_msg = channel.parse_inbound(mass_events[0])
+    assert mass_msg.metadata["bot_mentioned"] is False
+
+    # 3. GroupContextManager blocks /command from non-owner, allows owner with normalized phone (+86 138-1111-2222 vs 8613811112222@c.us)
+    guest_cmd_raw = {
+        "_format": "waha",
+        "payload": {
+            "id": "m_guest_cmd",
+            "from": "120363000@g.us",
+            "fromMe": False,
+            "participant": "8613899990000@c.us",
+            "body": "@8619900009999 /new",
+            "mentionedIds": ["8619900009999@c.us"],
+        },
+    }
+    assert await channel._prepare_inbound(guest_cmd_raw) is None
+
+    owner_cmd_raw = {
+        "_format": "waha",
+        "payload": {
+            "id": "m_owner_cmd",
+            "from": "120363000@g.us",
+            "fromMe": False,
+            "participant": "8613811112222@c.us",
+            "body": "@8619900009999 /new",
+            "mentionedIds": ["8619900009999@c.us"],
+        },
+    }
+    prepared_owner_res = await channel._prepare_inbound(owner_cmd_raw)
+    assert prepared_owner_res is not None
+    prepared_owner, owner_subject = prepared_owner_res
+    assert prepared_owner.allowed_tools is None
+
+    # 4. status_reactions sends ⏳ and ✅ via WAHA PUT /api/reaction
+    put_calls: list[tuple[str, Any]] = []
+    fake_http = MagicMock()
+    fake_http.closed = False
+    fake_http.post = MagicMock(return_value=_FakeResponse(200, {"ok": True}))
+    fake_http.put = MagicMock(
+        side_effect=lambda url, **kw: (put_calls.append((url, kw.get("json"))), _FakeResponse(200, {"ok": True}))[1]
+    )
+    fake_http.close = AsyncMock()
+    channel._http = fake_http
+
+    ok = await channel._process_inbound(prepared_owner, owner_subject)
+    assert ok is True
+    reactions = [p["reaction"] for u, p in put_calls if u.endswith("/api/reaction")]
+    assert reactions == ["⏳", "✅"]
+
+    await channel.stop()
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_review_fixes_security_typing_allowlist_and_evolution_mentions() -> None:
+    from octop_gateway.group_context import GroupContextConfig
+
+    # 1. Typing keepalive is enabled by default when show_typing=True
+    typing_ch = WhatsAppChannel(_echo_processor, WhatsAppConfig(provider="cloud", show_typing=True))
+    assert typing_ch.constraints.typing_keepalive_interval > 0
+    no_typing_ch = WhatsAppChannel(_echo_processor, WhatsAppConfig(provider="cloud", show_typing=False))
+    assert no_typing_ch.constraints.typing_keepalive_interval == 0.0
+
+    # 2. Webhook auth fails closed when require_secret/require_token is True and secrets are unset
+    unauth_cloud = WhatsAppChannel(
+        _echo_processor, WhatsAppConfig(provider="cloud", access_token="t", phone_number_id="1")
+    )
+    assert unauth_cloud.verify_webhook_challenge("subscribe", "any", "chal", require_token=True) is None
+    assert unauth_cloud.verify_webhook_request({}, b"{}", require_secret=True) is False
+
+    waha_keyed = WhatsAppChannel(
+        _echo_processor,
+        WhatsAppConfig(provider="waha", bridge_url="http://127.0.0.1:3000", bridge_api_key="k-secret"),
+    )
+    assert waha_keyed.verify_webhook_request({}, b"{}", require_secret=True) is False
+    assert waha_keyed.verify_webhook_request({"X-Api-Key": "k-secret"}, b"{}", require_secret=True) is True
+
+    # 3. fetch_remote_media does not leak tokens to spoofed query/subdomain URLs
+    seen_headers: list[dict[str, str]] = []
+    fake_http = MagicMock()
+    fake_http.closed = False
+    fake_http.get = MagicMock(
+        side_effect=lambda url, **kw: (
+            seen_headers.append(dict(kw.get("headers") or {})),
+            _FakeResponse(200, json_data=None, body=b"ok", content_type="image/png"),
+        )[1]
+    )
+    fake_http.close = AsyncMock()
+    media_ch = WhatsAppChannel(
+        _echo_processor,
+        WhatsAppConfig(
+            provider="waha",
+            access_token="META_SECRET",
+            bridge_url="http://127.0.0.1:3000",
+            bridge_api_key="BRIDGE_SECRET",
+        ),
+    )
+    media_ch._http = fake_http
+    await media_ch.fetch_remote_media("https://evil.example/?x=facebook.com")
+    await media_ch.fetch_remote_media("http://127.0.0.1:3000.evil.example/media.png")
+    await media_ch.fetch_remote_media("http://127.0.0.1:3000/api/files/pic.png")
+    assert seen_headers[0] == {}
+    assert seen_headers[1] == {}
+    assert seen_headers[2].get("X-Api-Key") == "BRIDGE_SECRET"
+    await media_ch.stop()
+
+    # 4. allow_all_groups=True ignores stale allowed_group_ids; owner_only + allow_all_dms=False allows owner_ids
+    policy_ch = WhatsAppChannel(
+        _echo_processor,
+        WhatsAppConfig(
+            provider="waha",
+            bridge_url="http://127.0.0.1:3000",
+            owner_only=True,
+            allow_all_dms=False,
+            allow_all_groups=True,
+            allowed_group_ids=["stale@g.us"],
+            group_context=GroupContextConfig(enabled=True, owner_ids=["+86 138-1111-2222"]),
+        ),
+    )
+    assert policy_ch._is_allowed_sender("8613811112222@c.us", "8613811112222@c.us", is_group=False) is True
+    assert policy_ch._is_allowed_sender("8613811112222@c.us", "newgroup@g.us", is_group=True) is True
+    assert policy_ch._is_allowed_sender("8613999999999@c.us", "8613999999999@c.us", is_group=False) is False
+
+    # 5. Evolution group mention only triggers when the bot itself is mentioned, not another user
+    evo_ch = WhatsAppChannel(
+        _echo_processor,
+        WhatsAppConfig(provider="evolution", bridge_url="http://127.0.0.1:8080", ignore_mention_all=True),
+    )
+    other_mention = evo_ch.extract_webhook_messages(
+        {
+            "event": "messages.upsert",
+            "instance": "personal",
+            "sender": "8619900009999@s.whatsapp.net",
+            "data": {
+                "key": {
+                    "remoteJid": "120363@g.us",
+                    "fromMe": False,
+                    "id": "E1",
+                    "participant": "8613811112222@s.whatsapp.net",
+                },
+                "message": {
+                    "extendedTextMessage": {
+                        "text": "@8613800000000 hi",
+                        "contextInfo": {"mentionedJid": ["8613800000000@s.whatsapp.net"]},
+                    }
+                },
+            },
+        }
+    )
+    assert len(other_mention) == 1
+    assert evo_ch.parse_inbound(other_mention[0]).metadata["bot_mentioned"] is False
+
+    self_mention = evo_ch.extract_webhook_messages(
+        {
+            "event": "messages.upsert",
+            "instance": "personal",
+            "sender": "8619900009999@s.whatsapp.net",
+            "data": {
+                "key": {
+                    "remoteJid": "120363@g.us",
+                    "fromMe": False,
+                    "id": "E2",
+                    "participant": "8613811112222@s.whatsapp.net",
+                },
+                "message": {
+                    "extendedTextMessage": {
+                        "text": "@all @8619900009999 check this",
+                        "contextInfo": {"mentionedJid": ["8619900009999@s.whatsapp.net"]},
+                    }
+                },
+            },
+        }
+    )
+    assert len(self_mention) == 1
+    parsed_self = evo_ch.parse_inbound(self_mention[0])
+    assert parsed_self.metadata["bot_mentioned"] is True
+    assert "@8619900009999" not in parsed_self.text
+
+    # 6. Bridge QR helper rejects non-HTTP schemes
+    with pytest.raises(ValueError, match="http:// or https://"):
+        await fetch_whatsapp_bridge_qr("file:///etc/passwd")
