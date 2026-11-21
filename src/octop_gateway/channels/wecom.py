@@ -381,21 +381,19 @@ class WeComChannel(BaseChannel):
           - The error path uses :attr:`ChannelConstraints.placeholder_text`
             so manager-level overrides take effect.
         """
-        message = self.parse_inbound(raw_payload)
-
-        # Auto-persist media if backend configured
-        if self._media_backend:
-            await self._persist_media(message)
-
-        self._track_subject(message)
+        prepared = await self._prepare_inbound(raw_payload)
+        if prepared is None:
+            return
+        message, subject = prepared
         meta = message.metadata
 
         ws_client = meta.get("_ws_client", self._ws_client)
         frame = meta.get("_frame")
 
-        # If no frame/ws_client available, fall back to BaseChannel behavior
+        # If no frame/ws_client available, fall back to BaseChannel buffered delivery
         if not ws_client or not frame:
-            await super().handle_inbound(raw_payload)
+            processing_succeeded = await self._process_inbound(message, subject)
+            self._finalize_inbound(message, processing_succeeded=processing_succeeded)
             return
 
         # One rate-limit slot for the whole stream reply.
@@ -565,6 +563,8 @@ class WeComChannel(BaseChannel):
             reply_subject = ChannelSubject(subject_id=subject_id, metadata=media_meta)
             for media in media_buffer:
                 await self._send_media(reply_subject, media)
+
+        self._finalize_inbound(message, processing_succeeded=True)
 
     def parse_inbound(self, raw_payload: Any) -> InboundMessage:
         """Parse WebSocket message frame into InboundMessage.
