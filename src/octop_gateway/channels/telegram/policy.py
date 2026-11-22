@@ -54,7 +54,8 @@ def should_accept_message(
     Private chats bypass group activation. A command addressed to another bot
     is rejected in every mode. Restricted group modes require a known bot
     identity; each trigger uses the corresponding ID or username when available.
-    Anonymous group senders cannot satisfy a user allowlist.
+    Anonymous group senders carry GroupAnonymousBot as their from_user, so
+    allowlisting that id admits them; a foreign sender_chat stays rejected.
     """
     chat = message.chat
     if chat.type not in ("private", "group", "supergroup"):
@@ -62,9 +63,13 @@ def should_accept_message(
     if allowed_chat_ids and str(chat.id) not in allowed_chat_ids:
         return False
     if allowed_user_ids:
-        if message.sender_chat is not None or message.from_user is None:
+        if message.from_user is None:
             return False
         if str(message.from_user.id) not in allowed_user_ids:
+            return False
+        # Anonymous group admins arrive as GroupAnonymousBot with the group
+        # itself as sender_chat. Accept that chat, never a channel identity.
+        if message.sender_chat is not None and message.sender_chat.id != chat.id:
             return False
 
     text = (message.text or message.caption or "").strip()

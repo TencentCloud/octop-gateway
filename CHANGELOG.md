@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 修复
+
+- Telegram：配置 `allowed_user_ids` 白名单后不再连带拒绝群自身的匿名管理员（`sender_chat` 为当前群）。把 GroupAnonymousBot（`1087968824`）加入白名单后，匿名发言即可触发；白名单外发送者、频道身份转发与缺少 `from_user` 的消息仍被拒绝。
+
 ## [1.0.4] - 2026-11-17
 
 ### 新增

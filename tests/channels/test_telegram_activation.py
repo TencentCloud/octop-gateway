@@ -170,8 +170,14 @@ def test_allowlists_and_anonymous_sender() -> None:
     assert not accepts(msg, activation="always", allowed_user_ids=["8"])
     assert not accepts(msg, activation="always", allowed_chat_ids=["-10043"])
     anonymous = message(sender_chat={"id": -10042, "type": "supergroup"})
-    assert not accepts(anonymous, activation="always", allowed_user_ids=["7"])
+    # Anonymous admins arrive as GroupAnonymousBot, with the group itself as sender_chat.
+    assert accepts(anonymous, activation="always", allowed_user_ids=["7"])
+    assert not accepts(anonymous, activation="always", allowed_user_ids=["8"])
     assert accepts(anonymous, activation="always")
+    # A channel identity is not the group itself and stays rejected.
+    assert not accepts(
+        message(sender_chat={"id": -10043, "type": "channel"}), activation="always", allowed_user_ids=["7"]
+    )
     assert not accepts(message(**{"from": None}), activation="always", allowed_user_ids=["7"])
 
 
