@@ -217,6 +217,7 @@ class SlackChannel(BaseChannel):
         self._connection_session: str | None = None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._ws_task: asyncio.Task[None] | None = None
+        self._ws_ready = asyncio.Event()
         self._stopping = False
         self._seen_events: OrderedDict[str, str] = OrderedDict()
         self._participated_threads: OrderedDict[str, None] = OrderedDict()
@@ -329,6 +330,7 @@ class SlackChannel(BaseChannel):
             raise ValueError("Slack bot_token is required")
 
         self._stopping = False
+        self._ws_ready.clear()
         await self._verify_auth()
         self._connection_session = f"slack-{uuid.uuid4().hex[:12]}"
 
@@ -339,10 +341,27 @@ class SlackChannel(BaseChannel):
                     self._ws_loop(initial_url=ws_url),
                     name=f"slack-ws-{self._channel_id}",
                 )
+                await self._wait_ws_ready(timeout=10.0)
+
+    async def _wait_ws_ready(self, *, timeout: float) -> None:
+        if self._ws_task is None:
+            return
+        ready_task = asyncio.create_task(self._ws_ready.wait())
+        try:
+            await asyncio.wait(
+                {ready_task, self._ws_task},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            ready_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ready_task
 
     async def stop(self) -> None:
         """Stop Socket Mode loop and close HTTP resources."""
         self._stopping = True
+        self._ws_ready.clear()
         if self._ws_task and not self._ws_task.done():
             self._ws_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -404,6 +423,7 @@ class SlackChannel(BaseChannel):
                 ) as ws:
                     self._ws = ws
                     self._connection_session = f"slack-{uuid.uuid4().hex[:12]}"
+                    self._ws_ready.set()
                     ws_url = None  # Force fresh URL on next reconnect
                     backoff = 1.0
                     async for msg in ws:
@@ -427,6 +447,7 @@ class SlackChannel(BaseChannel):
                 backoff = min(backoff * 2.0, 30.0)
             finally:
                 self._ws = None
+                self._ws_ready.clear()
 
     async def _handle_socket_frame(self, ws: aiohttp.ClientWebSocketResponse, raw_text: str) -> bool:
         """Process one Socket Mode JSON frame. Returns True if disconnect was requested."""
