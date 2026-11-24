@@ -710,3 +710,242 @@ async def test_whatsapp_channel_manager_worker_e2e_owner_ids_and_is_connected() 
     finally:
         await manager.stop()
     assert ch.is_connected is False
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_start_waits_for_waha_ws_ready() -> None:
+    import asyncio
+
+    release_ws = asyncio.Event()
+
+    class _FakeWS:
+        closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+            release_ws.set()
+
+        def __aiter__(self) -> _FakeWS:
+            return self
+
+        async def __anext__(self) -> Any:
+            await release_ws.wait()
+            raise StopAsyncIteration
+
+        async def __aenter__(self) -> _FakeWS:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            self.closed = True
+
+    fake_http = MagicMock()
+    fake_http.closed = False
+    fake_http.get = MagicMock(
+        return_value=_FakeResponse(200, {"status": "WORKING", "me": {"id": "8619900009999@c.us"}})
+    )
+    fake_http.ws_connect = MagicMock(return_value=_FakeWS())
+    fake_http.close = AsyncMock()
+
+    ch = WhatsAppChannel(
+        _echo_processor,
+        WhatsAppConfig(
+            provider="waha",
+            bridge_url="http://127.0.0.1:3000",
+            bridge_api_key="my-waha-secret",
+            use_websocket=True,
+        ),
+        channel_id="wa-ws-ready",
+    )
+    ch._http = fake_http
+    await ch.start()
+    try:
+        # Must already be connected immediately upon start() returning (no post-save race)
+        assert ch.is_connected is True
+        # WAHA WebSocketAuth requires x-api-key in query params
+        ws_url = fake_http.ws_connect.call_args.args[0]
+        assert "x-api-key=my-waha-secret" in ws_url
+        assert "session=default" in ws_url
+        assert "events=message.any" in ws_url
+    finally:
+        await ch.stop()
+    assert ch.is_connected is False
+
+
+@pytest.mark.asyncio
+async def test_waha_self_chat_accepts_app_and_rejects_api_echo_and_outgoing_to_others() -> None:
+    ch = WhatsAppChannel(
+        _echo_processor,
+        WhatsAppConfig(provider="waha", bridge_url="http://127.0.0.1:3000", use_websocket=False),
+    )
+    me = {"id": "8615063577835@c.us", "lid": "274062685298807@lid", "pushName": "Dennis"}
+
+    # 1. User typing in "Message Yourself" via @lid (fromMe=True, source=app) -> ACCEPTED
+    self_lid_event = {
+        "event": "message.any",
+        "session": "default",
+        "me": me,
+        "payload": {
+            "id": "true_274062685298807@lid_APP1",
+            "from": "274062685298807@lid",
+            "fromMe": True,
+            "source": "app",
+            "body": "Hello self",
+        },
+    }
+    accepted = ch.extract_webhook_messages(self_lid_event)
+    assert len(accepted) == 1
+    parsed = ch.parse_inbound(accepted[0])
+    assert parsed.text == "Hello self"
+    assert parsed.channel_subject is not None
+    assert parsed.channel_subject.subject_id == "274062685298807@lid"
+
+    # 2. Bot reply echo in self-chat (fromMe=True, source=api) -> REJECTED (prevents loop)
+    api_echo_event = {
+        "event": "message.any",
+        "session": "default",
+        "me": me,
+        "payload": {
+            "id": "true_274062685298807@lid_API1",
+            "from": "274062685298807@lid",
+            "fromMe": True,
+            "source": "api",
+            "body": "Bot reply",
+        },
+    }
+    assert ch.extract_webhook_messages(api_echo_event) == []
+
+    # 3. Echo matching a recorded sent message ID even without source="api" -> REJECTED
+    ch._remember_sent_message_ids({"id": "true_8615063577835@c.us_SENT2", "key": {"id": "SENT2"}})
+    sent_echo_event = {
+        "event": "message.any",
+        "session": "default",
+        "me": me,
+        "payload": {
+            "id": "true_8615063577835@c.us_SENT2",
+            "from": "8615063577835@c.us",
+            "fromMe": True,
+            "body": "Bot reply 2",
+        },
+    }
+    assert ch.extract_webhook_messages(sent_echo_event) == []
+
+    # 4. Outgoing message sent by user to a friend (fromMe=True, other chat) -> REJECTED
+    friend_outgoing = {
+        "event": "message.any",
+        "session": "default",
+        "me": me,
+        "payload": {
+            "id": "true_8613800001111@c.us_FRIEND1",
+            "from": "8613800001111@c.us",
+            "fromMe": True,
+            "source": "app",
+            "body": "Hey friend",
+        },
+    }
+    assert ch.extract_webhook_messages(friend_outgoing) == []
+
+    # 5. Outgoing message sent by user in a group (fromMe=True, @g.us) -> REJECTED
+    group_outgoing = {
+        "event": "message.any",
+        "session": "default",
+        "me": me,
+        "payload": {
+            "id": "true_120363000@g.us_GRP1",
+            "from": "120363000@g.us",
+            "fromMe": True,
+            "source": "app",
+            "body": "Hey group",
+        },
+    }
+    assert ch.extract_webhook_messages(group_outgoing) == []
+
+
+@pytest.mark.asyncio
+async def test_waha_ws_close_1008_sets_runtime_error_and_backs_off() -> None:
+    import asyncio
+    from unittest.mock import patch
+
+    class _UnauthorizedWS:
+        closed = False
+        close_code = 1008
+
+        async def close(self) -> None:
+            self.closed = True
+
+        def __aiter__(self) -> _UnauthorizedWS:
+            return self
+
+        async def __anext__(self) -> Any:
+            raise StopAsyncIteration
+
+        async def __aenter__(self) -> _UnauthorizedWS:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            self.closed = True
+
+    sleep_calls: list[float] = []
+    slept = asyncio.Event()
+    block_forever = asyncio.Event()
+
+    async def _fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+        slept.set()
+        await block_forever.wait()
+
+    fake_http = MagicMock()
+    fake_http.closed = False
+    fake_http.get = MagicMock(return_value=_FakeResponse(200, {"status": "WORKING"}))
+    fake_http.ws_connect = MagicMock(return_value=_UnauthorizedWS())
+    fake_http.close = AsyncMock()
+
+    ch = WhatsAppChannel(
+        _echo_processor,
+        WhatsAppConfig(provider="waha", bridge_url="http://127.0.0.1:3000", bridge_api_key="bad", use_websocket=True),
+        channel_id="wa-ws-1008",
+    )
+    ch._http = fake_http
+    with patch("octop_gateway.channels.whatsapp.asyncio.sleep", side_effect=_fake_sleep):
+        await ch.start()
+        await asyncio.wait_for(slept.wait(), timeout=2.0)
+        try:
+            assert ch.is_connected is False
+            assert ch.runtime_error is not None
+            assert "1008" in ch.runtime_error
+            assert sleep_calls == [1.0]
+        finally:
+            await ch.stop()
+
+
+@pytest.mark.asyncio
+async def test_waha_fetch_qr_restarts_failed_session() -> None:
+    calls: list[tuple[str, str]] = []
+
+    def _fake_get(url: str, **kwargs: Any) -> _FakeResponse:
+        calls.append(("GET", url))
+        if url.endswith("/api/sessions/default"):
+            return _FakeResponse(200, {"name": "default", "status": "FAILED"})
+        if "/auth/qr" in url:
+            return _FakeResponse(200, {"value": "2@fresh-qr-payload"})
+        return _FakeResponse(200, {})
+
+    def _fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        calls.append(("POST", url))
+        if url.endswith("/api/sessions/default/restart"):
+            return _FakeResponse(201, {"name": "default", "status": "STARTING"})
+        return _FakeResponse(200, {})
+
+    fake_http = MagicMock()
+    fake_http.get = MagicMock(side_effect=_fake_get)
+    fake_http.post = MagicMock(side_effect=_fake_post)
+
+    res = await fetch_whatsapp_bridge_qr(
+        "http://127.0.0.1:3000",
+        provider="waha",
+        session_name="default",
+        api_key="k1",
+        http=fake_http,
+    )
+    assert res["status"] == "SCAN_QR_CODE"
+    assert res["qrcode"] == "2@fresh-qr-payload"
+    assert ("POST", "http://127.0.0.1:3000/api/sessions/default/restart") in calls
