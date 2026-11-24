@@ -607,3 +607,106 @@ async def test_whatsapp_review_fixes_security_typing_allowlist_and_evolution_men
     # 6. Bridge QR helper rejects non-HTTP schemes
     with pytest.raises(ValueError, match="http:// or https://"):
         await fetch_whatsapp_bridge_qr("file:///etc/passwd")
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_channel_manager_worker_e2e_owner_ids_and_is_connected() -> None:
+    import asyncio
+
+    from octop_gateway.group_context import GroupContextConfig
+    from octop_gateway.manager import ChannelManager
+
+    delivered = asyncio.Event()
+    sent_payloads: list[dict[str, Any]] = []
+
+    def _fake_get(url: str, **kwargs: Any) -> _FakeResponse:
+        return _FakeResponse(200, {"status": "WORKING", "me": {"id": "8619900009999@c.us"}})
+
+    def _fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/api/sendText"):
+            sent_payloads.append(kwargs.get("json") or {})
+            delivered.set()
+            return _FakeResponse(200, {"id": "sent-1"})
+        return _FakeResponse(200, {"ok": True})
+
+    fake_http = MagicMock()
+    fake_http.closed = False
+    fake_http.get = MagicMock(side_effect=_fake_get)
+    fake_http.post = MagicMock(side_effect=_fake_post)
+    fake_http.close = AsyncMock()
+
+    cfg = WhatsAppConfig(
+        provider="waha",
+        bridge_url="http://127.0.0.1:3000",
+        use_websocket=False,
+        allow_all_groups=True,
+        group_context=GroupContextConfig(
+            enabled=True,
+            owner_ids=["+86 138-1111-2222"],
+            owner_commands_only=True,
+        ),
+    )
+    ch = WhatsAppChannel(_echo_processor, cfg, channel_id="wa-e2e")
+    ch._http = fake_http
+    assert ch.is_connected is False
+
+    # 1. parse_inbound accepts already-parsed InboundMessage and normalizes owner_ids immediately
+    owner_event = {
+        "_format": "waha",
+        "event": "message",
+        "me": {"id": "8619900009999@c.us"},
+        "payload": {
+            "id": "M_OWNER",
+            "from": "120363@g.us",
+            "participant": "8613811112222@c.us",
+            "fromMe": False,
+            "body": "@8619900009999 /model gpt-5",
+            "mentionedIds": ["8619900009999@c.us"],
+        },
+    }
+    parsed_owner = ch.parse_inbound(owner_event)
+    assert parsed_owner.metadata["sender_id"] == "+86 138-1111-2222"
+    assert ch.parse_inbound(parsed_owner) is parsed_owner
+    assert ch.group_context_manager.accepts(parsed_owner) is True
+
+    # Non-owner group command is rejected right after parse_inbound
+    guest_event = {
+        "_format": "waha",
+        "event": "message",
+        "me": {"id": "8619900009999@c.us"},
+        "payload": {
+            "id": "M_GUEST",
+            "from": "120363@g.us",
+            "participant": "8613999999999@c.us",
+            "fromMe": False,
+            "body": "@8619900009999 /model gpt-5",
+            "mentionedIds": ["8619900009999@c.us"],
+        },
+    }
+    assert ch.group_context_manager.accepts(ch.parse_inbound(guest_event)) is False
+
+    # 2. Full ChannelManager worker loop processes owner command through accepts() + handle_inbound(merged)
+    manager = ChannelManager({"wa-e2e": ch})
+    await manager.start()
+    try:
+        assert ch.is_connected is True
+        ch.enqueue(owner_event)
+        await asyncio.wait_for(delivered.wait(), timeout=2.0)
+        assert len(sent_payloads) == 1
+        assert sent_payloads[0]["chatId"] == "120363@g.us"
+        assert sent_payloads[0]["text"] == "Echo: /model gpt-5"
+
+        # 3. WAHA WebSocket is_connected tracks live websocket state
+        fake_ws = MagicMock(closed=False)
+        fake_task = MagicMock()
+        fake_task.done.return_value = False
+        ch._ws = fake_ws
+        ch._ws_task = fake_task
+        assert ch.is_connected is True
+        fake_ws.closed = True
+        assert ch.is_connected is False
+        ch._ws = None
+        ch._ws_task = None
+    finally:
+        await manager.stop()
+    assert ch.is_connected is False
