@@ -346,10 +346,20 @@ async def fetch_whatsapp_bridge_qr(
                 s_resp.raise_for_status()
                 s_data = await s_resp.json()
                 status = str(s_data.get("status") or "UNKNOWN")
-                if status in ("STOPPED", "FAILED"):
+                if status == "FAILED":
+                    async with client.post(f"{base}/api/sessions/{session}/restart", headers=headers) as rst_resp:
+                        if rst_resp.status < 400:
+                            rst_data: dict[str, Any] = await rst_resp.json()
+                            status = str(rst_data.get("status") or "STARTING")
+                        elif rst_resp.status == 404:
+                            async with client.post(f"{base}/api/sessions/{session}/start", headers=headers) as st_resp:
+                                if st_resp.status < 400:
+                                    st_data: dict[str, Any] = await st_resp.json()
+                                    status = str(st_data.get("status") or "STARTING")
+                elif status == "STOPPED":
                     async with client.post(f"{base}/api/sessions/{session}/start", headers=headers) as st_resp:
                         if st_resp.status < 400:
-                            st_data: dict[str, Any] = await st_resp.json()
+                            st_data = await st_resp.json()
                             status = str(st_data.get("status") or "STARTING")
 
         if status.upper() == "WORKING":
@@ -466,11 +476,15 @@ class WhatsAppChannel(BaseChannel):
         )
         self._display_phone_number: str = ""
         self._self_jid: str = ""
+        self._self_lid: str = ""
         self._connection_session: str | None = None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._ws_task: asyncio.Task[None] | None = None
+        self._ws_ready = asyncio.Event()
+        self.runtime_error: str | None = None
         self._stopping = False
         self._seen_messages: OrderedDict[str, None] = OrderedDict()
+        self._sent_message_ids: OrderedDict[str, None] = OrderedDict()
 
     def _default_constraints(self) -> ChannelConstraints:
         return ChannelConstraints(
@@ -511,6 +525,67 @@ class WhatsAppChannel(BaseChannel):
             self._seen_messages.popitem(last=False)
         return False
 
+    def _remember_sent_message_ids(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        candidates: list[str] = []
+        raw_id = payload.get("id")
+        if isinstance(raw_id, str) and raw_id.strip():
+            candidates.append(raw_id.strip())
+        elif isinstance(raw_id, dict):
+            for k in ("_serialized", "id"):
+                v = raw_id.get(k)
+                if isinstance(v, str) and v.strip():
+                    candidates.append(v.strip())
+        key_obj = _as_dict(payload.get("key"))
+        if isinstance(key_obj.get("id"), str) and key_obj["id"].strip():
+            candidates.append(key_obj["id"].strip())
+        data_key = _as_dict(_as_dict(payload.get("_data")).get("key"))
+        if isinstance(data_key.get("id"), str) and data_key["id"].strip():
+            candidates.append(data_key["id"].strip())
+        for cid in candidates:
+            self._sent_message_ids[cid] = None
+            while len(self._sent_message_ids) > _DEDUP_MAX_SIZE:
+                self._sent_message_ids.popitem(last=False)
+
+    def _is_sent_by_self(self, payload: dict[str, Any]) -> bool:
+        msg_id = str(payload.get("id") or "").strip()
+        if msg_id and msg_id in self._sent_message_ids:
+            return True
+        data_key = _as_dict(_as_dict(payload.get("_data")).get("key"))
+        raw_key_id = str(data_key.get("id") or "").strip()
+        return bool(raw_key_id and raw_key_id in self._sent_message_ids)
+
+    def _is_self_chat(self, chat_id: str, *, me: dict[str, Any] | None = None) -> bool:
+        target = chat_id.strip().lower()
+        if not target or target.endswith("@g.us") or target == "status@broadcast":
+            return False
+        me_dict = me if isinstance(me, dict) else {}
+        self_jids = [
+            j.strip().lower()
+            for j in (
+                self._self_jid,
+                str(me_dict.get("id") or ""),
+            )
+            if j and j.strip()
+        ]
+        self_lids = [
+            lid.strip().lower()
+            for lid in (
+                self._self_lid,
+                str(me_dict.get("lid") or ""),
+            )
+            if lid and lid.strip()
+        ]
+        if target in self_jids or target in self_lids:
+            return True
+        norm_target = normalize_whatsapp_identifier(target)
+        if not norm_target:
+            return False
+        if target.endswith("@lid"):
+            return any(normalize_whatsapp_identifier(lid) == norm_target for lid in self_lids)
+        return any(normalize_whatsapp_identifier(jid) == norm_target for jid in self_jids)
+
     # =========================================================================
     # Lifecycle
     # =========================================================================
@@ -522,6 +597,7 @@ class WhatsAppChannel(BaseChannel):
             raise ValueError(f"WhatsApp channel missing required credentials: {', '.join(missing)}")
 
         self._stopping = False
+        self._ws_ready.clear()
         mode = self.provider
 
         if mode == "cloud":
@@ -537,13 +613,30 @@ class WhatsAppChannel(BaseChannel):
                     self._waha_ws_loop(),
                     name=f"whatsapp-waha-ws-{self._channel_id}",
                 )
+                await self._wait_ws_ready(timeout=5.0)
         elif mode == "evolution":
             await self._verify_evolution_bridge()
         self._connection_session = f"whatsapp-{uuid.uuid4().hex[:12]}"
 
+    async def _wait_ws_ready(self, *, timeout: float) -> None:
+        if self._ws_task is None:
+            return
+        ready_task = asyncio.create_task(self._ws_ready.wait())
+        try:
+            await asyncio.wait(
+                {ready_task, self._ws_task},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            ready_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ready_task
+
     async def stop(self) -> None:
         """Stop WebSocket listener and close HTTP session."""
         self._stopping = True
+        self._ws_ready.clear()
         if self._ws_task and not self._ws_task.done():
             self._ws_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -554,6 +647,7 @@ class WhatsAppChannel(BaseChannel):
                 await self._ws.close()
         self._ws = None
         self._connection_session = None
+        self.runtime_error = None
         await self._close_http()
 
     @property
@@ -594,6 +688,8 @@ class WhatsAppChannel(BaseChannel):
         me = _as_dict(data.get("me"))
         if me.get("id"):
             self._self_jid = str(me["id"])
+        if me.get("lid"):
+            self._self_lid = str(me["lid"])
         return data
 
     async def _verify_evolution_bridge(self) -> dict[str, Any]:
@@ -619,8 +715,15 @@ class WhatsAppChannel(BaseChannel):
         ws_path = f"{base_path}/ws"
         query_params: dict[str, str] = {
             "session": self._config.session_name.strip() or "default",
-            "events": "message",
+            # Subscribe to message.any so both messages from others (fromMe=false)
+            # and user-authored self-chat ("Message Yourself", fromMe=true, source=app)
+            # are received once without duplicates; non-self-chat and API echoes are filtered.
+            "events": "message.any",
         }
+        api_key = self._config.bridge_api_key.strip()
+        if api_key:
+            # WAHA WebSocketAuth validates x-api-key from query params (not HTTP upgrade headers).
+            query_params["x-api-key"] = api_key
         return urlunparse((ws_scheme, parsed.netloc, ws_path, "", urlencode(query_params), ""))
 
     async def _waha_ws_loop(self) -> None:
@@ -628,6 +731,9 @@ class WhatsAppChannel(BaseChannel):
         backoff = 1.0
         headers = _bridge_headers("waha", self._config.bridge_api_key)
         while not self._stopping:
+            close_code: int | None = None
+            connected_at: float | None = None
+            received_text = False
             try:
                 ws_url = self._build_waha_ws_url()
                 http = await self._ensure_http()
@@ -638,26 +744,52 @@ class WhatsAppChannel(BaseChannel):
                     proxy=self._proxy(),
                 ) as ws:
                     self._ws = ws
+                    self.runtime_error = None
                     self._connection_session = f"whatsapp-{uuid.uuid4().hex[:12]}"
-                    backoff = 1.0
+                    connected_at = time.monotonic()
+                    self._ws_ready.set()
                     async for msg in ws:
                         if self._stopping:
                             break
                         if msg.type == aiohttp.WSMsgType.TEXT:
+                            received_text = True
                             self._handle_waha_ws_frame(msg.data)
-                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        elif msg.type in (
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSING,
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.ERROR,
+                        ):
                             break
+                    close_code = getattr(ws, "close_code", None)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 if self._stopping:
                     break
-                logger.warning("WAHA WebSocket disconnected; reconnecting in %.1fs", backoff, exc_info=True)
+                err_msg = re.sub(r"(x-api-key=)[^&\s]+", r"\1***", str(exc), flags=re.IGNORECASE)
+                self.runtime_error = err_msg or type(exc).__name__
+                logger.warning("WAHA WebSocket disconnected (%s); reconnecting in %.1fs", self.runtime_error, backoff)
                 self.note_reconnect()
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2.0, 30.0)
+                continue
             finally:
                 self._ws = None
+                self._ws_ready.clear()
+
+            if self._stopping:
+                break
+            if received_text or (connected_at is not None and (time.monotonic() - connected_at) >= 5.0):
+                backoff = 1.0
+            if close_code == 1008:
+                self.runtime_error = "WAHA WebSocket unauthorized (close code 1008); check bridge_api_key"
+                logger.warning("%s; reconnecting in %.1fs", self.runtime_error, backoff)
+            else:
+                logger.warning("WAHA WebSocket closed (code=%s); reconnecting in %.1fs", close_code, backoff)
+            self.note_reconnect()
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2.0, 30.0)
 
     def _handle_waha_ws_frame(self, raw_text: str) -> None:
         try:
@@ -791,6 +923,8 @@ class WhatsAppChannel(BaseChannel):
             me = _as_dict(payload.get("me"))
             if me.get("id"):
                 self._self_jid = str(me["id"])
+            if me.get("lid"):
+                self._self_lid = str(me["lid"])
             enriched = {
                 "_format": "waha",
                 "event": ev_name,
@@ -898,14 +1032,23 @@ class WhatsAppChannel(BaseChannel):
 
         if fmt == "waha" or ("from" in item and "fromMe" in item):
             p = _as_dict(item.get("payload"), item)
-            if p.get("fromMe"):
-                return False
+            me = _as_dict(item.get("me"))
             msg_id = str(p.get("id") or "")
-            chat_id = str(p.get("from") or p.get("chatId") or "")
+            chat_id = str(p.get("from") or p.get("chatId") or p.get("to") or "")
             if not chat_id or chat_id == "status@broadcast":
                 return False
             is_group = chat_id.endswith("@g.us")
+            if p.get("fromMe"):
+                # Never process bot API echoes or outgoing messages sent to other users/groups.
+                # Only allow user-authored self-chat ("Message Yourself") messages.
+                source = str(p.get("source") or "").strip().lower()
+                if source == "api" or self._is_sent_by_self(p):
+                    return False
+                if is_group or not self._is_self_chat(chat_id, me=me):
+                    return False
             sender = str(p.get("participant") or p.get("author") or chat_id)
+            if p.get("fromMe") and self._self_jid:
+                sender = self._self_jid
             if not self._is_allowed_sender(sender, chat_id, is_group=is_group):
                 return False
             return not self._is_duplicate(msg_id)
@@ -1517,6 +1660,8 @@ class WhatsAppChannel(BaseChannel):
             if resp.status >= 400:
                 body = await resp.text()
                 raise RuntimeError(f"WAHA sendText failed (HTTP {resp.status}): {body[:200]}")
+            with contextlib.suppress(Exception):
+                self._remember_sent_message_ids(await resp.json())
 
     async def _send_evolution_text(self, chat_id: str, text: str, *, reply_to: str | None = None) -> None:
         http = await self._ensure_http()
@@ -1683,6 +1828,8 @@ class WhatsAppChannel(BaseChannel):
             proxy=self._proxy(),
         ) as resp:
             resp.raise_for_status()
+            with contextlib.suppress(Exception):
+                self._remember_sent_message_ids(await resp.json())
 
     async def _send_evolution_media(
         self,
