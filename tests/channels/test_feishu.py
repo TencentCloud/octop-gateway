@@ -869,3 +869,145 @@ class TestFeishuChannelExtendedUnit:
 
         # Bot messages should be skipped
         assert len(enqueued) == 0
+
+
+# ---------------------------------------------------------------------------
+# Typing indicator lifecycle (Typing reaction add/remove)
+# ---------------------------------------------------------------------------
+
+
+class TestFeishuTypingReactionLifecycle:
+    """Feishu has no native typing API; the ``Typing`` reaction must be added
+    when processing starts and removed when it ends, otherwise the "typing"
+    indicator stays visible forever. See upstream issue for the bug report.
+    """
+
+    def test_extract_message_id_from_dict(self) -> None:
+        assert FeishuChannel._extract_message_id({"message_id": "om_123"}) == "om_123"
+        assert FeishuChannel._extract_message_id({}) == ""
+        assert FeishuChannel._extract_message_id(None) == ""
+
+    def test_extract_message_id_from_inbound(self) -> None:
+        ch = FeishuChannel(processor=_noop_processor, config=_make_config())
+        msg = ch.parse_inbound({
+            "message_id": "om_456",
+            "message_type": "text",
+            "content": '{"text":"hi"}',
+            "chat_id": "oc_chat",
+            "chat_type": "p2p",
+            "sender": {"sender_id": "ou_user", "sender_type": "user"},
+        })
+        assert FeishuChannel._extract_message_id(msg) == "om_456"
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_removes_typing_reaction_on_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from octop_gateway.channel import BaseChannel
+
+        ch = FeishuChannel(processor=_noop_processor, config=_make_config())
+        calls: list[tuple[str, ...]] = []
+
+        async def _fake_add(message_id: str, emoji_type: str) -> str:
+            calls.append(("add", message_id, emoji_type))
+            return "reaction_1"
+
+        async def _fake_remove(message_id: str, reaction_id: str) -> None:
+            calls.append(("remove", message_id, reaction_id))
+
+        async def _fake_base_handle(self, raw_payload: object) -> None:
+            calls.append(("process",))
+
+        ch._add_reaction = _fake_add  # type: ignore[method-assign]
+        ch._remove_reaction = _fake_remove  # type: ignore[method-assign]
+        monkeypatch.setattr(BaseChannel, "handle_inbound", _fake_base_handle)
+
+        await ch.handle_inbound({"message_id": "om_ok"})
+
+        assert calls == [
+            ("add", "om_ok", "Typing"),
+            ("process",),
+            ("remove", "om_ok", "reaction_1"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_removes_typing_reaction_on_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from octop_gateway.channel import BaseChannel
+
+        ch = FeishuChannel(processor=_noop_processor, config=_make_config())
+        calls: list[tuple[str, ...]] = []
+
+        async def _fake_add(message_id: str, emoji_type: str) -> str:
+            calls.append(("add", message_id, emoji_type))
+            return "reaction_2"
+
+        async def _fake_remove(message_id: str, reaction_id: str) -> None:
+            calls.append(("remove", message_id, reaction_id))
+
+        async def _fake_base_handle(self, raw_payload: object) -> None:
+            calls.append(("process",))
+            raise RuntimeError("boom")
+
+        ch._add_reaction = _fake_add  # type: ignore[method-assign]
+        ch._remove_reaction = _fake_remove  # type: ignore[method-assign]
+        monkeypatch.setattr(BaseChannel, "handle_inbound", _fake_base_handle)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await ch.handle_inbound({"message_id": "om_err"})
+
+        # Removal must still happen even when processing fails.
+        assert calls == [
+            ("add", "om_err", "Typing"),
+            ("process",),
+            ("remove", "om_err", "reaction_2"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_skips_reactions_without_message_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from octop_gateway.channel import BaseChannel
+
+        ch = FeishuChannel(processor=_noop_processor, config=_make_config())
+        calls: list[str] = []
+
+        async def _fake_add(message_id: str, emoji_type: str) -> str:
+            calls.append("add")
+            return "reaction_x"
+
+        async def _fake_remove(message_id: str, reaction_id: str) -> None:
+            calls.append("remove")
+
+        async def _fake_base_handle(self, raw_payload: object) -> None:
+            calls.append("process")
+
+        ch._add_reaction = _fake_add  # type: ignore[method-assign]
+        ch._remove_reaction = _fake_remove  # type: ignore[method-assign]
+        monkeypatch.setattr(BaseChannel, "handle_inbound", _fake_base_handle)
+
+        await ch.handle_inbound({"message_id": ""})
+
+        assert calls == ["process"]
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_no_removal_when_add_failed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """If Feishu did not return a reaction_id we cannot delete anything;
+        avoid a bogus DELETE with an empty id."""
+        from octop_gateway.channel import BaseChannel
+
+        ch = FeishuChannel(processor=_noop_processor, config=_make_config())
+        calls: list[str] = []
+
+        async def _fake_add(message_id: str, emoji_type: str) -> str:
+            calls.append("add")
+            return ""
+
+        async def _fake_remove(message_id: str, reaction_id: str) -> None:
+            calls.append("remove")
+
+        async def _fake_base_handle(self, raw_payload: object) -> None:
+            calls.append("process")
+
+        ch._add_reaction = _fake_add  # type: ignore[method-assign]
+        ch._remove_reaction = _fake_remove  # type: ignore[method-assign]
+        monkeypatch.setattr(BaseChannel, "handle_inbound", _fake_base_handle)
+
+        await ch.handle_inbound({"message_id": "om_no_reaction"})
+
+        assert calls == ["add", "process"]
