@@ -886,7 +886,7 @@ class BaseChannel(ABC):
     ) -> tuple[InboundMessage, ChannelSubject] | None:
         """Prepare one message for any channel-specific output strategy."""
         force_activation = force_activation or _inbound_activation.get()
-        message = self.parse_inbound(raw_payload)
+        message = raw_payload if isinstance(raw_payload, InboundMessage) else self.parse_inbound(raw_payload)
         await self._preprocess_inbound(message)
         if not self._group_context.accepts(message):
             return None

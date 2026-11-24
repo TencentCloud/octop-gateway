@@ -553,7 +553,17 @@ class WhatsAppChannel(BaseChannel):
             with contextlib.suppress(Exception):
                 await self._ws.close()
         self._ws = None
+        self._connection_session = None
         await self._close_http()
+
+    @property
+    def is_connected(self) -> bool:
+        """Return whether this WhatsApp adapter is currently ready to receive/send events."""
+        if self._stopping:
+            return False
+        if self._ws_task is not None:
+            return bool(self._ws is not None and not self._ws.closed and not self._ws_task.done())
+        return self._connection_session is not None
 
     async def _verify_cloud_credentials(self) -> dict[str, Any]:
         """Validate Meta Cloud API ``access_token`` and ``phone_number_id``."""
@@ -855,7 +865,7 @@ class WhatsAppChannel(BaseChannel):
             return norm_sender in allowed_users
         return True
 
-    async def _preprocess_inbound(self, message: InboundMessage) -> None:
+    def _normalize_owner_sender(self, message: InboundMessage) -> InboundMessage:
         meta = message.metadata
         if isinstance(meta, dict) and self._config.group_context.owner_ids:
             sender = str(meta.get("sender_id") or "").strip()
@@ -866,6 +876,10 @@ class WhatsAppChannel(BaseChannel):
                     if owner_str and normalize_whatsapp_identifier(owner_str) == norm_sender:
                         meta["sender_id"] = owner_str
                         break
+        return message
+
+    async def _preprocess_inbound(self, message: InboundMessage) -> None:
+        self._normalize_owner_sender(message)
         await super()._preprocess_inbound(message)
 
     def _should_accept_normalized(self, item: dict[str, Any]) -> bool:
@@ -919,6 +933,8 @@ class WhatsAppChannel(BaseChannel):
 
     def parse_inbound(self, raw_payload: Any) -> InboundMessage:
         """Parse a Cloud API, WAHA, or Evolution API message payload into :class:`InboundMessage`."""
+        if isinstance(raw_payload, InboundMessage):
+            return self._normalize_owner_sender(raw_payload)
         if not isinstance(raw_payload, dict):
             raise TypeError(
                 f"Expected dict payload for WhatsAppChannel.parse_inbound, got {type(raw_payload).__name__}"
@@ -934,16 +950,18 @@ class WhatsAppChannel(BaseChannel):
         if fmt == "waha" or (
             isinstance(raw_payload.get("payload"), dict) and raw_payload.get("event") in ("message", "message.any")
         ):
-            return self._parse_waha_inbound(raw_payload)
+            return self._normalize_owner_sender(self._parse_waha_inbound(raw_payload))
         if fmt == "evolution" or (
             raw_payload.get("event") == "messages.upsert" and isinstance(raw_payload.get("data"), dict)
         ):
-            return self._parse_evolution_inbound(raw_payload)
+            return self._normalize_owner_sender(self._parse_evolution_inbound(raw_payload))
         if "fromMe" in raw_payload and "from" in raw_payload and "body" in raw_payload:
-            return self._parse_waha_inbound({"_format": "waha", "payload": raw_payload})
+            return self._normalize_owner_sender(self._parse_waha_inbound({"_format": "waha", "payload": raw_payload}))
         if isinstance(raw_payload.get("key"), dict) and "remoteJid" in raw_payload["key"]:
-            return self._parse_evolution_inbound({"_format": "evolution", "data": raw_payload})
-        return self._parse_cloud_inbound(raw_payload)
+            return self._normalize_owner_sender(
+                self._parse_evolution_inbound({"_format": "evolution", "data": raw_payload})
+            )
+        return self._normalize_owner_sender(self._parse_cloud_inbound(raw_payload))
 
     def _parse_cloud_inbound(self, payload: dict[str, Any]) -> InboundMessage:
         msg = _as_dict(payload.get("message"), payload)
@@ -1017,7 +1035,6 @@ class WhatsAppChannel(BaseChannel):
             "provider": "cloud",
             "message_id": msg_id,
             "chat_id": chat_id,
-            "conversation_id": chat_id,
             "recipient_id": chat_id,
             "sender_id": sender_id,
             "sender_name": sender_name,
@@ -1026,6 +1043,8 @@ class WhatsAppChannel(BaseChannel):
             "bot_mentioned": bot_mentioned,
             "has_mentions": "@" in raw_text,
         }
+        if is_group and chat_id:
+            metadata["conversation_id"] = chat_id
         if reply_to_id:
             metadata["reply_to_message_id"] = reply_to_id
         if reply_quote_text:
@@ -1133,7 +1152,6 @@ class WhatsAppChannel(BaseChannel):
             "session_name": str(envelope.get("session") or self._config.session_name),
             "message_id": msg_id,
             "chat_id": chat_id,
-            "conversation_id": chat_id,
             "recipient_id": chat_id,
             "sender_id": sender_id,
             "sender_name": sender_name,
@@ -1142,6 +1160,8 @@ class WhatsAppChannel(BaseChannel):
             "bot_mentioned": bot_mentioned,
             "has_mentions": has_mentions,
         }
+        if is_group and chat_id:
+            metadata["conversation_id"] = chat_id
         if reply_to_id:
             metadata["reply_to_message_id"] = reply_to_id
         if reply_quote_text:
@@ -1262,7 +1282,6 @@ class WhatsAppChannel(BaseChannel):
             "session_name": str(envelope.get("instance") or self._config.session_name),
             "message_id": msg_id,
             "chat_id": chat_id,
-            "conversation_id": chat_id,
             "recipient_id": chat_id,
             "sender_id": sender_id,
             "sender_name": sender_name,
@@ -1271,6 +1290,8 @@ class WhatsAppChannel(BaseChannel):
             "bot_mentioned": bot_mentioned,
             "has_mentions": has_mentions,
         }
+        if is_group and chat_id:
+            metadata["conversation_id"] = chat_id
         if reply_to_id:
             metadata["reply_to_message_id"] = reply_to_id
         if reply_quote_text:

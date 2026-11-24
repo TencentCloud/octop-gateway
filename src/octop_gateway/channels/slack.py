@@ -44,6 +44,8 @@ from octop_gateway.models import (
     ChannelSubject,
     ContentPart,
     FileContent,
+    GroupContext,
+    GroupContextMessage,
     ImageContent,
     InboundMessage,
     MessageEventType,
@@ -57,7 +59,10 @@ logger = logging.getLogger(__name__)
 
 _SLACK_MAX_MESSAGE_LEN = 3800
 _DEDUP_MAX_SIZE = 1000
-_MENTION_RE = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]+)?>")
+_PARTICIPATED_THREADS_MAX_SIZE = 1000
+_FETCHED_THREADS_MAX_SIZE = 500
+_REPLY_BROADCAST_MODES = ("off", "first", "all")
+_MENTION_RE = re.compile(r"<@([A-Z0-9_]+)(?:\|[^>]+)?>")
 _FENCE_RE = re.compile(r"^(`{3,}|~{3,})")
 
 
@@ -135,6 +140,9 @@ class SlackConfig(ChannelConfig):
     allowed_user_ids: list[str] = field(default_factory=list)
     ignore_mention_all: bool = False
     reply_in_thread: bool = True
+    reply_broadcast: str = "first"
+    thread_follow_up: bool = True
+    fetch_thread_context: bool = True
     thread_isolation: bool = False
     streaming_mode: str = "off"
     status_reactions: bool = False
@@ -155,6 +163,13 @@ class SlackConfig(ChannelConfig):
             normalized["allowed_channel_ids"] = _coerce_id_list(normalized["allowed_channel_ids"])
         if "allowed_user_ids" in normalized:
             normalized["allowed_user_ids"] = _coerce_id_list(normalized["allowed_user_ids"])
+        if "reply_broadcast" in normalized:
+            raw_rb = normalized["reply_broadcast"]
+            if isinstance(raw_rb, bool):
+                normalized["reply_broadcast"] = "all" if raw_rb else "off"
+            else:
+                rb_str = str(raw_rb or "").strip().lower()
+                normalized["reply_broadcast"] = rb_str if rb_str in _REPLY_BROADCAST_MODES else "first"
         return super().from_dict(normalized)
 
 
@@ -165,6 +180,11 @@ SlackConfig.field_aliases = {  # type: ignore[attr-defined]
     "appToken": "app_token",
     "signingSecret": "signing_secret",
     "proxy": "http_proxy",
+    "replyInThread": "reply_in_thread",
+    "replyBroadcast": "reply_broadcast",
+    "threadFollowUp": "thread_follow_up",
+    "fetchThreadContext": "fetch_thread_context",
+    "threadIsolation": "thread_isolation",
 }
 
 
@@ -198,7 +218,9 @@ class SlackChannel(BaseChannel):
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._ws_task: asyncio.Task[None] | None = None
         self._stopping = False
-        self._seen_events: OrderedDict[str, None] = OrderedDict()
+        self._seen_events: OrderedDict[str, str] = OrderedDict()
+        self._participated_threads: OrderedDict[str, None] = OrderedDict()
+        self._fetched_threads: OrderedDict[str, None] = OrderedDict()
 
     def _default_constraints(self) -> ChannelConstraints:
         return ChannelConstraints(
@@ -216,6 +238,15 @@ class SlackChannel(BaseChannel):
         """Resolved Slack bot user ID (e.g. ``U01234567``)."""
         return self._bot_user_id
 
+    @property
+    def is_connected(self) -> bool:
+        """Return whether this Slack adapter is currently ready to receive/send events."""
+        if self._stopping:
+            return False
+        if self._ws_task is not None:
+            return bool(self._ws is not None and not self._ws.closed and not self._ws_task.done())
+        return self._connection_session is not None
+
     def _proxy(self) -> str | None:
         return self._config.http_proxy.strip() or None
 
@@ -223,17 +254,69 @@ class SlackChannel(BaseChannel):
         base = self._config.api_base.rstrip("/")
         return f"{base}/{method.lstrip('/')}"
 
-    def _is_duplicate(self, event_key: str) -> bool:
-        """Return True if *event_key* was already seen, else record it."""
+    def _is_duplicate(self, event_key: str, *, is_mention: bool = False) -> bool:
+        """Return True if *event_key* was already seen, else record it.
+
+        When both ``message`` and ``app_mention`` events are subscribed, Slack
+        delivers both with the same ``(channel, ts)``.  If a non-mention
+        ``message`` arrived first (e.g. before ``bot_user_id`` was resolved),
+        a subsequent ``app_mention`` for the same timestamp is allowed through.
+        """
         if not event_key:
             return False
-        if event_key in self._seen_events:
+        kind = "mention" if is_mention else "message"
+        existing = self._seen_events.get(event_key)
+        if existing is not None:
+            if is_mention and existing == "unresolved_message":
+                self._seen_events[event_key] = "mention"
+                self._seen_events.move_to_end(event_key)
+                return False
             self._seen_events.move_to_end(event_key)
             self.dropped_duplicate += 1
             return True
-        self._seen_events[event_key] = None
+        self._seen_events[event_key] = kind if (is_mention or self._bot_user_id) else "unresolved_message"
         while len(self._seen_events) > _DEDUP_MAX_SIZE:
             self._seen_events.popitem(last=False)
+        return False
+
+    def _mark_thread_participated(self, channel_id: str, thread_ts: str) -> None:
+        if not channel_id or not thread_ts:
+            return
+        key = f"{channel_id}:{thread_ts}"
+        self._participated_threads[key] = None
+        self._participated_threads.move_to_end(key)
+        while len(self._participated_threads) > _PARTICIPATED_THREADS_MAX_SIZE:
+            self._participated_threads.popitem(last=False)
+
+    def _is_thread_participated(self, channel_id: str, thread_ts: str) -> bool:
+        if not channel_id or not thread_ts:
+            return False
+        key = f"{channel_id}:{thread_ts}"
+        if key in self._participated_threads:
+            self._participated_threads.move_to_end(key)
+            return True
+        return False
+
+    def _mark_thread_fetched(self, channel_id: str, thread_ts: str) -> None:
+        if not channel_id or not thread_ts:
+            return
+        key = f"{channel_id}:{thread_ts}"
+        self._fetched_threads[key] = None
+        self._fetched_threads.move_to_end(key)
+        while len(self._fetched_threads) > _FETCHED_THREADS_MAX_SIZE:
+            self._fetched_threads.popitem(last=False)
+
+    def _should_broadcast_reply(self, subject: ChannelSubject, thread_ts: str | None) -> bool:
+        """Whether ``chat.postMessage`` should set ``reply_broadcast=True`` (Also send to channel)."""
+        if not thread_ts:
+            return False
+        raw_mode = self._config.reply_broadcast
+        mode = ("all" if raw_mode else "off") if isinstance(raw_mode, bool) else str(raw_mode or "off").strip().lower()
+        if mode == "all":
+            return True
+        if mode == "first":
+            meta = subject.metadata or {}
+            return not bool(meta.get("is_thread_reply"))
         return False
 
     # =========================================================================
@@ -269,6 +352,7 @@ class SlackChannel(BaseChannel):
             with contextlib.suppress(Exception):
                 await self._ws.close()
         self._ws = None
+        self._connection_session = None
         await self._close_http()
 
     async def _verify_auth(self) -> dict[str, Any]:
@@ -468,13 +552,23 @@ class SlackChannel(BaseChannel):
             return False
         is_dm = self._is_dm_event(event)
         if not self._is_allowed(channel_id, user_id, is_dm=is_dm):
+            logger.debug("Slack inbound ignored (disallowed): channel=%s user=%s is_dm=%s", channel_id, user_id, is_dm)
             return False
         ts = str(event.get("ts") or event.get("event_ts") or "")
         dedup_key = f"{channel_id}:{ts}" if ts else ""
-        return not self._is_duplicate(dedup_key)
+        raw_text = str(event.get("text") or "")
+        is_mention = event_type == "app_mention" or (
+            bool(self._bot_user_id) and self._bot_user_id in _MENTION_RE.findall(raw_text)
+        )
+        if self._is_duplicate(dedup_key, is_mention=is_mention):
+            logger.debug("Slack inbound ignored (duplicate): channel=%s ts=%s type=%s", channel_id, ts, event_type)
+            return False
+        return True
 
     def parse_inbound(self, raw_payload: Any) -> InboundMessage:
         """Convert a Slack event dict into an :class:`InboundMessage`."""
+        if isinstance(raw_payload, InboundMessage):
+            return raw_payload
         if not isinstance(raw_payload, dict):
             raise TypeError(f"Expected dict payload for SlackChannel.parse_inbound, got {type(raw_payload).__name__}")
 
@@ -487,17 +581,46 @@ class SlackChannel(BaseChannel):
         sender_name = str(event.get("user_name") or event.get("username") or user_id)
         ts_str = str(event.get("ts") or event.get("event_ts") or "")
         thread_ts = str(event.get("thread_ts") or "")
+        parent_user_id = str(event.get("parent_user_id") or "")
         raw_text = str(event.get("text") or "")
         event_type = str(event.get("type") or "message")
 
         is_dm = self._is_dm_event(event)
         is_group = not is_dm
+        is_thread_reply = bool(thread_ts and thread_ts != ts_str)
 
         mentions = _MENTION_RE.findall(raw_text)
         broadcast_mentioned = any(tag in raw_text for tag in ("<!channel>", "<!here>", "<!everyone>"))
         has_mentions = bool(mentions) or broadcast_mentioned
         direct_bot_mention = event_type == "app_mention" or (bool(self._bot_user_id) and self._bot_user_id in mentions)
-        bot_mentioned = direct_bot_mention or (is_group and not self._config.ignore_mention_all and broadcast_mentioned)
+
+        if is_group and direct_bot_mention:
+            self._mark_thread_participated(channel_id, thread_ts or ts_str)
+
+        in_participated_thread = (
+            is_group
+            and is_thread_reply
+            and self._config.thread_follow_up
+            and (
+                self._is_thread_participated(channel_id, thread_ts)
+                or (bool(self._bot_user_id) and parent_user_id == self._bot_user_id)
+            )
+        )
+        other_user_mentioned = bool(mentions) and not (bool(self._bot_user_id) and self._bot_user_id in mentions)
+        thread_follow_up_triggered = in_participated_thread and not other_user_mentioned
+
+        bot_mentioned = (
+            direct_bot_mention
+            or thread_follow_up_triggered
+            or (is_group and not self._config.ignore_mention_all and broadcast_mentioned)
+        )
+        if is_group and not bot_mentioned:
+            logger.debug(
+                "Slack channel message not triggering mention gate: channel=%s thread_ts=%s participated=%s",
+                channel_id,
+                thread_ts,
+                in_participated_thread,
+            )
 
         # Strip own bot mention from text
         cleaned_text = raw_text
@@ -570,7 +693,6 @@ class SlackChannel(BaseChannel):
 
         metadata: dict[str, Any] = {
             "channel_id": channel_id,
-            "conversation_id": channel_id,
             "sender_id": user_id,
             "sender_name": sender_name,
             "ts": ts_str,
@@ -578,9 +700,13 @@ class SlackChannel(BaseChannel):
             "team_id": str(event.get("team") or self._team_id),
             "is_dm": is_dm,
             "is_group": is_group,
+            "is_thread_reply": is_thread_reply,
+            "thread_follow_up": thread_follow_up_triggered,
             "bot_mentioned": bot_mentioned,
             "has_mentions": has_mentions,
         }
+        if is_group and channel_id:
+            metadata["conversation_id"] = channel_id
         if thread_ts:
             metadata["thread_ts"] = thread_ts
         if reply_quote_text:
@@ -604,6 +730,101 @@ class SlackChannel(BaseChannel):
             timestamp=timestamp,
             metadata=metadata,
         )
+
+    async def _preprocess_inbound(self, message: InboundMessage) -> None:
+        meta = message.metadata
+        if (
+            self._config.fetch_thread_context
+            and isinstance(meta, dict)
+            and meta.get("is_group")
+            and meta.get("is_thread_reply")
+            and meta.get("bot_mentioned")
+            and message.group_context is None
+        ):
+            channel_id = str(meta.get("channel_id") or "")
+            thread_ts = str(meta.get("thread_ts") or "")
+            current_ts = str(meta.get("ts") or "")
+            key = f"{channel_id}:{thread_ts}"
+            if channel_id and thread_ts and key not in self._fetched_threads:
+                history_items = await self._fetch_thread_history(channel_id, thread_ts, current_ts=current_ts)
+                if history_items:
+                    policy = self._group_context.policy_for(message)
+                    limit = policy.history_limit
+                    message.group_context = GroupContext(
+                        conversation_id=channel_id,
+                        visibility=policy.visibility,
+                        activation=policy.activation,
+                        messages=history_items[-limit:] if limit else history_items,
+                    )
+        await super()._preprocess_inbound(message)
+
+    async def _fetch_thread_history(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        *,
+        current_ts: str = "",
+    ) -> list[GroupContextMessage]:
+        """Fetch recent replies in a Slack thread via ``conversations.replies`` on first entry."""
+        if not self._config.bot_token or (self._http is None and self._connection_session is None):
+            return []
+        self._mark_thread_fetched(channel_id, thread_ts)
+        limit = max(1, min(self._config.group_context.history_limit, 50)) + 2
+        headers = {"Authorization": f"Bearer {self._config.bot_token}"}
+        params = {"channel": channel_id, "ts": thread_ts, "limit": str(limit)}
+        try:
+            http = await self._ensure_http()
+            async with http.get(
+                self._api_url("conversations.replies"),
+                headers=headers,
+                params=params,
+                proxy=self._proxy(),
+            ) as resp:
+                resp.raise_for_status()
+                data: dict[str, Any] = await resp.json()
+        except Exception:
+            logger.debug("Slack conversations.replies failed; continuing without thread history", exc_info=True)
+            return []
+
+        if not data.get("ok"):
+            logger.debug(
+                "Slack conversations.replies returned error=%s for channel=%s thread_ts=%s",
+                data.get("error", "unknown_error"),
+                channel_id,
+                thread_ts,
+            )
+            return []
+
+        raw_messages = data.get("messages")
+        if not isinstance(raw_messages, list):
+            return []
+
+        items: list[GroupContextMessage] = []
+        for entry in raw_messages:
+            if not isinstance(entry, dict):
+                continue
+            entry_ts = str(entry.get("ts") or "")
+            if current_ts and entry_ts == current_ts:
+                continue
+            text = str(entry.get("text") or "").strip()
+            if not text:
+                continue
+            sender_id = str(entry.get("user") or entry.get("bot_id") or "unknown")
+            sender_name = str(entry.get("username") or sender_id)
+            try:
+                ts_val = float(entry_ts) if entry_ts else time.time()
+            except ValueError:
+                ts_val = time.time()
+            items.append(
+                GroupContextMessage(
+                    message_id=entry_ts,
+                    sender_id=sender_id,
+                    sender_name=sender_name,
+                    text=text,
+                    timestamp=ts_val,
+                )
+            )
+        return items
 
     # =========================================================================
     # Outbound API (Slack Web API)
@@ -657,6 +878,7 @@ class SlackChannel(BaseChannel):
         text: str,
         *,
         message_ts: str | None = None,
+        reply_broadcast: bool = False,
     ) -> str | None:
         if not text.strip():
             return message_ts
@@ -701,6 +923,8 @@ class SlackChannel(BaseChannel):
         post_payload: dict[str, Any] = {"channel": channel_id, "text": first_chunk}
         if thread_ts:
             post_payload["thread_ts"] = thread_ts
+            if reply_broadcast:
+                post_payload["reply_broadcast"] = True
         try:
             async with http.post(
                 self._api_url("chat.postMessage"),
@@ -712,6 +936,8 @@ class SlackChannel(BaseChannel):
                 data = await resp.json()
                 if data.get("ok"):
                     self.note_outbound()
+                    if thread_ts:
+                        self._mark_thread_participated(channel_id, thread_ts)
                     if receipt is not None:
                         receipt.delivered = True
                     return str(data.get("ts") or "") or None
@@ -750,6 +976,7 @@ class SlackChannel(BaseChannel):
 
         channel_id, thread_ts = self._resolve_target(subject)
         stream_ts: str | None = None
+        broadcast_pending = self._should_broadcast_reply(subject, thread_ts)
         delta_buffer: list[str] = []
         thinking_buffer: list[str] = []
         show_thinking = self.should_show_thinking()
@@ -767,7 +994,7 @@ class SlackChannel(BaseChannel):
                 await self._rate_limited_send(subject, formatted)
 
         async def _flush_deltas(*, reset_stream: bool = False) -> None:
-            nonlocal stream_ts
+            nonlocal stream_ts, broadcast_pending
             if not delta_buffer:
                 return
             final_text = self._clean_output("".join(delta_buffer))
@@ -775,8 +1002,14 @@ class SlackChannel(BaseChannel):
             if final_text:
                 chunks = split_slack_text(final_text, limit=_SLACK_MAX_MESSAGE_LEN)
                 stream_ts = await self._post_or_update_stream_text(
-                    channel_id, thread_ts, chunks[0], message_ts=stream_ts
+                    channel_id,
+                    thread_ts,
+                    chunks[0],
+                    message_ts=stream_ts,
+                    reply_broadcast=broadcast_pending,
                 )
+                if stream_ts:
+                    broadcast_pending = False
                 for extra_chunk in chunks[1:]:
                     await self.reply_text(subject, extra_chunk)
             if reset_stream:
@@ -809,8 +1042,14 @@ class SlackChannel(BaseChannel):
                         current_text = self._clean_output("".join(delta_buffer))
                         if current_text:
                             stream_ts = await self._post_or_update_stream_text(
-                                channel_id, thread_ts, current_text, message_ts=stream_ts
+                                channel_id,
+                                thread_ts,
+                                current_text,
+                                message_ts=stream_ts,
+                                reply_broadcast=broadcast_pending,
                             )
+                            if stream_ts:
+                                broadcast_pending = False
                             last_edit_at = now
                 elif event.type == MessageEventType.THINKING and show_thinking:
                     await self._on_thinking(subject, event)
@@ -882,19 +1121,22 @@ class SlackChannel(BaseChannel):
         if not text:
             return
         channel_id, thread_ts = self._resolve_target(subject)
+        broadcast = self._should_broadcast_reply(subject, thread_ts)
         chunks = split_slack_text(text, limit=_SLACK_MAX_MESSAGE_LEN)
         http = await self._ensure_http()
         headers = {
             "Authorization": f"Bearer {self._config.bot_token}",
             "Content-Type": "application/json; charset=utf-8",
         }
-        for chunk in chunks:
+        for idx, chunk in enumerate(chunks):
             payload: dict[str, Any] = {
                 "channel": channel_id,
                 "text": chunk,
             }
             if thread_ts:
                 payload["thread_ts"] = thread_ts
+                if broadcast and idx == 0:
+                    payload["reply_broadcast"] = True
             async with http.post(
                 self._api_url("chat.postMessage"),
                 headers=headers,
@@ -906,6 +1148,8 @@ class SlackChannel(BaseChannel):
                 if not data.get("ok"):
                     err = data.get("error", "unknown_error")
                     raise RuntimeError(f"Slack chat.postMessage failed: {err}")
+        if thread_ts:
+            self._mark_thread_participated(channel_id, thread_ts)
         self.note_outbound()
 
     async def _send_content(self, subject: ChannelSubject, parts: list[ContentPart]) -> None:
@@ -1007,6 +1251,8 @@ class SlackChannel(BaseChannel):
             step3: dict[str, Any] = await resp.json()
         if not step3.get("ok"):
             raise RuntimeError(f"Slack files.completeUploadExternal failed: {step3.get('error', 'unknown_error')}")
+        if thread_ts:
+            self._mark_thread_participated(channel_id, thread_ts)
         return file_id
 
     async def fetch_remote_media(self, url: str) -> tuple[bytes, str]:

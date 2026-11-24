@@ -265,6 +265,7 @@ async def test_slack_socket_mode_frame_ack_and_outbound_send() -> None:
         "channel": "C100",
         "text": "Hello from bot",
         "thread_ts": "1700000100.0001",
+        "reply_broadcast": True,
     }
 
     # Outbound media uses 3-step files.getUploadURLExternal -> upload -> files.completeUploadExternal
@@ -481,3 +482,236 @@ async def test_slack_review_fixes_auth_allowlist_and_text_filter() -> None:
     )
     assert posts == []
     await stream_ch.stop()
+
+
+@pytest.mark.asyncio
+async def test_slack_channel_manager_worker_e2e_and_is_connected() -> None:
+    import asyncio
+
+    from octop_gateway.manager import ChannelManager
+
+    delivered = asyncio.Event()
+    sent_payloads: list[dict[str, Any]] = []
+
+    def _fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/auth.test"):
+            return _FakeResponse(200, {"ok": True, "user_id": "UBOT", "team_id": "T1"})
+        if url.endswith("/chat.postMessage"):
+            sent_payloads.append(kwargs.get("json") or {})
+            delivered.set()
+            return _FakeResponse(200, {"ok": True, "ts": "999.1"})
+        return _FakeResponse(200, {"ok": True})
+
+    fake_http = MagicMock()
+    fake_http.closed = False
+    fake_http.post = MagicMock(side_effect=_fake_post)
+    fake_http.close = AsyncMock()
+
+    ch = SlackChannel(_echo_processor, SlackConfig(bot_token="xoxb-1"), channel_id="slack-e2e")
+    ch._http = fake_http
+    assert ch.is_connected is False
+
+    # 1. parse_inbound accepts already-parsed InboundMessage
+    parsed = ch.parse_inbound({"type": "message", "channel": "D1", "channel_type": "im", "user": "U1", "text": "hi"})
+    assert ch.parse_inbound(parsed) is parsed
+
+    # 2. Full ChannelManager worker loop: enqueue raw dict -> parse_inbound -> handle_inbound(merged) -> chat.postMessage
+    manager = ChannelManager({"slack-e2e": ch})
+    await manager.start()
+    try:
+        assert ch.is_connected is True
+        ch.enqueue({"type": "message", "channel": "D1", "channel_type": "im", "user": "U1", "text": "hello", "ts": "1"})
+        await asyncio.wait_for(delivered.wait(), timeout=2.0)
+        assert len(sent_payloads) == 1
+        assert sent_payloads[0]["channel"] == "D1"
+        assert sent_payloads[0]["text"] == "Echo: hello"
+
+        # 3. Socket Mode is_connected tracks live websocket state
+        fake_ws = MagicMock(closed=False)
+        fake_task = MagicMock()
+        fake_task.done.return_value = False
+        ch._ws = fake_ws
+        ch._ws_task = fake_task
+        assert ch.is_connected is True
+        fake_ws.closed = True
+        assert ch.is_connected is False
+        ch._ws = None
+        ch._ws_task = None
+    finally:
+        await manager.stop()
+    assert ch.is_connected is False
+
+
+@pytest.mark.asyncio
+async def test_slack_thread_followup_broadcast_and_context_fetch() -> None:
+    # 1. Config defaults & normalization
+    default_cfg = SlackConfig.from_dict({"bot_token": "xoxb-1"})
+    assert default_cfg.reply_in_thread is True
+    assert default_cfg.reply_broadcast == "first"
+    assert default_cfg.thread_follow_up is True
+    assert default_cfg.fetch_thread_context is True
+    assert SlackConfig.from_dict({"bot_token": "xoxb-1", "reply_broadcast": False}).reply_broadcast == "off"
+    assert SlackConfig.from_dict({"bot_token": "xoxb-1", "reply_broadcast": True}).reply_broadcast == "all"
+
+    # 2. Participated thread follow-up + anti-hijack + reply_broadcast="first"
+    posted: list[dict[str, Any]] = []
+    replies_calls: list[dict[str, Any]] = []
+
+    def _fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/chat.postMessage"):
+            posted.append(kwargs.get("json") or {})
+            return _FakeResponse(200, {"ok": True, "ts": f"bot.{len(posted)}"})
+        return _FakeResponse(200, {"ok": True})
+
+    def _fake_get(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/conversations.replies"):
+            replies_calls.append(kwargs.get("params") or {})
+            return _FakeResponse(
+                200,
+                {
+                    "ok": True,
+                    "messages": [
+                        {"ts": "100.0", "user": "U1", "text": "Root question"},
+                        {"ts": "100.1", "user": "UBOT", "text": "Earlier bot answer"},
+                        {"ts": "100.2", "user": "U1", "text": "Follow up without mention"},
+                    ],
+                },
+            )
+        return _FakeResponse(200, {"ok": True})
+
+    fake_http = MagicMock()
+    fake_http.closed = False
+    fake_http.post = MagicMock(side_effect=_fake_post)
+    fake_http.get = MagicMock(side_effect=_fake_get)
+    fake_http.close = AsyncMock()
+
+    ch = SlackChannel(
+        _echo_processor,
+        SlackConfig(
+            bot_token="xoxb-1",
+            reply_in_thread=True,
+            reply_broadcast="first",
+            thread_follow_up=True,
+            fetch_thread_context=True,
+        ),
+        channel_id="slack-thread",
+    )
+    ch._bot_user_id = "UBOT"
+    ch._http = fake_http
+
+    # Step A: Mention in main channel -> reply goes into thread WITH reply_broadcast=True
+    root_event = {
+        "type": "app_mention",
+        "channel": "C100",
+        "channel_type": "channel",
+        "user": "U1",
+        "text": "<@UBOT> Hi",
+        "ts": "100.0",
+    }
+    await ch.handle_inbound(root_event)
+    assert len(posted) == 1
+    assert posted[0]["thread_ts"] == "100.0"
+    assert posted[0].get("reply_broadcast") is True
+
+    # Step B: Follow-up in same thread WITHOUT @UBOT -> auto-triggered, NO reply_broadcast, fetches thread history once
+    followup_event = {
+        "type": "message",
+        "channel": "C100",
+        "channel_type": "channel",
+        "user": "U1",
+        "text": "Follow up without mention",
+        "ts": "100.2",
+        "thread_ts": "100.0",
+    }
+    prepared = await ch._prepare_inbound(followup_event)
+    assert prepared is not None
+    followup_msg, followup_subj = prepared
+    assert followup_msg.metadata["bot_mentioned"] is True
+    assert followup_msg.metadata["thread_follow_up"] is True
+    assert followup_msg.group_context is not None
+    assert [m.text for m in followup_msg.group_context.messages] == ["Root question", "Earlier bot answer"]
+    assert len(replies_calls) == 1
+
+    await ch._send_text(followup_subj, "Second answer")
+    assert len(posted) == 2
+    assert posted[1]["thread_ts"] == "100.0"
+    assert "reply_broadcast" not in posted[1]
+
+    # Step C: Anti-hijack — mentioning another user in the thread does NOT trigger bot
+    other_mention = {
+        "type": "message",
+        "channel": "C100",
+        "channel_type": "channel",
+        "user": "U1",
+        "text": "<@U_ALICE> what do you think?",
+        "ts": "100.3",
+        "thread_ts": "100.0",
+    }
+    parsed_other = ch.parse_inbound(other_mention)
+    assert parsed_other.metadata["bot_mentioned"] is False
+
+    # Step D: Second follow-up in same thread does NOT re-call conversations.replies
+    followup_2 = {
+        "type": "message",
+        "channel": "C100",
+        "channel_type": "channel",
+        "user": "U1",
+        "text": "Another follow up",
+        "ts": "100.4",
+        "thread_ts": "100.0",
+    }
+    assert await ch._prepare_inbound(followup_2) is not None
+    assert len(replies_calls) == 1
+
+    # 3. reply_broadcast="all" broadcasts thread follow-up; reply_broadcast="off" never broadcasts
+    ch._config.reply_broadcast = "all"
+    await ch._send_text(followup_subj, "Broadcast follow-up")
+    assert posted[-1].get("reply_broadcast") is True
+
+    ch._config.reply_broadcast = "off"
+    root_msg = ch.parse_inbound(root_event)
+    assert root_msg.channel_subject is not None
+    await ch._send_text(root_msg.channel_subject, "Quiet root reply")
+    assert "reply_broadcast" not in posted[-1]
+
+    # 4. thread_follow_up=False requires explicit @mention even in participated threads
+    ch._config.thread_follow_up = False
+    assert ch.parse_inbound(followup_event).metadata["bot_mentioned"] is False
+
+    # 5. Dual-event dedup: message before bot_user_id resolved does NOT swallow subsequent app_mention
+    race_ch = SlackChannel(_echo_processor, SlackConfig(bot_token="xoxb-1"))
+    assert race_ch._should_handle_event(
+        {"type": "message", "channel": "C1", "user": "U1", "text": "<@UBOT> hi", "ts": "5.0"}
+    )
+    assert race_ch._should_handle_event(
+        {"type": "app_mention", "channel": "C1", "user": "U1", "text": "<@UBOT> hi", "ts": "5.0"}
+    )
+    # Once mention is recorded, another duplicate app_mention IS dropped
+    assert not race_ch._should_handle_event(
+        {"type": "app_mention", "channel": "C1", "user": "U1", "text": "<@UBOT> hi", "ts": "5.0"}
+    )
+
+    # 6. conversations.replies missing_scope degrades gracefully without breaking reply
+    err_http = MagicMock()
+    err_http.closed = False
+    err_http.get = MagicMock(return_value=_FakeResponse(200, {"ok": False, "error": "missing_scope"}))
+    err_http.close = AsyncMock()
+    err_ch = SlackChannel(_echo_processor, SlackConfig(bot_token="xoxb-1", fetch_thread_context=True))
+    err_ch._bot_user_id = "UBOT"
+    err_ch._http = err_http
+    err_prepared = await err_ch._prepare_inbound(
+        {
+            "type": "app_mention",
+            "channel": "C200",
+            "channel_type": "channel",
+            "user": "U1",
+            "text": "<@UBOT> summarize",
+            "ts": "200.5",
+            "thread_ts": "200.0",
+        }
+    )
+    assert err_prepared is not None
+
+    await ch.stop()
+    await race_ch.stop()
+    await err_ch.stop()
