@@ -712,3 +712,53 @@ async def test_slack_thread_followup_broadcast_and_context_fetch() -> None:
     await ch.stop()
     await race_ch.stop()
     await err_ch.stop()
+
+
+@pytest.mark.asyncio
+async def test_slack_start_waits_for_socket_mode_ws_ready() -> None:
+    import asyncio
+
+    release_ws = asyncio.Event()
+
+    class _FakeWS:
+        closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+            release_ws.set()
+
+        def __aiter__(self) -> _FakeWS:
+            return self
+
+        async def __anext__(self) -> Any:
+            await release_ws.wait()
+            raise StopAsyncIteration
+
+        async def __aenter__(self) -> _FakeWS:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            self.closed = True
+
+    def _fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+        if url.endswith("/auth.test"):
+            return _FakeResponse(200, {"ok": True, "user_id": "UBOT", "team_id": "T1"})
+        if url.endswith("/apps.connections.open"):
+            return _FakeResponse(200, {"ok": True, "url": "wss://wss-primary.slack.com/link"})
+        return _FakeResponse(200, {"ok": True})
+
+    fake_http = MagicMock()
+    fake_http.closed = False
+    fake_http.post = MagicMock(side_effect=_fake_post)
+    fake_http.ws_connect = MagicMock(return_value=_FakeWS())
+    fake_http.close = AsyncMock()
+
+    ch = SlackChannel(_echo_processor, SlackConfig(bot_token="xoxb-1", app_token="xapp-1"), channel_id="slack-ws-ready")
+    ch._http = fake_http
+    await ch.start()
+    try:
+        # Must already be connected immediately upon start() returning (no post-save race)
+        assert ch.is_connected is True
+    finally:
+        await ch.stop()
+    assert ch.is_connected is False
