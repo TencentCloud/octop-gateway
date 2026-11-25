@@ -230,22 +230,22 @@ class GroupContextManager:
 
     def handles(self, message: InboundMessage) -> bool:
         conversation_id = self._conversation_id(message)
-        return bool(conversation_id and self._config.resolve(conversation_id).enabled)
+        return bool(conversation_id and self._resolve_policy(message).enabled)
 
     def protects_command(self, message: InboundMessage) -> bool:
         """Keep an authorized command separate from other senders' arguments."""
-        policy = self._config.resolve(self._conversation_id(message))
+        policy = self._resolve_policy(message)
         return self._is_group(message) and policy.owner_commands_only and self._is_octop_command(message.text)
 
     def protects_tools(self, message: InboundMessage) -> bool:
         """Keep different group senders out of the same privileged tool turn."""
-        return self._is_group(message) and self._config.resolve(self._conversation_id(message)).owner_tools_only
+        return self._is_group(message) and self._resolve_policy(message).owner_tools_only
 
     def accepts(self, message: InboundMessage) -> bool:
         """Authorize group commands before batching, host callbacks or media I/O."""
         if not self._is_group(message):
             return True
-        policy = self._config.resolve(self._conversation_id(message))
+        policy = self._resolve_policy(message)
         if self._accepts_command(policy, message.text, message.metadata.get("sender_id")):
             return True
         logger.debug("non_owner_blocked_in_group: channel=%s", message.channel_id)
@@ -290,7 +290,7 @@ class GroupContextManager:
         conversation_id = self._conversation_id(message)
         if not conversation_id:
             return True
-        policy = self._config.resolve(conversation_id)
+        policy = self._resolve_policy(message)
         if not policy.enabled:
             return True
         if self._should_process(message, policy):
@@ -310,7 +310,7 @@ class GroupContextManager:
         if not self.accepts(message):
             return None
         conversation_id = self._conversation_id(message)
-        policy = self._config.resolve(conversation_id)
+        policy = self._resolve_policy(message)
         if (
             self._is_group(message)
             and policy.owner_tools_only
@@ -393,13 +393,33 @@ class GroupContextManager:
         conversation_id = self._conversation_id(message)
         if not conversation_id:
             return
-        policy = self._config.resolve(conversation_id)
+        policy = self._resolve_policy(message)
         if policy.enabled and policy.clear_after_reply:
             self._buffers.pop(conversation_id, None)
 
     def clear(self, conversation_id: str) -> None:
         """Purge retained context after a permission/configuration downgrade."""
         self._buffers.pop(conversation_id, None)
+        thread_prefix = f"{conversation_id}:thread:"
+        for key in [k for k in self._buffers if k.startswith(thread_prefix)]:
+            self._buffers.pop(key, None)
+
+    def _resolve_policy(self, message: InboundMessage) -> GroupContextPolicy:
+        policy_id = self._policy_conversation_id(message)
+        context_id = self._conversation_id(message)
+        policy = self._config.resolve(policy_id)
+        if context_id and context_id != policy_id:
+            specific = self._config.groups.get(context_id)
+            if isinstance(specific, dict):
+                policy = self._config._overlay(policy, specific)
+        return policy
+
+    @staticmethod
+    def _policy_conversation_id(message: InboundMessage) -> str:
+        value = message.metadata.get("group_policy_id")
+        if isinstance(value, str) and value:
+            return value
+        return GroupContextManager._conversation_id(message)
 
     @staticmethod
     def _conversation_id(message: InboundMessage) -> str:

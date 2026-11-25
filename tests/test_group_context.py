@@ -221,3 +221,73 @@ def test_tool_policy_can_be_disabled_for_a_specific_group() -> None:
 def test_tool_policy_rejects_non_boolean_config() -> None:
     with pytest.raises(ValueError, match="owner_tools_only"):
         _ = GroupContextConfig.from_dict({"owner_tools_only": "false"})
+
+
+def test_group_policy_id_separates_permission_key_from_thread_context_buffer() -> None:
+    config = GroupContextConfig.from_dict(
+        {
+            "enabled": False,
+            "groups": {
+                "C1": {
+                    "enabled": True,
+                    "visibility": "all",
+                    "activation": "mention",
+                    "history": "recent",
+                    "clear_after_reply": True,
+                    "owner_commands_only": True,
+                    "owner_tools_only": True,
+                    "owner_ids": ["owner"],
+                }
+            },
+        }
+    )
+    manager = GroupContextManager(config)
+
+    def _thread_msg(thread_id: str, text: str, *, msg_id: str, sender: str, mentioned: bool = False) -> InboundMessage:
+        context_id = f"C1:thread:{thread_id}"
+        return InboundMessage(
+            channel_id="slack-1",
+            channel_type="slack",
+            channel_subject=ChannelSubject(subject_id=context_id, chat_type="group"),
+            content=[TextContent(text=text)],
+            timestamp=100.0,
+            metadata={
+                "chat_type": "group",
+                "group_policy_id": "C1",
+                "conversation_id": context_id,
+                "message_id": msg_id,
+                "sender_id": sender,
+                "sender_name": sender,
+                "bot_mentioned": mentioned,
+            },
+        )
+
+    assert manager.prepare(_thread_msg("t1", "thread 1 passive", msg_id="m1", sender="member")) is None
+    assert manager.prepare(_thread_msg("t2", "thread 2 passive", msg_id="m2", sender="member")) is None
+
+    # Non-owner command rejected via channel-level policy C1
+    assert manager.accepts(_thread_msg("t1", "/model gpt-5", msg_id="m3", sender="member", mentioned=True)) is False
+
+    # Trigger in t2 sees only t2 passive context and gets channel-level owner_tools_only restriction
+    trigger_t2 = manager.prepare(_thread_msg("t2", "answer t2", msg_id="m4", sender="member", mentioned=True))
+    assert trigger_t2 is not None
+    assert trigger_t2.allowed_tools == []
+    assert trigger_t2.group_context is not None
+    assert trigger_t2.group_context.conversation_id == "C1:thread:t2"
+    assert [m.text for m in trigger_t2.group_context.messages] == ["thread 2 passive"]
+
+    # Clearing t2 after reply does not wipe t1's buffered context
+    manager.mark_replied(trigger_t2)
+    trigger_t1 = manager.prepare(_thread_msg("t1", "answer t1", msg_id="m5", sender="owner", mentioned=True))
+    assert trigger_t1 is not None
+    assert trigger_t1.allowed_tools is None
+    assert trigger_t1.group_context is not None
+    assert trigger_t1.group_context.conversation_id == "C1:thread:t1"
+    assert [m.text for m in trigger_t1.group_context.messages] == ["thread 1 passive"]
+
+    # Channel-level clear("C1") purges remaining thread buffers under C1
+    manager.clear("C1")
+    trigger_t1_after = manager.prepare(_thread_msg("t1", "again", msg_id="m6", sender="owner", mentioned=True))
+    assert trigger_t1_after is not None
+    assert trigger_t1_after.group_context is not None
+    assert trigger_t1_after.group_context.messages == []
