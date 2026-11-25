@@ -47,6 +47,7 @@ class DiscordConfig(ChannelConfig):
     http_proxy: str = ""
     http_proxy_auth: str = ""
     allow_all_channels: bool = True
+    allow_all_dms: bool = False
     allowed_user_ids: list[str] = field(default_factory=list)
     allowed_channel_ids: list[str] = field(default_factory=list)
     group_context: GroupContextConfig = field(
@@ -233,7 +234,10 @@ class DiscordChannel(BaseChannel):
         ):
             return
         if message.guild is None:
-            allowed = str(message.author.id) in self._config.allowed_user_ids
+            if self._config.allowed_user_ids:
+                allowed = str(message.author.id) in self._config.allowed_user_ids
+            else:
+                allowed = self._config.allow_all_dms
         else:
             allowed = (
                 self._config.allow_all_channels
@@ -284,14 +288,38 @@ class DiscordChannel(BaseChannel):
             "channel_id_native": chat_id,
             "chat_type": chat_type,
             "sender_id": sender_id,
+            "sender_is_bot": bool(message.author.bot),
             "sender_name": message.author.display_name,
             "message_id": str(message.id),
             "bot_mentioned": mentioned,
+            "has_mentions": bool(
+                getattr(message, "mentions", [])
+                or getattr(message, "role_mentions", [])
+                or getattr(message, "mention_everyone", False)
+            ),
         }
         if is_group:
             metadata["guild_id"] = str(message.guild.id)
         if getattr(message.channel, "parent_id", None):
             metadata["parent_channel_id"] = str(message.channel.parent_id)
+        ref = getattr(message, "reference", None)
+        if ref is not None:
+            ref_msg_id = getattr(ref, "message_id", None)
+            if ref_msg_id is not None:
+                metadata["reply_to_message_id"] = str(ref_msg_id)
+            resolved = getattr(ref, "resolved", None) or getattr(ref, "cached_message", None)
+            if resolved is not None:
+                ref_text = str(getattr(resolved, "content", "") or "").strip()
+                if ref_text:
+                    metadata["reply_quote_text"] = ref_text
+                    metadata["reply_to_text"] = ref_text
+                ref_author = getattr(resolved, "author", None)
+                ref_author_id = getattr(ref_author, "id", None)
+                if ref_author_id is not None:
+                    metadata["reply_to_sender_id"] = str(ref_author_id)
+                    if bot and ref_author_id == bot.id:
+                        metadata["reply_to_is_own_bot"] = True
+                        metadata["bot_mentioned"] = True
         return InboundMessage(
             channel_id=self.channel_id,
             channel_type=self.channel_type,

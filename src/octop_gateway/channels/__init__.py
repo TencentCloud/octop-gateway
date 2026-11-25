@@ -20,6 +20,7 @@ _CHANNEL_MAP: dict[str, str] = {
     "xiaoyi": "octop_gateway.channels.xiaoyi",
     "mqtt": "octop_gateway.channels.mqtt",
     "telegram": "octop_gateway.channels.telegram",
+    "slack": "octop_gateway.channels.slack",
     "whatsapp": "octop_gateway.channels.whatsapp",
 }
 
@@ -41,6 +42,7 @@ class ChannelKind(StrEnum):
     XIAOYI = "xiaoyi"
     MQTT = "mqtt"
     TELEGRAM = "telegram"
+    SLACK = "slack"
     WHATSAPP = "whatsapp"
 
 
@@ -58,6 +60,7 @@ _CLASS_NAMES: dict[str, str] = {
     "xiaoyi": "XiaoyiChannel",
     "mqtt": "MQTTChannel",
     "telegram": "TelegramChannel",
+    "slack": "SlackChannel",
     "whatsapp": "WhatsAppChannel",
 }
 
