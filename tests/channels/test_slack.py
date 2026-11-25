@@ -762,3 +762,261 @@ async def test_slack_start_waits_for_socket_mode_ws_ready() -> None:
     finally:
         await ch.stop()
     assert ch.is_connected is False
+
+
+@pytest.mark.asyncio
+async def test_slack_mpim_treated_as_group_for_routing_and_authorization() -> None:
+    from octop_gateway.group_context import GroupContextConfig
+
+    cfg = SlackConfig(
+        bot_token="xoxb-mpim",
+        owner_only=False,
+        allow_all_dms=True,
+        allow_all_channels=True,
+        group_context=GroupContextConfig(
+            enabled=True,
+            visibility="all",
+            activation="mention",
+            owner_commands_only=True,
+            owner_tools_only=True,
+            owner_ids=["U_OWNER"],
+        ),
+    )
+    ch = SlackChannel(_echo_processor, cfg, channel_id="slack-mpim")
+    ch._bot_user_id = "UBOT"
+
+    # 1. MPIM event is classified as a group conversation (not direct)
+    mpim_cmd = {
+        "type": "message",
+        "channel": "G_MPIM1",
+        "channel_type": "mpim",
+        "user": "U_GUEST",
+        "text": "<@UBOT> /model gpt-5",
+        "ts": "10.1",
+    }
+    parsed_mpim = ch.parse_inbound(mpim_cmd)
+    assert parsed_mpim.channel_subject is not None
+    assert parsed_mpim.channel_subject.chat_type == "group"
+    assert parsed_mpim.metadata["is_group"] is True
+    assert parsed_mpim.metadata["is_dm"] is False
+    assert parsed_mpim.metadata["group_policy_id"] == "G_MPIM1"
+    assert parsed_mpim.metadata["conversation_id"] == "G_MPIM1"
+
+    # Non-owner command in MPIM is rejected by GroupContextManager
+    assert ch.group_context_manager.accepts(parsed_mpim) is False
+    assert await ch._prepare_inbound(mpim_cmd) is None
+
+    # Non-owner normal mention in MPIM has tools restricted
+    mpim_guest_chat = {
+        "type": "message",
+        "channel": "G_MPIM1",
+        "channel_type": "mpim",
+        "user": "U_GUEST",
+        "text": "<@UBOT> run a tool",
+        "ts": "10.2",
+    }
+    prepared_guest = await ch._prepare_inbound(mpim_guest_chat)
+    assert prepared_guest is not None
+    guest_msg, guest_subj = prepared_guest
+    assert guest_subj.chat_type == "group"
+    assert guest_msg.allowed_tools == []
+
+    # Owner command in MPIM is allowed without tool restriction
+    mpim_owner_cmd = {
+        "type": "message",
+        "channel": "G_MPIM1",
+        "channel_type": "mpim",
+        "user": "U_OWNER",
+        "text": "<@UBOT> /model gpt-5",
+        "ts": "10.3",
+    }
+    prepared_owner = await ch._prepare_inbound(mpim_owner_cmd)
+    assert prepared_owner is not None
+    owner_msg, _ = prepared_owner
+    assert owner_msg.allowed_tools is None
+
+    # 2. Channel allowlist also applies to MPIMs (since MPIM is a group, not 1:1 DM)
+    restricted_ch = SlackChannel(
+        _echo_processor,
+        SlackConfig(
+            bot_token="xoxb-mpim",
+            allow_all_dms=True,
+            allow_all_channels=False,
+            allowed_channel_ids=["C_ONLY"],
+        ),
+    )
+    assert not restricted_ch._should_handle_event(
+        {"type": "message", "channel": "G_MPIM1", "channel_type": "mpim", "user": "U_GUEST", "ts": "11.1"}
+    )
+    assert restricted_ch._should_handle_event(
+        {"type": "message", "channel": "D_DM1", "channel_type": "im", "user": "U_GUEST", "ts": "11.2"}
+    )
+
+    # 3. Ordinary 1:1 DM (channel_type="im") retains direct behavior without group restrictions
+    dm_cmd = {
+        "type": "message",
+        "channel": "D_DM1",
+        "channel_type": "im",
+        "user": "U_GUEST",
+        "text": "/model gpt-5",
+        "ts": "12.1",
+    }
+    prepared_dm = await ch._prepare_inbound(dm_cmd)
+    assert prepared_dm is not None
+    dm_msg, dm_subj = prepared_dm
+    assert dm_subj.chat_type == "direct"
+    assert dm_msg.metadata["is_dm"] is True
+    assert dm_msg.metadata["is_group"] is False
+    assert "conversation_id" not in dm_msg.metadata
+    assert dm_msg.allowed_tools is None
+
+    await ch.stop()
+    await restricted_ch.stop()
+
+
+@pytest.mark.asyncio
+async def test_slack_thread_isolation_isolates_passive_context_and_cleanup() -> None:
+    from octop_gateway.group_context import GroupContextConfig
+
+    seen_contexts: list[tuple[str, list[str], list[str] | None]] = []
+
+    async def _recording_processor(msg: InboundMessage) -> AsyncIterator[MessageEvent]:
+        ctx_id = msg.group_context.conversation_id if msg.group_context else ""
+        ctx_texts = [m.text for m in msg.group_context.messages] if msg.group_context else []
+        seen_contexts.append((ctx_id, ctx_texts, msg.allowed_tools))
+        yield MessageEvent.text(f"Ack: {msg.text}")
+        yield MessageEvent.completed()
+
+    fake_http = MagicMock()
+    fake_http.closed = False
+    fake_http.post = MagicMock(return_value=_FakeResponse(200, {"ok": True, "ts": "999.1"}))
+    fake_http.close = AsyncMock()
+
+    # Enable group_context ONLY via channel-level override C_ISO (proving policy key != thread context key)
+    cfg = SlackConfig(
+        bot_token="xoxb-iso",
+        thread_isolation=True,
+        fetch_thread_context=False,
+        thread_follow_up=False,
+        group_context=GroupContextConfig.from_dict(
+            {
+                "enabled": False,
+                "groups": {
+                    "C_ISO": {
+                        "enabled": True,
+                        "visibility": "all",
+                        "activation": "mention",
+                        "history": "recent",
+                        "clear_after_reply": True,
+                        "owner_commands_only": True,
+                        "owner_tools_only": True,
+                        "owner_ids": ["U_OWNER"],
+                    }
+                },
+            }
+        ),
+    )
+    ch = SlackChannel(_recording_processor, cfg, channel_id="slack-iso")
+    ch._bot_user_id = "UBOT"
+    ch._http = fake_http
+
+    # Interleaved passive chatter across Thread A (100.0) and Thread B (200.0)
+    await ch.handle_inbound(
+        {
+            "type": "message",
+            "channel": "C_ISO",
+            "channel_type": "channel",
+            "user": "U_GUEST",
+            "text": "Thread A passive 1",
+            "ts": "100.1",
+            "thread_ts": "100.0",
+        }
+    )
+    await ch.handle_inbound(
+        {
+            "type": "message",
+            "channel": "C_ISO",
+            "channel_type": "channel",
+            "user": "U_GUEST",
+            "text": "Thread B passive 1",
+            "ts": "200.1",
+            "thread_ts": "200.0",
+        }
+    )
+    await ch.handle_inbound(
+        {
+            "type": "message",
+            "channel": "C_ISO",
+            "channel_type": "channel",
+            "user": "U_GUEST",
+            "text": "Thread A passive 2",
+            "ts": "100.2",
+            "thread_ts": "100.0",
+        }
+    )
+    assert seen_contexts == []
+
+    # Channel-level owner_commands_only still blocks non-owner /command inside isolated thread
+    assert (
+        await ch._prepare_inbound(
+            {
+                "type": "app_mention",
+                "channel": "C_ISO",
+                "channel_type": "channel",
+                "user": "U_GUEST",
+                "text": "<@UBOT> /model gpt-5",
+                "ts": "100.25",
+                "thread_ts": "100.0",
+            }
+        )
+        is None
+    )
+
+    # Reply in Thread B (by non-owner): receives ONLY Thread B context, applies channel-level tool restriction,
+    # and clears ONLY Thread B's passive buffer.
+    await ch.handle_inbound(
+        {
+            "type": "app_mention",
+            "channel": "C_ISO",
+            "channel_type": "channel",
+            "user": "U_GUEST",
+            "text": "<@UBOT> handle B",
+            "ts": "200.2",
+            "thread_ts": "200.0",
+        }
+    )
+    assert len(seen_contexts) == 1
+    assert seen_contexts[0] == ("C_ISO:thread:200.0", ["Thread B passive 1"], [])
+
+    # Reply in Thread A (by owner): STILL receives Thread A's buffered messages (not cleared by B),
+    # contains zero Thread B messages, and clears Thread A's buffer after replying.
+    await ch.handle_inbound(
+        {
+            "type": "app_mention",
+            "channel": "C_ISO",
+            "channel_type": "channel",
+            "user": "U_OWNER",
+            "text": "<@UBOT> handle A",
+            "ts": "100.3",
+            "thread_ts": "100.0",
+        }
+    )
+    assert len(seen_contexts) == 2
+    assert seen_contexts[1] == ("C_ISO:thread:100.0", ["Thread A passive 1", "Thread A passive 2"], None)
+
+    # Subsequent trigger in Thread A confirms Thread A's passive buffer was cleared after reply
+    await ch.handle_inbound(
+        {
+            "type": "app_mention",
+            "channel": "C_ISO",
+            "channel_type": "channel",
+            "user": "U_OWNER",
+            "text": "<@UBOT> follow-up A",
+            "ts": "100.4",
+            "thread_ts": "100.0",
+        }
+    )
+    assert len(seen_contexts) == 3
+    assert seen_contexts[2] == ("C_ISO:thread:100.0", [], None)
+
+    await ch.stop()

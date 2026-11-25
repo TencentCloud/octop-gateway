@@ -527,9 +527,12 @@ class SlackChannel(BaseChannel):
     # =========================================================================
 
     def _is_dm_event(self, event: dict[str, Any]) -> bool:
+        """Return True only for one-to-one DMs (``im``); MPIMs are treated as groups."""
         channel_type = str(event.get("channel_type") or "").lower()
+        if channel_type:
+            return channel_type == "im"
         channel_id = str(event.get("channel") or "")
-        return channel_type in ("im", "mpim") or channel_id.startswith("D")
+        return channel_id.startswith("D")
 
     def _is_allowed(self, channel_id: str, user_id: str, *, is_dm: bool) -> bool:
         if self._config.owner_only:
@@ -726,7 +729,9 @@ class SlackChannel(BaseChannel):
             "has_mentions": has_mentions,
         }
         if is_group and channel_id:
-            metadata["conversation_id"] = channel_id
+            # Separate channel-level policy/permission key from thread-scoped passive context key.
+            metadata["group_policy_id"] = channel_id
+            metadata["conversation_id"] = subject_id
         if thread_ts:
             metadata["thread_ts"] = thread_ts
         if reply_quote_text:
@@ -771,7 +776,7 @@ class SlackChannel(BaseChannel):
                     policy = self._config.group_context.resolve(channel_id)
                     limit = policy.history_limit
                     message.group_context = GroupContext(
-                        conversation_id=channel_id,
+                        conversation_id=str(meta.get("conversation_id") or channel_id),
                         visibility=policy.visibility,
                         activation=policy.activation,
                         messages=history_items[-limit:] if limit else history_items,
