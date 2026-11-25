@@ -6,6 +6,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from octop_gateway.channel import BaseChannel, MessageProcessor
@@ -158,20 +159,22 @@ class ChannelManager:
             queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=self._queue_maxsize)
             self._queues[channel_id] = queue
             channel.set_enqueue_callback(
-                lambda payload, cid=channel_id: self.enqueue(cid, payload)  # type: ignore[misc]
+                lambda payload, cid=channel_id: self.enqueue(cid, payload),  # type: ignore[misc]
+                admit=lambda payload, cid=channel_id: self._admit(cid, payload),  # type: ignore[misc]
             )
 
-        # Start all channels
+        started_channels: list[str] = []
         for channel_id, channel in self._channels.items():
             try:
                 await channel.start()
+                started_channels.append(channel_id)
                 logger.info("Channel started: %s", channel_id)
             except Exception:  # pylint: disable=broad-except
                 # Channel adapters are independent failure domains during startup.
                 logger.exception("Failed to start channel: %s", channel_id)
 
         # Spawn workers
-        for channel_id in self._channels:
+        for channel_id in started_channels:
             for i in range(self._workers_per_channel):
                 task = asyncio.create_task(
                     self._worker_loop(channel_id),
@@ -270,7 +273,12 @@ class ChannelManager:
             except asyncio.QueueFull:
                 logger.error("Queue full for channel %s, dropping payload", channel_id)
 
-    def _put_to_queue(self, queue: asyncio.Queue, channel_id: str, payload: Any) -> None:  # type: ignore[type-arg]
+    def _admit(self, channel_id: str, payload: Any) -> bool:
+        """Report acceptance to callers already running on the gateway loop."""
+        queue = self._queues.get(channel_id)
+        return self._running and queue is not None and self._put_to_queue(queue, channel_id, payload)
+
+    def _put_to_queue(self, queue: asyncio.Queue, channel_id: str, payload: Any) -> bool:  # type: ignore[type-arg]
         """Thread-safe helper: put payload into queue from the event loop thread."""
         queued_payload = payload
         channel = self._channels.get(channel_id)
@@ -281,21 +289,31 @@ class ChannelManager:
                 # Preserve the existing worker error path for malformed payloads.
                 message = None
             if message is not None and not channel.group_context_manager.accepts(message):
-                return
+                return True
             if message is not None and self._interrupt_message_predicate(message):
+                if channel.inbound_store is not None:
+                    operation = self._consume_receipt(channel, str(message.metadata["message_id"]), message)
+                else:
+                    operation = self._run_interrupt(channel_id, channel, message)
                 task = asyncio.create_task(
-                    self._run_interrupt(channel_id, channel, message),
+                    operation,
                     name=f"gateway-interrupt-{channel_id}",
                 )
                 self._interrupt_tasks.add(task)
                 task.add_done_callback(self._interrupt_tasks.discard)
-                return
+                return True
             if message is not None:
                 queued_payload = message
+        # The durable worker reads committed receipts. The callback is only a
+        # fast path for urgent messages, which still claim their SQLite row.
+        if channel is not None and channel.inbound_store is not None:
+            return True
         try:
             queue.put_nowait(queued_payload)
         except asyncio.QueueFull:
             logger.error("Queue full for channel %s, dropping payload", channel_id)
+            return False
+        return True
 
     async def _run_interrupt(
         self,
@@ -606,6 +624,8 @@ class ChannelManager:
             raise ValueError(f"Unknown channel_type '{channel_type}'. Available: {sorted(BUILTIN_CHANNELS.keys())}")
 
         probe_config = dict(config)
+        if channel_type == "feishu":
+            probe_config["probe_mode"] = "token"
         if channel_type == "yuanbao" and not probe_config.get("probe_mode"):
             # Yuanbao appears to allow only one effective bot WebSocket session.
             # Opening a second full connection for a UI probe can kick the live
@@ -641,7 +661,10 @@ class ChannelManager:
         self._channels[channel_id] = channel
         queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=self._queue_maxsize)
         self._queues[channel_id] = queue
-        channel.set_enqueue_callback(lambda payload, cid=channel_id: self.enqueue(cid, payload))  # type: ignore[misc]
+        channel.set_enqueue_callback(
+            lambda payload, cid=channel_id: self.enqueue(cid, payload),  # type: ignore[misc]
+            admit=lambda payload, cid=channel_id: self._admit(cid, payload),  # type: ignore[misc]
+        )
 
         # Propagate media backend to new channel
         if self._media_backend:
@@ -691,12 +714,20 @@ class ChannelManager:
 
         # Cancel workers for this channel
         remaining: list[asyncio.Task[None]] = []
+        cancelled: list[asyncio.Task[None]] = []
         for task in self._workers:
             if task.get_name().startswith(f"gateway-worker-{channel_id}-"):
                 task.cancel()
+                cancelled.append(task)
             else:
                 remaining.append(task)
         self._workers = remaining
+        for task in self._interrupt_tasks:
+            if task.get_name() == f"gateway-interrupt-{channel_id}":
+                task.cancel()
+                cancelled.append(task)
+        if cancelled:
+            await asyncio.gather(*cancelled, return_exceptions=True)
 
         await channel.stop()
 
@@ -714,6 +745,9 @@ class ChannelManager:
         queue = self._queues.get(channel_id)
         channel = self._channels.get(channel_id)
         if not queue or not channel:
+            return
+        if channel.inbound_store is not None:
+            await self._durable_worker_loop(channel_id, channel)
             return
 
         while self._running:
@@ -764,6 +798,93 @@ class ChannelManager:
             except Exception:  # pylint: disable=broad-except
                 # One malformed payload or adapter failure must not stop the worker.
                 logger.exception("Worker error: channel=%s", channel_id)
+
+    async def _durable_worker_loop(self, channel_id: str, channel: BaseChannel) -> None:
+        store = channel.inbound_store
+        assert store is not None
+        scope = channel.inbound_scope
+        offset = 0
+        while self._running and self._channels.get(channel_id) is channel:
+            try:
+                entries = await asyncio.to_thread(store.pending, scope, 100, offset)
+                for entry in entries:
+                    try:
+                        message = channel.parse_inbound(entry.payload)
+                    except Exception:
+                        if await asyncio.to_thread(store.claim, scope, entry.message_id):
+                            await asyncio.to_thread(store.finish, scope, entry.message_id, "failed")
+                        logger.exception("Invalid durable message: channel=%s id=%s", channel_id, entry.message_id)
+                        continue
+                    urgent = (
+                        self._interrupt_message_predicate is not None
+                        and channel.group_context_manager.accepts(message)
+                        and self._interrupt_message_predicate(message)
+                    )
+                    lock = self._session_lock(channel_id, channel.get_debounce_key(message))
+                    control = self._control_message_predicate is not None and self._control_message_predicate(message)
+                    if lock.locked() and not urgent and not (control and self._on_pre_lock is not None):
+                        continue
+                    await self._consume_receipt(channel, entry.message_id, message, None if urgent else lock)
+                    offset = 0
+                    break
+                else:
+                    if len(entries) == 100:
+                        offset += len(entries)
+                    else:
+                        offset = 0
+                        await asyncio.sleep(0.25)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Durable Feishu worker failed: channel=%s", channel_id)
+                await asyncio.sleep(1)
+
+    async def _consume_receipt(
+        self, channel: BaseChannel, message_id: str, message: InboundMessage, lock: asyncio.Lock | None = None
+    ) -> None:
+        store = channel.inbound_store
+        assert store is not None
+        scope = channel.inbound_scope
+        claim = asyncio.create_task(asyncio.to_thread(store.claim, scope, message_id, waiting=True))
+        try:
+            if not await asyncio.shield(claim):
+                return
+        except asyncio.CancelledError:
+            if await claim:
+                await asyncio.to_thread(store.release, scope, message_id)
+            raise
+
+        try:
+            message.metadata["inbound_scope"] = scope
+            message.metadata["inbound_message_id"] = message_id
+            if lock is not None and self._on_pre_lock is not None and channel.group_context_manager.accepts(message):
+                try:
+                    await self._on_pre_lock(channel.channel_id, message)
+                except Exception:
+                    logger.exception("Pre-lock handler failed: channel=%s", channel.channel_id)
+            async with lock if lock is not None else nullcontext():
+                begin = asyncio.create_task(asyncio.to_thread(store.begin, scope, message_id))
+                try:
+                    if not await asyncio.shield(begin):
+                        return
+                except asyncio.CancelledError:
+                    await begin
+                    raise
+                outcome = await channel.handle_inbound_result(message)
+                finish = asyncio.create_task(asyncio.to_thread(store.finish, scope, message_id, outcome))
+                try:
+                    await asyncio.shield(finish)
+                except asyncio.CancelledError:
+                    await finish
+                    raise
+        except asyncio.CancelledError:
+            # Started work remains recorded for explicit reconciliation.
+            raise
+        except Exception:
+            logger.exception("Durable receipt processing failed: app=%s id=%s", scope, message_id)
+            await asyncio.to_thread(store.finish, scope, message_id, "failed")
+        finally:
+            await asyncio.to_thread(store.release, scope, message_id)
 
     def _session_lock(self, channel_id: str, session_key: str) -> asyncio.Lock:
         """Return the shared lock for one registered-channel session."""

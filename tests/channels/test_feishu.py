@@ -25,6 +25,7 @@ import pytest
 from octop_gateway.channels.feishu import FeishuChannel, FeishuConfig
 from octop_gateway.channels.feishu_dedup import FeishuDedupStore
 from octop_gateway.constraints import ChannelConstraints
+from octop_gateway.inbox import SqliteInbox
 from octop_gateway.models import (
     ChannelSubject,
     FileContent,
@@ -389,6 +390,73 @@ class TestFeishuChannelUnit:
         assert len(enqueued) == 1
         assert channel.dropped_stale == 0
         assert channel.last_inbound_at is not None
+
+    @pytest.mark.asyncio
+    async def test_worker_preserves_late_message_without_coverage_for_reconciliation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("OCTOP_FEISHU_MAX_MSG_AGE_SECONDS", "180")
+        monkeypatch.delenv("OCTOP_FEISHU_DEDUP_DB", raising=False)
+        channel = FeishuChannel(processor=_noop_processor, config=_make_config(), channel_id="ch-worker-stale")
+        channel._running = True
+        store = SqliteInbox(tmp_path / "inbox.sqlite3")
+        channel.inbound_store = store
+        frame = {
+            "event": {
+                "message": {"message_id": "om_worker_stale", "create_time": str(int((time.time() - 3600) * 1000))},
+                "sender": {"sender_type": "user", "sender_id": {"open_id": "ou_user"}},
+            }
+        }
+
+        assert await channel._on_worker_message(frame)
+        assert channel.dropped_stale == 0
+        assert store.pending(channel.inbound_scope) == []
+        held = store.entries(channel.inbound_scope, "recovery_required")
+        assert [entry.message_id for entry in held] == ["om_worker_stale"]
+        assert await channel._on_worker_message(frame)
+        assert channel.dropped_duplicate == 1
+
+    @pytest.mark.asyncio
+    async def test_worker_accepts_late_first_delivery_and_deduplicates_after_restart(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("OCTOP_FEISHU_MAX_MSG_AGE_SECONDS", "180")
+        monkeypatch.delenv("OCTOP_FEISHU_DEDUP_DB", raising=False)
+        config = _make_config()
+        path = tmp_path / "inbox.sqlite3"
+        now = time.time()
+        store = SqliteInbox(path)
+        store.establish_coverage(config.app_id, now - 900)
+
+        reopened = SqliteInbox(path)
+        reopened.establish_coverage(config.app_id, now)
+        channel = FeishuChannel(processor=_noop_processor, config=config, channel_id="ch-worker-delayed")
+        channel._running = True
+        channel.inbound_store = reopened
+        frame = {
+            "create_time": str(int(now * 1000)),
+            "event": {
+                "message": {
+                    "message_id": "om_delayed",
+                    "create_time": str(int((now - 600) * 1000)),
+                    "parent_id": "om_parent",
+                },
+                "sender": {"sender_type": "user", "sender_id": {"open_id": "ou_user"}},
+            },
+        }
+
+        assert await channel._on_worker_message(frame)
+        pending = reopened.pending(config.app_id)
+        assert [entry.message_id for entry in pending] == ["om_delayed"]
+        inbound = channel.parse_inbound(pending[0].payload)
+        assert inbound is not None
+        assert inbound.metadata["reply_to_message_id"] == "om_parent"
+        assert reopened.claim(config.app_id, "om_delayed")
+        reopened.finish(config.app_id, "om_delayed", "completed")
+        channel.inbound_store = SqliteInbox(path)
+        assert await channel._on_worker_message(frame)
+        assert channel.dropped_duplicate == 1
+        assert channel.inbound_store.pending(config.app_id) == []
 
     def test_age_gate_can_be_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OCTOP_FEISHU_MAX_MSG_AGE_SECONDS", "0")
