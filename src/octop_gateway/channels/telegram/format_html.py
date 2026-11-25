@@ -6,6 +6,8 @@ import re
 from html import escape
 from html.parser import HTMLParser
 
+from octop_gateway.format_tables import convert_markdown_tables
+
 
 def _utf16_units(text: str) -> int:
     return sum(2 if ord(char) > 0xFFFF else 1 for char in text)
@@ -101,6 +103,7 @@ def markdown_to_telegram_html(text: str) -> str:
         return text
 
     original = text
+    text = convert_markdown_tables(text)
     placeholders: list[str] = []
 
     def _ph(html_fragment: str) -> str:

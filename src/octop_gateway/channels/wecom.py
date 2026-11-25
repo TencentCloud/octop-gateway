@@ -16,8 +16,9 @@ import logging
 import mimetypes
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import aiohttp
 
@@ -97,6 +98,20 @@ class WeComChannel(BaseChannel):
         self._running = False
         # WebSocket connection session ID (generated on each connect/reconnect)
         self._ws_session_id: str | None = None
+        self._seen_messages: OrderedDict[str, None] = OrderedDict()
+
+    def _is_duplicate(self, msg_id: str) -> bool:
+        """Check and record WeCom msgid for deduplication."""
+        if not msg_id:
+            return False
+        if msg_id in self._seen_messages:
+            self._seen_messages.move_to_end(msg_id)
+            self.dropped_duplicate += 1
+            return True
+        self._seen_messages[msg_id] = None
+        while len(self._seen_messages) > 1000:
+            self._seen_messages.popitem(last=False)
+        return False
 
     def _default_constraints(self) -> ChannelConstraints:
         return ChannelConstraints(
@@ -366,21 +381,19 @@ class WeComChannel(BaseChannel):
           - The error path uses :attr:`ChannelConstraints.placeholder_text`
             so manager-level overrides take effect.
         """
-        message = self.parse_inbound(raw_payload)
-
-        # Auto-persist media if backend configured
-        if self._media_backend:
-            await self._persist_media(message)
-
-        self._track_subject(message)
+        prepared = await self._prepare_inbound(raw_payload)
+        if prepared is None:
+            return
+        message, subject = prepared
         meta = message.metadata
 
         ws_client = meta.get("_ws_client", self._ws_client)
         frame = meta.get("_frame")
 
-        # If no frame/ws_client available, fall back to BaseChannel behavior
+        # If no frame/ws_client available, fall back to BaseChannel buffered delivery
         if not ws_client or not frame:
-            await super().handle_inbound(raw_payload)
+            processing_succeeded = await self._process_inbound(message, subject)
+            self._finalize_inbound(message, processing_succeeded=processing_succeeded)
             return
 
         # One rate-limit slot for the whole stream reply.
@@ -553,6 +566,8 @@ class WeComChannel(BaseChannel):
             for media in media_buffer:
                 await self._send_media(reply_subject, media)
 
+        self._finalize_inbound(message, processing_succeeded=True)
+
     def parse_inbound(self, raw_payload: Any) -> InboundMessage:
         """Parse WebSocket message frame into InboundMessage.
 
@@ -649,23 +664,44 @@ class WeComChannel(BaseChannel):
         if not content_parts:
             content_parts.append(TextContent(text=""))
 
+        is_group = chat_type == "group" and bool(chat_id)
+        subject_id = chat_id if is_group else sender_id
+        subject_chat_type: Literal["direct", "group"] = "group" if is_group else "direct"
+        msg_id = str(data.get("msgid", "") or "")
+        metadata: dict[str, Any] = {
+            "to_handle": subject_id,
+            "sender_id": sender_id,
+            "chat_id": chat_id,
+            "chat_type": chat_type,
+            "msgid": msg_id,
+            "message_id": msg_id,
+            "bot_mentioned": True,
+            "response_url": data.get("response_url", ""),
+            "_media_aes_keys": media_aes_keys,
+            "_ws_client": self._ws_client,
+            "_frame": data.get("_frame", data),
+        }
+
+        quote_obj = data.get("quote")
+        if isinstance(quote_obj, dict):
+            q_text_obj = quote_obj.get("text")
+            q_text = q_text_obj.get("content", "") if isinstance(q_text_obj, dict) else str(q_text_obj or "")
+            if q_text.strip():
+                metadata["reply_quote_text"] = q_text.strip()
+                metadata["reply_to_text"] = q_text.strip()
+
         return InboundMessage(
             channel_id=self.channel_id,
             channel_type=self.channel_type,
             tenant_id=self._tenant_id,
-            channel_subject=ChannelSubject(subject_id=sender_id, metadata={}),
+            channel_subject=ChannelSubject(
+                subject_id=subject_id,
+                chat_type=subject_chat_type,
+                metadata=metadata,
+            ),
             channel_session_id=session_id,
             content=content_parts,
-            metadata={
-                "to_handle": sender_id,
-                "chat_id": chat_id,
-                "chat_type": chat_type,
-                "msgid": data.get("msgid", ""),
-                "response_url": data.get("response_url", ""),
-                "_media_aes_keys": media_aes_keys,
-                "_ws_client": self._ws_client,
-                "_frame": data.get("_frame", data),
-            },
+            metadata=metadata,
         )
 
     # --- Event handlers ---
@@ -706,6 +742,12 @@ class WeComChannel(BaseChannel):
         if msg_type not in ("text", "image", "file", "voice", "video", "mixed"):
             logger.debug("WeComChannel ignoring msgtype=%s", msg_type)
             return
+
+        msg_id = str(body.get("msgid") or "")
+        if self._is_duplicate(msg_id):
+            logger.debug("Duplicate WeCom message ignored: %s", msg_id)
+            return
+        self.note_inbound()
 
         # Enqueue body with frame reference for reply routing
         payload = dict(body)

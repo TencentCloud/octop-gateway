@@ -337,6 +337,34 @@ def test_parse_attachments(channel):
     assert isinstance(result.content[2], FileContent)
 
 
+async def test_allow_all_dms_and_reply_reference_context(client):
+    channel = DiscordChannel(
+        processor,
+        config=DiscordConfig(bot_token="fake-token", allow_all_dms=True),
+    )
+    await channel.start()
+    enqueue = Mock()
+    channel.set_enqueue_callback(enqueue)
+    try:
+        dm_msg = message(guild=None, author=42, content="dm hello", msg_id=101)
+        await channel.on_message(dm_msg)
+        assert enqueue.call_count == 1
+        assert enqueue.call_args.args[0].channel_subject.subject_id == "42"
+
+        reply_msg = message(channel=200, author=42, content="follow up", msg_id=102)
+        reply_msg.reference = SimpleNamespace(
+            message_id=90,
+            resolved=SimpleNamespace(content="previous bot answer", author=SimpleNamespace(id=99)),
+        )
+        parsed = channel.parse_inbound(reply_msg)
+        assert parsed.metadata["reply_to_message_id"] == "90"
+        assert parsed.metadata["reply_quote_text"] == "previous bot answer"
+        assert parsed.metadata["reply_to_is_own_bot"] is True
+        assert parsed.metadata["bot_mentioned"] is True
+    finally:
+        await channel.stop()
+
+
 @pytest.mark.parametrize(
     "text",
     [
