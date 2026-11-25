@@ -8,7 +8,16 @@ from typing import Any
 EPHEMERAL_PUSH_META = frozenset(
     {
         "msg_id",
+        "msg_idx",
+        "ref_msg_idx",
+        "reply_to_bot",
+        "reply_quote_text",
+        "reply_to_sender_id",
         "message_id",
+        "source_message_id",
+        "reply_to_message_id",
+        "reply_to_text",
+        "reply_to_is_own_bot",
         "_frame",
         "_ws_client",
         "response_url",

@@ -11,16 +11,25 @@ import contextlib
 import json
 import logging
 import re
+import sqlite3
+import threading
 import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import quote
 
 import aiohttp
 
 from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor
+from octop_gateway.channels.feishu_dedup import (
+    DEDUP_TTL_SECONDS,
+    max_message_age_seconds,
+    message_create_time_seconds,
+    open_dedup_store,
+    resolve_dedup_db_path,
+)
 from octop_gateway.models import (
     AudioContent,
     ChannelSubject,
@@ -34,8 +43,9 @@ from octop_gateway.push_routing import alias_subject_fields
 
 logger = logging.getLogger(__name__)
 
-# Feishu API base URL
+# Feishu / Lark API base URLs
 _API_BASE = "https://open.feishu.cn/open-apis"
+_LARK_API_BASE = "https://open.larksuite.com/open-apis"
 
 # Maximum number of message IDs to track for deduplication
 _DEDUP_MAX_SIZE = 2000
@@ -70,6 +80,9 @@ class FeishuConfig(ChannelConfig):
     app_secret: str = ""
     verification_token: str = ""
     encrypt_key: str = ""
+    domain: str = "feishu"
+    # Empty uses OCTOP_FEISHU_DEDUP_DB. When that is also empty, dedup stays in memory.
+    dedup_db_path: str = ""
 
     required_credentials = ("app_id", "app_secret")
 
@@ -83,6 +96,10 @@ class FeishuChannel(BaseChannel):
     """
 
     channel_type = "feishu"
+    # Shared across instances of the same channel id so a re-register in this
+    # process does not forget ids that SQLite also remembers.
+    _shared_seen_ids: ClassVar[OrderedDict[tuple[str, str], float]] = OrderedDict()
+    _shared_seen_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(
         self,
@@ -120,8 +137,36 @@ class FeishuChannel(BaseChannel):
         self._ws_session_id: str | None = None
         # Bot open_id used for group @mention activation (group_context)
         self._bot_open_id: str | None = None
-        # Deduplication: ordered dict acting as bounded LRU set
-        self._seen_message_ids: OrderedDict[str, float] = OrderedDict()
+        # Process-local cache is the class-level map above. This file survives
+        # restarts when Octop (or OCTOP_FEISHU_DEDUP_DB) supplies a path.
+        dedup_path = resolve_dedup_db_path(config.dedup_db_path)
+        self._dedup_store = open_dedup_store(dedup_path) if dedup_path else None
+
+    @property
+    def _api_base(self) -> str:
+        """Resolve Feishu vs international Lark OpenAPI base URL."""
+        raw = (self._config.domain or "feishu").strip()
+        lower = raw.lower()
+        if lower in ("lark", "larksuite", "international", "global"):
+            return _LARK_API_BASE
+        if lower.startswith(("http://", "https://")):
+            trimmed = raw.rstrip("/")
+            return trimmed if trimmed.endswith("/open-apis") else f"{trimmed}/open-apis"
+        return _API_BASE
+
+    @property
+    def _ws_domain(self) -> str | None:
+        """Return custom domain URL for lark_oapi.ws.Client when non-default."""
+        raw = (self._config.domain or "feishu").strip()
+        lower = raw.lower()
+        if lower in ("", "feishu", "cn"):
+            return None
+        if lower in ("lark", "larksuite", "international", "global"):
+            return "https://open.larksuite.com"
+        if lower.startswith(("http://", "https://")):
+            trimmed = raw.rstrip("/")
+            return trimmed[: -len("/open-apis")] if trimmed.endswith("/open-apis") else trimmed
+        return None
 
     # =========================================================================
     # Lifecycle
@@ -155,7 +200,7 @@ class FeishuChannel(BaseChannel):
         try:
             http = await self._ensure_http()
             headers = await self._get_auth_headers()
-            async with http.get(f"{_API_BASE}/bot/v3/info", headers=headers) as resp:
+            async with http.get(f"{self._api_base}/bot/v3/info", headers=headers) as resp:
                 data = await resp.json()
             if data.get("code") != 0:
                 logger.warning("Feishu bot info failed: %s", data.get("msg", "unknown"))
@@ -184,7 +229,7 @@ class FeishuChannel(BaseChannel):
                 return self._tenant_token
 
             http = await self._ensure_http()
-            url = f"{_API_BASE}/auth/v3/tenant_access_token/internal"
+            url = f"{self._api_base}/auth/v3/tenant_access_token/internal"
             payload = {
                 "app_id": self._config.app_id,
                 "app_secret": self._config.app_secret,
@@ -238,22 +283,19 @@ class FeishuChannel(BaseChannel):
         self._ws_reconnecting_since = None
         self._mark_ws_activity()
 
-        # Build event handler
-        event_handler = (
-            lark.EventDispatcherHandler.builder(
-                self._config.encrypt_key or "",
-                self._config.verification_token or "",
-            )
-            .register_p2_im_message_receive_v1(self._on_message_event)
-            .build()
-        )
+        event_handler = self._build_event_handler(lark)
 
         # Create WebSocket client (lark_oapi.ws.Client)
+        ws_kwargs: dict[str, Any] = {
+            "event_handler": event_handler,
+            "log_level": lark.LogLevel.INFO,
+        }
+        if self._ws_domain:
+            ws_kwargs["domain"] = self._ws_domain
         self._ws_client = lark.ws.Client(
             self._config.app_id,
             self._config.app_secret,
-            event_handler=event_handler,
-            log_level=lark.LogLevel.INFO,
+            **ws_kwargs,
         )
         # SDK reconnect hooks (fire on the WS thread's loop).
         self._ws_client.on_reconnecting = self._on_ws_reconnecting
@@ -267,6 +309,30 @@ class FeishuChannel(BaseChannel):
         )
         self._ws_thread.start()
         logger.info("Feishu WebSocket client connecting (daemon thread, session=%s)", self._ws_session_id)
+
+    def _build_event_handler(self, lark: Any) -> Any:
+        """Register message delivery and the reaction events this bot creates.
+
+        Unregistered events make lark-oapi answer HTTP 500, and Feishu then
+        retries them on the same schedule as real messages. Reaction events
+        are acknowledged and ignored.
+        """
+        return (
+            lark.EventDispatcherHandler.builder(
+                self._config.encrypt_key or "",
+                self._config.verification_token or "",
+            )
+            .register_p2_im_message_receive_v1(self._on_message_event)
+            .register_p2_im_message_reaction_created_v1(self._on_reaction_event)
+            .register_p2_im_message_reaction_deleted_v1(self._on_reaction_event)
+            .build()
+        )
+
+    def _on_reaction_event(self, data: Any) -> None:
+        """Ack a reaction event so Feishu stops retrying it."""
+        header = getattr(data, "header", None)
+        event_id = str(getattr(header, "event_id", "") or "") if header is not None else ""
+        logger.debug("Feishu reaction event acknowledged: %s", event_id)
 
     def _run_ws_thread(self) -> None:
         """WebSocket client thread entry point."""
@@ -308,6 +374,7 @@ class FeishuChannel(BaseChannel):
         self._ws_reconnecting_since = None
         self._ws_session_id = str(uuid.uuid4())
         self._mark_ws_activity()
+        self.note_reconnect()
         logger.info("Feishu WebSocket reconnected (session=%s)", self._ws_session_id)
 
     async def _cancel_watchdog(self) -> None:
@@ -407,6 +474,7 @@ class FeishuChannel(BaseChannel):
                 return
             if self._running:
                 await self._start_ws_client()
+                self.note_reconnect()
 
     def _request_ws_thread_shutdown(self) -> None:
         """Ask the WS thread event loop to disconnect and cancel its tasks.
@@ -486,9 +554,12 @@ class FeishuChannel(BaseChannel):
             if sender_type == "bot":
                 return
 
-            message_id = message.message_id
-            if self._is_duplicate(message_id):
-                logger.debug("Duplicate Feishu message ignored: %s", message_id)
+            message_id = str(getattr(message, "message_id", "") or "")
+            if self._drop_if_stale(message, message_id):
+                return
+            if message_id and self._is_duplicate(message_id):
+                self.dropped_duplicate += 1
+                logger.info("Duplicate Feishu message ignored: %s", message_id)
                 return
 
             sender_id_obj = getattr(sender, "sender_id", None)
@@ -499,6 +570,8 @@ class FeishuChannel(BaseChannel):
             mentions = self._normalize_mentions(getattr(message, "mentions", None))
 
             # Build raw payload dict for parse_inbound
+            parent_id = getattr(message, "parent_id", "") or ""
+            root_id = getattr(message, "root_id", "") or ""
             raw_payload = {
                 "message_id": message_id,
                 "message_type": message.message_type,
@@ -513,6 +586,10 @@ class FeishuChannel(BaseChannel):
                 },
                 "create_time": data.header.create_time if data.header else "",
             }
+            if parent_id and isinstance(parent_id, str):
+                raw_payload["parent_id"] = parent_id
+            if root_id and isinstance(root_id, str):
+                raw_payload["root_id"] = root_id
 
             logger.info(
                 "Feishu received message: id=%s type=%s sender=%s",
@@ -525,6 +602,7 @@ class FeishuChannel(BaseChannel):
             # Add "Typing" reaction to acknowledge receipt (non-blocking)
             self._add_reaction_async(message_id, "Typing")
 
+            self.note_inbound()
             # Enqueue for processing
             if self._enqueue_callback:
                 self._enqueue_callback(raw_payload)
@@ -581,18 +659,60 @@ class FeishuChannel(BaseChannel):
     # Deduplication
     # =========================================================================
 
+    def _drop_if_stale(self, message: Any, message_id: str) -> bool:
+        """Return True when the message's own create_time is past the age gate.
+
+        A normal return (no exception) lets lark-oapi acknowledge the event,
+        which stops Feishu from retrying an old delivery.
+        """
+        limit = max_message_age_seconds()
+        if limit <= 0:
+            return False
+        created = message_create_time_seconds(getattr(message, "create_time", None))
+        if created is None:
+            return False
+        age = time.time() - created
+        if age <= limit:
+            return False
+        self.dropped_stale += 1
+        logger.warning("Feishu dropped stale message: id=%s age=%.0fs", message_id, age)
+        return True
+
     def _is_duplicate(self, message_id: str) -> bool:
         """Check if a message_id has been seen recently.
 
-        Uses an OrderedDict as a bounded LRU cache to track IDs.
+        The process-wide map survives channel re-register. The SQLite store
+        survives process restarts for ``DEDUP_TTL_SECONDS``.
         """
-        if message_id in self._seen_message_ids:
-            return True
-        self._seen_message_ids[message_id] = time.time()
-        # Evict oldest entries when exceeding max size
-        while len(self._seen_message_ids) > _DEDUP_MAX_SIZE:
-            self._seen_message_ids.popitem(last=False)
+        if not message_id:
+            return False
+        key = (self.channel_id, message_id)
+        with self._shared_seen_lock:
+            if key in self._shared_seen_ids:
+                self._shared_seen_ids.move_to_end(key)
+                return True
+        if self._dedup_store is not None:
+            try:
+                if self._dedup_store.already_seen(
+                    self.channel_id,
+                    message_id,
+                    now=time.time(),
+                    ttl_seconds=DEDUP_TTL_SECONDS,
+                ):
+                    self._remember(message_id)
+                    return True
+            except sqlite3.Error:
+                logger.warning("Feishu dedup store failed for %s", message_id, exc_info=True)
+        self._remember(message_id)
         return False
+
+    def _remember(self, message_id: str) -> None:
+        key = (self.channel_id, message_id)
+        with self._shared_seen_lock:
+            self._shared_seen_ids[key] = time.time()
+            self._shared_seen_ids.move_to_end(key)
+            while len(self._shared_seen_ids) > _DEDUP_MAX_SIZE:
+                self._shared_seen_ids.popitem(last=False)
 
     # =========================================================================
     # Sending
@@ -732,7 +852,7 @@ class FeishuChannel(BaseChannel):
         """Reply to a message inside its thread via the Feishu reply API."""
         http = await self._ensure_http()
         headers = await self._get_auth_headers()
-        url = f"{_API_BASE}/im/v1/messages/{quote(message_id, safe='')}/reply"
+        url = f"{self._api_base}/im/v1/messages/{quote(message_id, safe='')}/reply"
         payload = {
             "msg_type": msg_type,
             "content": content,
@@ -776,7 +896,7 @@ class FeishuChannel(BaseChannel):
         """
         http = await self._ensure_http()
         headers = await self._get_auth_headers()
-        url = f"{_API_BASE}/im/v1/messages?receive_id_type={receive_id_type}"
+        url = f"{self._api_base}/im/v1/messages?receive_id_type={receive_id_type}"
         payload = {
             "receive_id": receive_id,
             "msg_type": msg_type,
@@ -795,6 +915,7 @@ class FeishuChannel(BaseChannel):
                         receive_id[:16],
                     )
                 else:
+                    self.note_outbound()
                     logger.info("Feishu message sent: receive_id=%s msg_type=%s", receive_id[:16], msg_type)
                 return data  # type: ignore[no-any-return]
         except (aiohttp.ClientError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError):
@@ -809,7 +930,7 @@ class FeishuChannel(BaseChannel):
         """Download a URL, attaching tenant_access_token for Feishu API URLs."""
         http = await self._ensure_http()
         headers: dict[str, str] = {}
-        if "open.feishu.cn" in url or "open-apis" in url:
+        if "open.feishu.cn" in url or "open.larksuite.com" in url or "open-apis" in url:
             token = await self._refresh_token()
             headers["Authorization"] = f"Bearer {token}"
         async with http.get(url, headers=headers) as resp:
@@ -826,7 +947,7 @@ class FeishuChannel(BaseChannel):
         data, mime = await self.load_media_bytes(media)
         http = await self._ensure_http()
         token = await self._refresh_token()
-        url = f"{_API_BASE}/im/v1/images"
+        url = f"{self._api_base}/im/v1/images"
         headers = {"Authorization": f"Bearer {token}"}
 
         form = _build_multipart_form(
@@ -867,7 +988,7 @@ class FeishuChannel(BaseChannel):
 
         http = await self._ensure_http()
         token = await self._refresh_token()
-        api_url = f"{_API_BASE}/im/v1/files"
+        api_url = f"{self._api_base}/im/v1/files"
         headers = {"Authorization": f"Bearer {token}"}
 
         form = _build_multipart_form(
@@ -941,7 +1062,7 @@ class FeishuChannel(BaseChannel):
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
             }
-            url = f"{_API_BASE}/im/v1/messages/{message_id}/reactions"
+            url = f"{self._api_base}/im/v1/messages/{message_id}/reactions"
             payload = {"reaction_type": {"emoji_type": emoji_type}}
 
             async with aiohttp.ClientSession() as session, session.post(url, headers=headers, json=payload) as resp:
@@ -1029,10 +1150,22 @@ class FeishuChannel(BaseChannel):
             "to_handle": to_handle,
             "sender_id": sender_id,
             "bot_mentioned": bot_mentioned,
+            "has_mentions": bool(mentions),
+            "sender_is_bot": raw_payload.get("sender", {}).get("sender_type") == "bot"
+            if raw_payload.get("sender", {}).get("sender_type") in {"user", "bot"}
+            else None,
             "mentions": mentions,
         }
         if thread_id:
             metadata["thread_id"] = thread_id
+        parent_id = str(raw_payload.get("parent_id", "") or "")
+        if parent_id:
+            metadata["parent_id"] = parent_id
+            metadata["reply_to_message_id"] = parent_id
+        reply_quote_text = str(raw_payload.get("reply_quote_text", "") or "").strip()
+        if reply_quote_text:
+            metadata["reply_quote_text"] = reply_quote_text
+            metadata["reply_to_text"] = reply_quote_text
 
         return InboundMessage(
             channel_id=self.channel_id,

@@ -15,14 +15,15 @@ from io import BytesIO
 from typing import Any, Self
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, ReplyParameters
-from telegram.error import BadRequest, NetworkError, TelegramError
+from telegram.error import BadRequest, EndPointNotFound, InvalidToken, NetworkError, TelegramError
 
 from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor
 from octop_gateway.channels.telegram.delivery import RequestScheduler, formatting_error, request, sanitized_errors
 from octop_gateway.channels.telegram.format_html import markdown_to_telegram_html, split_telegram_html
 from octop_gateway.channels.telegram.interaction import Interactions
-from octop_gateway.channels.telegram.policy import parse_id_list, should_accept_message
+from octop_gateway.channels.telegram.policy import parse_id_list, should_accept_message, strip_own_mention
 from octop_gateway.constraints import ChannelConstraints
+from octop_gateway.format_tables import has_gfm_table
 from octop_gateway.models import (
     AudioContent,
     ChannelSubject,
@@ -395,7 +396,11 @@ class TelegramChannel(BaseChannel):
 
     async def _extract_message(self, message: Any, *, edited: bool = False) -> dict[str, Any] | None:
         content_parts: list[ContentPart] = []
-        text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+        raw_text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        text = strip_own_mention(raw_text, self._bot_username)
+        # Keep address-only messages visible to the processor instead of dropping them.
+        if not text.strip():
+            text = raw_text
         if text:
             content_parts.append(TextContent(text=text))
 
@@ -447,6 +452,10 @@ class TelegramChannel(BaseChannel):
         chat_id = str(getattr(chat, "id", ""))
         user_id = str(user.id) if user and not message.sender_chat else ""
         is_group = getattr(chat, "type", "") in ("group", "supergroup")
+        reply = getattr(message, "reply_to_message", None)
+        reply_text = (getattr(reply, "text", None) or getattr(reply, "caption", None) or "")[:2000]
+        reply_author = getattr(reply, "from_user", None)
+        quote_text = (getattr(getattr(message, "quote", None), "text", None) or "")[:2000]
 
         return {
             "chat_id": chat_id,
@@ -458,6 +467,9 @@ class TelegramChannel(BaseChannel):
             "media": media_metadata,
             "edited": edited,
             "reply_to_message_id": getattr(getattr(message, "reply_to_message", None), "message_id", None),
+            "reply_to_text": reply_text,
+            "reply_quote_text": quote_text,
+            "reply_to_is_own_bot": reply_author is not None and reply_author.id == self._bot_id,
         }
 
     async def fetch_remote_media(self, url: str) -> tuple[bytes, str]:
@@ -525,6 +537,8 @@ class TelegramChannel(BaseChannel):
         state = self._stream.get()
         if state and state.get("delivery_failed"):
             return
+        if has_gfm_table(text) and await self._send_rich_table(subject, text, state):
+            return
         if state and state.get("finalizing") and text == self._clean_output(state.get("text", "")):
             try:
                 await self._finish_preview(subject, text, state)
@@ -559,6 +573,43 @@ class TelegramChannel(BaseChannel):
                 if state is not None:
                     state["delivery_failed"] = True
                 raise
+
+    async def _send_rich_table(self, subject: ChannelSubject, text: str, state: dict[str, Any] | None) -> bool:
+        """Prefer native rich tables; only explicit API rejection permits fallback."""
+        chat = int(subject.metadata.get("chat_id") or subject.subject_id)
+        message_id = state.get("message_id") if state else None
+        in_place = bool(
+            state and message_id and state.get("finalizing") and text == self._clean_output(state.get("text", ""))
+        )
+        data: dict[str, Any] = {"chat_id": chat, "rich_message": {"markdown": text}}
+        if in_place:
+            data["message_id"] = message_id
+            data["reply_markup"] = InlineKeyboardMarkup([])
+            endpoint = "editMessageText"
+        else:
+            data.update(self._send_options(subject))
+            endpoint = "sendRichMessage"
+
+        async def post(*, chat_id: int, endpoint: str, data: dict[str, Any]) -> Any:
+            return await self._app.bot.do_api_request(endpoint, api_kwargs=data)
+
+        try:
+            await self._request(post, chat_id=chat, endpoint=endpoint, data=data)
+        except (BadRequest, EndPointNotFound, InvalidToken):
+            logger.debug("Telegram rich table rejected; using aligned text")
+            return False
+        except NetworkError:
+            if state is not None:
+                state["delivery_failed"] = True
+            raise
+        if state is not None and state.get("finalizing") and text == self._clean_output(state.get("text", "")):
+            if state.get("draft_sent"):
+                await self._clear_draft(subject, state)
+            state.pop("message_id", None)
+            state["finalizing"] = False
+            if state.get("stop_token"):
+                self.interactions.pending.pop(state.pop("stop_token"), None)
+        return True
 
     async def _send_content(self, subject: ChannelSubject, parts: list[ContentPart]) -> None:
         from telegram import InputMediaAudio, InputMediaDocument, InputMediaPhoto, InputMediaVideo
@@ -685,6 +736,9 @@ class TelegramChannel(BaseChannel):
             "source_message_id": data.get("message_id", ""),
             "sender_id": user_id,
             "reply_to_message_id": data.get("reply_to_message_id"),
+            "reply_to_text": data.get("reply_to_text", ""),
+            "reply_quote_text": data.get("reply_quote_text", ""),
+            "reply_to_is_own_bot": data.get("reply_to_is_own_bot", False),
             "media": data.get("media", []),
             "edited": data.get("edited", False),
             "topic_isolation": self._config.topic_isolation,
@@ -716,7 +770,12 @@ class TelegramChannel(BaseChannel):
             await self._request(self._app.bot.send_audio, chat_id=chat_id, audio=audio, **kwargs)
 
     def register_callback(
-        self, subject: ChannelSubject, action: Callable[[], Awaitable[None]], *, ttl: float = 300
+        self,
+        subject: ChannelSubject,
+        action: Callable[[], Awaitable[None]],
+        *,
+        ttl: float = 300,
+        settle: bool = True,
     ) -> str:
         """Host hook for authorized model/agent options or private approvals.
 
@@ -732,6 +791,7 @@ class TelegramChannel(BaseChannel):
             subject.metadata.get("message_thread_id"),
             action,
             ttl=ttl,
+            settle=settle,
         )
 
     async def send_buttons(
@@ -769,16 +829,66 @@ class TelegramChannel(BaseChannel):
         query = update.callback_query
         if not query:
             return
-        await self._request(query.answer)
-        if not query.message or not query.from_user:
+        if not getattr(query, "message", None) or not getattr(query, "from_user", None):
+            await self._request(query.answer)
             return
-        async with sanitized_errors():
-            await self.interactions.invoke(
-                query.data or "",
-                str(query.from_user.id),
-                str(query.message.chat.id),
-                _topic_thread_id(query.message),
-            )
+        token = query.data or ""
+        user, chat, topic = str(query.from_user.id), str(query.message.chat.id), _topic_thread_id(query.message)
+        item = self.interactions.pending.get(token)
+        # A foreign user's tap must not invalidate the intended user's keyboard.
+        running = token in self.interactions.running
+        can_settle = not running and (
+            item is None or ((item.user, item.chat, item.topic) == (user, chat, topic) and item.settle)
+        )
+        label = ""
+        markup = getattr(query.message, "reply_markup", None)
+        for row in getattr(markup, "inline_keyboard", ()):
+            for button in row:
+                if button.callback_data == token:
+                    label = str(button.text)
+        language = getattr(query.from_user, "language_code", "") or ""
+        expired = (
+            "该选择已失效或已处理" if language.startswith("zh") else "This option has expired or was already processed."
+        )
+        note = "操作未完成\uff0c请重试" if language.startswith("zh") else "Action did not complete; please retry."
+        invoked: bool | None = None
+        try:
+            async with sanitized_errors():
+                invoked = await self.interactions.invoke(token, user, chat, topic)
+            note = (f"✓ {label}" if label else "✓") if invoked else expired
+            if running:
+                note = "该选择正在处理中" if language.startswith("zh") else "This option is being processed."
+        finally:
+            # Always stop Telegram's spinner, including on host errors/cancellation.
+            try:
+                await self._request(query.answer, text=note)
+            except TelegramError:
+                if invoked is not None:
+                    raise
+                # Keep the original host failure when acknowledgement also fails.
+                logger.debug("Telegram failed-action acknowledgement unavailable")
+        if not can_settle or not getattr(query.message, "message_id", None):
+            return
+        try:
+            text = getattr(query.message, "text", None)
+            settled = f"{text}\n{note}" if text else ""
+            if label in ("←", "→") or not text or len(settled.encode("utf-16-le")) // 2 > 4096:
+                await self._request(
+                    self._app.bot.edit_message_reply_markup,
+                    chat_id=int(chat),
+                    message_id=query.message.message_id,
+                    reply_markup=None,
+                )
+            else:
+                await self._request(
+                    self._app.bot.edit_message_text,
+                    chat_id=int(chat),
+                    message_id=query.message.message_id,
+                    text=settled,
+                    reply_markup=InlineKeyboardMarkup([]),
+                )
+        except TelegramError:
+            logger.debug("Telegram choice keyboard cleanup unavailable")
 
     async def _reaction(self, subject: ChannelSubject, emoji: str) -> None:
         if not self._config.status_reactions or not self._app:
@@ -931,7 +1041,7 @@ class TelegramChannel(BaseChannel):
                     if task is not None and not task.done():
                         task.cancel()
 
-                token = self.register_callback(subject, cancel)
+                token = self.register_callback(subject, cancel, settle=False)
                 state["stop_token"] = token
                 sent = await self._request(
                     self._app.bot.send_message,

@@ -79,6 +79,14 @@
 
 使用 Bot Token + Gateway 长连接；在开发者门户开启 Message Content Intent。`allow_all_channels` 默认 `True`（包括未填写此字段的旧配置），允许机器人有权限访问的所有服务器频道。设为 `False` 后仅允许 `allowed_channel_ids` 指定的频道，列表为空则拒绝服务器频道消息。私聊始终仅允许 `allowed_user_ids` 中的用户，列表为空则拒绝私聊。频道默认需要直接 @机器人，线程继承父频道权限。支持 HTTP 代理、附件、typing、长回复分段。参见 [`examples/discord_bot.py`](examples/discord_bot.py)。
 
+#### Telegram 投递与按钮回调
+
+代码围栏外的表格优先使用 Bot API 原生富消息；API 明确拒绝后回退为列对齐的代码块，网络超时等不确定错误不重发。QQ 和微信 iLink 将表格转换为带列名的列表行。
+
+Telegram 入站元数据提供 `reply_to_text`、`reply_quote_text`（各最多 2000 字符）和 `reply_to_is_own_bot`。宿主决定如何将引用用于提示词与历史。入站正文只移除本机器人的提及与命令后缀，保留其他提及、邮箱和正文内部空白。
+
+选择按钮显示点击反馈并收起旧键盘；其他用户或话题的点击不能关闭仍有效的按钮。`register_callback(..., settle=False)` 将消息清理留给调用方，流式 Stop 控件使用此方式。耗时操作必须入队；应用权限与待答问题有效性仍由宿主检查。
+
 #### 统一消息抽象
 - `InboundMessage` 携带文本、结构化的 `ContentPart`（文本 / 图片 / 视频 / 音频 / 文件）以及 `ChannelSubject`。
 - 你的处理器是 `Callable[[InboundMessage], AsyncIterator[MessageEvent]]`——可产出 `MESSAGE` 表示完整文本，`DELTA` 表示逐字流式，`COMPLETED` 表示刷出。
