@@ -221,7 +221,7 @@ def test_whatsapp_waha_and_evolution_bridge_inbound_parsing() -> None:
     # Evolution API DM message
     evo_channel = WhatsAppChannel(
         _echo_processor,
-        WhatsAppConfig(provider="evolution", bridge_url="http://127.0.0.1:8080"),
+        WhatsAppConfig(provider="evolution", bridge_url="http://127.0.0.1:8080", session_name="personal"),
     )
     evo_event = {
         "event": "messages.upsert",
@@ -400,6 +400,7 @@ async def test_whatsapp_security_policies_and_status_reactions() -> None:
         channel.extract_webhook_messages(
             {
                 "event": "message",
+                "session": "default",
                 "payload": {
                     "id": "m_other_group",
                     "from": "999999@g.us",
@@ -416,6 +417,7 @@ async def test_whatsapp_security_policies_and_status_reactions() -> None:
     mass_events = channel.extract_webhook_messages(
         {
             "event": "message",
+            "session": "default",
             "payload": {
                 "id": "m_mass",
                 "from": "120363000@g.us",
@@ -552,7 +554,12 @@ async def test_whatsapp_review_fixes_security_typing_allowlist_and_evolution_men
     # 5. Evolution group mention only triggers when the bot itself is mentioned, not another user
     evo_ch = WhatsAppChannel(
         _echo_processor,
-        WhatsAppConfig(provider="evolution", bridge_url="http://127.0.0.1:8080", ignore_mention_all=True),
+        WhatsAppConfig(
+            provider="evolution",
+            bridge_url="http://127.0.0.1:8080",
+            session_name="personal",
+            ignore_mention_all=True,
+        ),
     )
     other_mention = evo_ch.extract_webhook_messages(
         {
@@ -949,3 +956,166 @@ async def test_waha_fetch_qr_restarts_failed_session() -> None:
     assert res["status"] == "SCAN_QR_CODE"
     assert res["qrcode"] == "2@fresh-qr-payload"
     assert ("POST", "http://127.0.0.1:3000/api/sessions/default/restart") in calls
+
+
+def test_whatsapp_webhook_account_binding_rejects_mismatched_accounts() -> None:
+    # 1. Meta Cloud API: shared app_secret authenticates both numbers, but extractor enforces metadata.phone_number_id
+    shared_secret = "shared_meta_secret"
+    cloud_ch = WhatsAppChannel(
+        _echo_processor,
+        WhatsAppConfig(
+            provider="cloud",
+            access_token="EAAB",
+            phone_number_id="PHONE_A",
+            app_secret=shared_secret,
+        ),
+    )
+
+    def _cloud_payload(phone_number_id: str | None, msg_id: str) -> dict[str, Any]:
+        meta: dict[str, Any] = {}
+        if phone_number_id is not None:
+            meta["phone_number_id"] = phone_number_id
+        return {
+            "object": "whatsapp_business_account",
+            "entry": [
+                {
+                    "id": "WABA_1",
+                    "changes": [
+                        {
+                            "field": "messages",
+                            "value": {
+                                "messaging_product": "whatsapp",
+                                "metadata": meta,
+                                "messages": [
+                                    {
+                                        "from": "8613800001111",
+                                        "id": msg_id,
+                                        "timestamp": "1700000000",
+                                        "type": "text",
+                                        "text": {"body": "hello"},
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+
+    wrong_cloud = _cloud_payload("PHONE_B", "wamid.SHARED_1")
+    wrong_cloud_raw = json.dumps(wrong_cloud).encode("utf-8")
+    wrong_sig = "sha256=" + hmac.new(shared_secret.encode("utf-8"), wrong_cloud_raw, hashlib.sha256).hexdigest()
+    assert cloud_ch.verify_webhook_request({"X-Hub-Signature-256": wrong_sig}, wrong_cloud_raw) is True
+    assert cloud_ch.extract_webhook_messages(wrong_cloud) == []
+    assert cloud_ch.extract_webhook_messages(_cloud_payload(None, "wamid.SHARED_1")) == []
+    # Mismatched events must NOT pollute dedup cache
+    assert cloud_ch.dropped_duplicate == 0
+    assert "wamid.SHARED_1" not in cloud_ch._seen_messages
+
+    matching_cloud = _cloud_payload("PHONE_A", "wamid.SHARED_1")
+    matching_cloud_raw = json.dumps(matching_cloud).encode("utf-8")
+    matching_sig = "sha256=" + hmac.new(shared_secret.encode("utf-8"), matching_cloud_raw, hashlib.sha256).hexdigest()
+    assert cloud_ch.verify_webhook_request({"X-Hub-Signature-256": matching_sig}, matching_cloud_raw) is True
+    accepted_cloud = cloud_ch.extract_webhook_messages(matching_cloud)
+    assert len(accepted_cloud) == 1
+    assert accepted_cloud[0]["metadata"]["phone_number_id"] == "PHONE_A"
+
+    # 2. WAHA: shared bridge_api_key authenticates both sessions, but extractor enforces session
+    shared_key = "shared_waha_key"
+    waha_ch = WhatsAppChannel(
+        _echo_processor,
+        WhatsAppConfig(
+            provider="waha",
+            bridge_url="http://127.0.0.1:3000",
+            bridge_api_key=shared_key,
+            session_name="sales",
+            use_websocket=False,
+        ),
+    )
+    waha_ch._self_jid = "8611100001111@c.us"
+    waha_ch._self_lid = "11100001111@lid"
+
+    wrong_waha = {
+        "event": "message",
+        "session": "support",
+        "me": {"id": "8622200002222@c.us", "lid": "22200002222@lid"},
+        "payload": {
+            "id": "waha_msg_1",
+            "from": "8613800001111@c.us",
+            "fromMe": False,
+            "body": "wrong session",
+        },
+    }
+    assert waha_ch.verify_webhook_request({"X-Api-Key": shared_key}, json.dumps(wrong_waha).encode("utf-8")) is True
+    assert waha_ch.extract_webhook_messages(wrong_waha) == []
+    assert waha_ch.extract_webhook_messages({**wrong_waha, "session": ""}) == []
+    # Must NOT overwrite cached self identity or pollute dedup cache
+    assert waha_ch._self_jid == "8611100001111@c.us"
+    assert waha_ch._self_lid == "11100001111@lid"
+    assert waha_ch.dropped_duplicate == 0
+    assert "waha_msg_1" not in waha_ch._seen_messages
+
+    matching_waha = {
+        "event": "message",
+        "session": "sales",
+        "me": {"id": "8611100009999@c.us", "lid": "11100009999@lid"},
+        "payload": {
+            "id": "waha_msg_1",
+            "from": "8613800001111@c.us",
+            "fromMe": False,
+            "body": "right session",
+        },
+    }
+    accepted_waha = waha_ch.extract_webhook_messages(matching_waha)
+    assert len(accepted_waha) == 1
+    assert accepted_waha[0]["session"] == "sales"
+    assert waha_ch._self_jid == "8611100009999@c.us"
+    assert waha_ch._self_lid == "11100009999@lid"
+
+    # 3. Evolution API: shared bridge_api_key authenticates both instances, but extractor enforces instance
+    evo_ch = WhatsAppChannel(
+        _echo_processor,
+        WhatsAppConfig(
+            provider="evolution",
+            bridge_url="http://127.0.0.1:8080",
+            bridge_api_key=shared_key,
+            session_name="inst-a",
+        ),
+    )
+    evo_ch._self_jid = "8611100001111@s.whatsapp.net"
+
+    wrong_evo = {
+        "event": "messages.upsert",
+        "instance": "inst-b",
+        "sender": "8622200002222@s.whatsapp.net",
+        "data": {
+            "key": {"remoteJid": "8613800001111@s.whatsapp.net", "fromMe": False, "id": "evo_msg_1"},
+            "message": {"conversation": "wrong instance"},
+        },
+    }
+    assert evo_ch.verify_webhook_request({"apikey": shared_key}, json.dumps(wrong_evo).encode("utf-8")) is True
+    assert evo_ch.extract_webhook_messages(wrong_evo) == []
+    assert evo_ch.extract_webhook_messages({**wrong_evo, "instance": ""}) == []
+    # Must NOT overwrite cached self identity or pollute dedup cache
+    assert evo_ch._self_jid == "8611100001111@s.whatsapp.net"
+    assert evo_ch.dropped_duplicate == 0
+    assert "evo_msg_1" not in evo_ch._seen_messages
+
+    matching_evo = {
+        "event": "messages.upsert",
+        "instance": "inst-a",
+        "sender": "8611100009999@s.whatsapp.net",
+        "data": {
+            "key": {"remoteJid": "8613800001111@s.whatsapp.net", "fromMe": False, "id": "evo_msg_1"},
+            "message": {"conversation": "right instance"},
+        },
+    }
+    accepted_evo = evo_ch.extract_webhook_messages(matching_evo)
+    assert len(accepted_evo) == 1
+    assert accepted_evo[0]["instance"] == "inst-a"
+    assert evo_ch._self_jid == "8611100009999@s.whatsapp.net"
+
+    # 4. Cross-provider envelopes are also rejected
+    assert cloud_ch.extract_webhook_messages(matching_waha) == []
+    assert waha_ch.extract_webhook_messages(matching_evo) == []
+    assert evo_ch.extract_webhook_messages(matching_cloud) == []

@@ -874,9 +874,23 @@ class WhatsAppChannel(BaseChannel):
                 return any(c and hmac.compare_digest(expected_key, c) for c in candidates)
         return not require_secret
 
+    def _matches_cloud_phone_number(self, metadata: dict[str, Any]) -> bool:
+        expected = self._config.phone_number_id.strip()
+        if not expected:
+            return False
+        incoming = str(metadata.get("phone_number_id") or "").strip()
+        return incoming == expected
+
+    def _matches_bridge_account(self, incoming_account: str) -> bool:
+        expected = self._config.session_name.strip() or "default"
+        return incoming_account.strip() == expected
+
     def extract_webhook_messages(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         """Extract actionable inbound message events from Cloud API, WAHA, or Evolution payloads.
 
+        Validates that each incoming event belongs to this channel's configured account
+        (Cloud ``metadata.phone_number_id``, WAHA ``session``, or Evolution ``instance``)
+        before updating cached self identities, deduplicating, or returning messages.
         Filters out delivery statuses, self-authored messages, duplicates, and disallowed chats.
         """
         if not isinstance(payload, dict):
@@ -886,6 +900,8 @@ class WhatsAppChannel(BaseChannel):
 
         # Case 1: Meta Cloud API webhook envelope (object == "whatsapp_business_account" or "entry" list)
         if isinstance(payload.get("entry"), list):
+            if self.provider != "cloud":
+                return []
             for entry in payload["entry"]:
                 if not isinstance(entry, dict):
                     continue
@@ -895,13 +911,15 @@ class WhatsAppChannel(BaseChannel):
                     val = change.get("value")
                     if not isinstance(val, dict):
                         continue
+                    metadata = _as_dict(val.get("metadata"))
+                    if not self._matches_cloud_phone_number(metadata):
+                        continue
                     contacts = _as_list(val.get("contacts"))
                     contact_map: dict[str, str] = {}
                     for c in contacts:
                         if isinstance(c, dict) and c.get("wa_id"):
                             profile = _as_dict(c.get("profile"))
                             contact_map[str(c["wa_id"])] = str(profile.get("name") or c["wa_id"])
-                    metadata = _as_dict(val.get("metadata"))
                     for msg in val.get("messages") or []:
                         if not isinstance(msg, dict):
                             continue
@@ -917,8 +935,13 @@ class WhatsAppChannel(BaseChannel):
 
         # Case 2: WAHA event envelope (event in ("message", "message.any") and "payload" dict)
         if "payload" in payload and isinstance(payload.get("payload"), dict) and payload.get("event"):
+            if self.provider != "waha":
+                return []
             ev_name = str(payload.get("event") or "")
             if ev_name not in ("message", "message.any"):
+                return []
+            raw_session = str(payload.get("session") or "").strip()
+            if not self._matches_bridge_account(raw_session):
                 return []
             me = _as_dict(payload.get("me"))
             if me.get("id"):
@@ -928,7 +951,7 @@ class WhatsAppChannel(BaseChannel):
             enriched = {
                 "_format": "waha",
                 "event": ev_name,
-                "session": str(payload.get("session") or self._config.session_name),
+                "session": raw_session,
                 "me": me,
                 "payload": payload["payload"],
             }
@@ -938,12 +961,17 @@ class WhatsAppChannel(BaseChannel):
 
         # Case 3: Evolution API webhook envelope (event == "messages.upsert" and "data" dict)
         if payload.get("event") == "messages.upsert" and isinstance(payload.get("data"), dict):
+            if self.provider != "evolution":
+                return []
+            raw_instance = str(payload.get("instance") or "").strip()
+            if not self._matches_bridge_account(raw_instance):
+                return []
             evo_sender = str(payload.get("sender") or "")
             if evo_sender:
                 self._self_jid = evo_sender
             enriched = {
                 "_format": "evolution",
-                "instance": str(payload.get("instance") or self._config.session_name),
+                "instance": raw_instance,
                 "sender": evo_sender,
                 "data": payload["data"],
             }
@@ -952,6 +980,22 @@ class WhatsAppChannel(BaseChannel):
             return results
 
         # Case 4: Direct / pre-unwrapped dict (unit test or direct enqueue)
+        fmt = payload.get("_format")
+        if fmt == "cloud" or ("message" in payload and isinstance(payload.get("message"), dict)):
+            if self.provider != "cloud":
+                return []
+            if not self._matches_cloud_phone_number(_as_dict(payload.get("metadata"))):
+                return []
+        elif fmt == "waha" or ("from" in payload and "fromMe" in payload):
+            if self.provider != "waha":
+                return []
+            if "session" in payload and not self._matches_bridge_account(str(payload.get("session") or "")):
+                return []
+        elif fmt == "evolution" or ("key" in payload and isinstance(payload.get("key"), dict)):
+            if self.provider != "evolution":
+                return []
+            if "instance" in payload and not self._matches_bridge_account(str(payload.get("instance") or "")):
+                return []
         if self._should_accept_normalized(payload):
             results.append(payload)
         return results
