@@ -39,3 +39,24 @@ jobs:
 
       - name: Test
         run: make test
+
+  feishu-worker:
+    name: "Feishu worker (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: workers/feishu-ws
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: workers/feishu-ws/go.mod
+          cache-dependency-path: workers/feishu-ws/go.sum
+      - name: Test
+        run: go test ./...
+      - name: Vet
+        run: go vet ./...

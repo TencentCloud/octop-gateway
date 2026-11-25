@@ -7,6 +7,7 @@ re-register, so ids are also stored in a small SQLite file for 24 hours.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sqlite3
@@ -128,6 +129,17 @@ class FeishuDedupStore:
                 raise
             finally:
                 conn.close()
+
+    def contains(self, channel_id: str, message_id: str, *, since: float) -> bool:
+        """Look up a receipt without marking a message that may be rejected."""
+        with self._lock, contextlib.closing(self._connect()) as conn:
+            return (
+                conn.execute(
+                    "SELECT 1 FROM feishu_seen WHERE channel_id = ? AND message_id = ? AND seen_at >= ?",
+                    (channel_id, message_id, since),
+                ).fetchone()
+                is not None
+            )
 
 
 def open_dedup_store(path: str) -> FeishuDedupStore | None:

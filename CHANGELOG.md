@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 修复
+
+- 飞书可为每个应用启用独立的 WebSocket 接收进程。接收进程卡死时由网关回收并重建。启用持久化收件时，消息写入 SQLite 后才确认接收，并按应用与消息 ID 拦截重投。
+
 ## [1.0.4] - 2026-11-17
 
 ### 新增

@@ -83,6 +83,12 @@ Harness Gateway sits between your agent and the outside world. Each platform is 
 
 Use a Bot Token and enable Message Content Intent in the developer portal. `allow_all_channels` defaults to `True`, including configurations without this field, allowing all guild channels accessible to the bot. Set it to `False` to restrict access to `allowed_channel_ids` (empty denies guild messages). DMs always require `allowed_user_ids`; an empty user list denies DMs. Guild messages require a direct bot mention by default, and threads inherit parent-channel access. Supports HTTP proxying, attachments, typing and split replies. See [`examples/discord_bot.py`](examples/discord_bot.py).
 
+#### Feishu WebSocket recovery
+
+With Go 1.23 or newer, run `go build` in `workers/feishu-ws` and set `OCTOP_FEISHU_WS_WORKER` to the absolute path of the resulting executable before starting the gateway. Hosts can also bundle it as `octop_gateway/bin/feishu-ws` (`feishu-ws.exe` on Windows). When the executable is available, the gateway starts and supervises one WebSocket process per Feishu app. Otherwise, the Python SDK transport remains available.
+
+When managed by `ChannelManager`, this transport acknowledges messages after the SQLite receipt is committed. Deduplication is scoped to the Feishu app. If a late message predates the app's reliable receipt history, it is recorded for reconciliation. The connection test validates the app token through REST. Send a real Feishu message to verify end-to-end delivery.
+
 #### Telegram delivery and callbacks
 
 Tables outside code fences use native rich messages when supported by the Bot API, with aligned code blocks after an explicit API rejection. Ambiguous network failures are not resent. QQ and WeChat iLink flatten tables into keyed list rows.

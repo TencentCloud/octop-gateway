@@ -18,7 +18,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, fields
-from typing import Any, Self
+from typing import Any, Literal, Self
 from urllib.parse import urlparse
 
 import aiohttp
@@ -31,6 +31,7 @@ from octop_gateway.constraints import (
     tool_hint_message,
 )
 from octop_gateway.group_context import GroupContextConfig, GroupContextManager
+from octop_gateway.inbox import InboxStore
 from octop_gateway.media import MediaBackend
 from octop_gateway.models import (
     AudioContent,
@@ -238,6 +239,8 @@ class BaseChannel(ABC):
         self._http: aiohttp.ClientSession | None = None
         # Set by ChannelManager
         self._enqueue_callback: Callable[[Any], None] | None = None
+        self._admit_callback: Callable[[Any], bool] | None = None
+        self.inbound_store: InboxStore | None = None
         self._group_context = GroupContextManager(config.group_context if config is not None else None)
 
         # Platform constraints
@@ -763,12 +766,21 @@ class BaseChannel(ABC):
         4. Process and deliver events using the channel's output strategy
         5. Finalize the group-context lifecycle after a successful reply
         """
+        await self.handle_inbound_result(raw_payload)
+
+    @property
+    def inbound_scope(self) -> str:
+        return self.channel_id
+
+    async def handle_inbound_result(self, raw_payload: object) -> Literal["completed", "ignored", "failed"]:
+        """Run the inbound pipeline and expose the outcome for durable receipts."""
         prepared = await self._prepare_inbound(raw_payload)
         if prepared is None:
-            return
+            return "ignored"
         message, subject = prepared
         processing_succeeded = await self._process_inbound(message, subject)
         self._finalize_inbound(message, processing_succeeded=processing_succeeded)
+        return "completed" if processing_succeeded else "failed"
 
     async def _preprocess_inbound(self, message: InboundMessage) -> None:
         """Normalize platform-specific content before shared policy runs.
@@ -1166,9 +1178,12 @@ class BaseChannel(ABC):
     # Internal: enqueue support (used by ChannelManager)
     # =========================================================================
 
-    def set_enqueue_callback(self, callback: Callable[[Any], None]) -> None:
+    def set_enqueue_callback(
+        self, callback: Callable[[Any], None], *, admit: Callable[[Any], bool] | None = None
+    ) -> None:
         """Set the enqueue callback (called by ChannelManager)."""
         self._enqueue_callback = callback
+        self._admit_callback = admit
 
     def enqueue(self, payload: Any) -> None:
         """Enqueue a payload for processing (delegates to manager)."""
