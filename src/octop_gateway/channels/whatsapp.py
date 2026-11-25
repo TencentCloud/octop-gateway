@@ -886,12 +886,13 @@ class WhatsAppChannel(BaseChannel):
         return incoming_account.strip() == expected
 
     def extract_webhook_messages(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
-        """Extract actionable inbound message events from Cloud API, WAHA, or Evolution payloads.
+        """Extract actionable inbound message events from native Cloud API, WAHA, or Evolution envelopes.
 
-        Validates that each incoming event belongs to this channel's configured account
-        (Cloud ``metadata.phone_number_id``, WAHA ``session``, or Evolution ``instance``)
-        before updating cached self identities, deduplicating, or returning messages.
-        Filters out delivery statuses, self-authored messages, duplicates, and disallowed chats.
+        Accepts only native provider envelopes carrying an account identifier that matches this
+        channel's configured account (Cloud ``metadata.phone_number_id``, WAHA ``session``, or
+        Evolution ``instance``) before updating cached self identities, deduplicating, or returning
+        messages. Pre-normalized or raw payloads without a native provider envelope are rejected
+        here and should only enter via trusted internal paths (``parse_inbound`` / ``enqueue``).
         """
         if not isinstance(payload, dict):
             return []
@@ -979,26 +980,7 @@ class WhatsAppChannel(BaseChannel):
                 results.append(enriched)
             return results
 
-        # Case 4: Direct / pre-unwrapped dict (unit test or direct enqueue)
-        fmt = payload.get("_format")
-        if fmt == "cloud" or ("message" in payload and isinstance(payload.get("message"), dict)):
-            if self.provider != "cloud":
-                return []
-            if not self._matches_cloud_phone_number(_as_dict(payload.get("metadata"))):
-                return []
-        elif fmt == "waha" or ("from" in payload and "fromMe" in payload):
-            if self.provider != "waha":
-                return []
-            if "session" in payload and not self._matches_bridge_account(str(payload.get("session") or "")):
-                return []
-        elif fmt == "evolution" or ("key" in payload and isinstance(payload.get("key"), dict)):
-            if self.provider != "evolution":
-                return []
-            if "instance" in payload and not self._matches_bridge_account(str(payload.get("instance") or "")):
-                return []
-        if self._should_accept_normalized(payload):
-            results.append(payload)
-        return results
+        return []
 
     def _is_allowed_sender(self, sender_id: str, chat_id: str, *, is_group: bool) -> bool:
         norm_sender = normalize_whatsapp_identifier(sender_id)

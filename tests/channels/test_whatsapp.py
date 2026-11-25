@@ -1115,7 +1115,54 @@ def test_whatsapp_webhook_account_binding_rejects_mismatched_accounts() -> None:
     assert accepted_evo[0]["instance"] == "inst-a"
     assert evo_ch._self_jid == "8611100009999@s.whatsapp.net"
 
-    # 4. Cross-provider envelopes are also rejected
+    # 4. Pre-normalized / raw payloads without a native provider envelope are rejected on the public extractor
+    #    (even if they omit session/instance or spoof _format), without mutating identity or dedup state.
+    forged_waha_normalized = {
+        "_format": "waha",
+        "payload": {
+            "id": "waha_forged_1",
+            "from": "8613800001111@c.us",
+            "fromMe": False,
+            "body": "forged normalized waha",
+        },
+    }
+    forged_waha_raw = {
+        "id": "waha_forged_1",
+        "from": "8613800001111@c.us",
+        "fromMe": False,
+        "body": "forged raw waha",
+    }
+    forged_evo_normalized = {
+        "_format": "evolution",
+        "data": {
+            "key": {"remoteJid": "8613800001111@s.whatsapp.net", "fromMe": False, "id": "evo_forged_1"},
+            "message": {"conversation": "forged normalized evo"},
+        },
+    }
+    forged_cloud_normalized = {
+        "_format": "cloud",
+        "metadata": {"phone_number_id": "PHONE_A"},
+        "message": {
+            "from": "8613800001111",
+            "id": "cloud_forged_1",
+            "timestamp": "1700000000",
+            "type": "text",
+            "text": {"body": "forged normalized cloud"},
+        },
+    }
+    assert waha_ch.extract_webhook_messages(forged_waha_normalized) == []
+    assert waha_ch.extract_webhook_messages(forged_waha_raw) == []
+    assert "waha_forged_1" not in waha_ch._seen_messages
+    assert evo_ch.extract_webhook_messages(forged_evo_normalized) == []
+    assert "evo_forged_1" not in evo_ch._seen_messages
+    assert cloud_ch.extract_webhook_messages(forged_cloud_normalized) == []
+    assert "cloud_forged_1" not in cloud_ch._seen_messages
+    # Trusted internal path (parse_inbound) still accepts pre-normalized payloads directly
+    assert waha_ch.parse_inbound(forged_waha_normalized).text == "forged normalized waha"
+    assert evo_ch.parse_inbound(forged_evo_normalized).text == "forged normalized evo"
+    assert cloud_ch.parse_inbound(forged_cloud_normalized).text == "forged normalized cloud"
+
+    # 5. Cross-provider envelopes are also rejected
     assert cloud_ch.extract_webhook_messages(matching_waha) == []
     assert waha_ch.extract_webhook_messages(matching_evo) == []
     assert evo_ch.extract_webhook_messages(matching_cloud) == []
