@@ -176,12 +176,27 @@ class FeishuChannel(BaseChannel):
         message_id = self._extract_message_id(raw_payload)
         reaction_id = ""
         if message_id:
-            reaction_id = await self._add_reaction(message_id, self._TYPING_EMOJI)
+            # Typing feedback is strictly best-effort: a token-refresh error or
+            # a stalled Feishu API must never delay or abort message processing.
+            try:
+                reaction_id = await asyncio.wait_for(
+                    self._add_reaction(message_id, self._TYPING_EMOJI),
+                    timeout=self._TYPING_REACTION_TIMEOUT_S,
+                )
+            except Exception:
+                logger.debug("Feishu: failed to add Typing reaction", exc_info=True)
+                reaction_id = ""
         try:
             await super().handle_inbound(raw_payload)
         finally:
             if message_id and reaction_id:
-                await self._remove_reaction(message_id, reaction_id)
+                try:
+                    await asyncio.wait_for(
+                        self._remove_reaction(message_id, reaction_id),
+                        timeout=self._TYPING_REACTION_TIMEOUT_S,
+                    )
+                except Exception:
+                    logger.debug("Feishu: failed to remove Typing reaction", exc_info=True)
 
     @staticmethod
     def _extract_message_id(raw_payload: Any) -> str:
@@ -1023,6 +1038,9 @@ class FeishuChannel(BaseChannel):
 
     # Emoji type Feishu renders as the "typing" indicator on a message.
     _TYPING_EMOJI = "Typing"
+    # A stalled reaction call must not hold up message processing. Typing feedback
+    # is cosmetic, so bound it tightly and drop it on timeout.
+    _TYPING_REACTION_TIMEOUT_S = 0.2
 
     def _add_reaction_async(self, message_id: str, emoji_type: str = "Typing") -> None:
         """Add emoji reaction to a message (fire-and-forget from lark-oapi thread).
@@ -1067,7 +1085,9 @@ class FeishuChannel(BaseChannel):
                     with contextlib.suppress(json.JSONDecodeError, UnicodeDecodeError, aiohttp.ClientError):
                         data = await resp.json()
                         reaction_id = str((data.get("data") or {}).get("reaction_id") or "")
-                    logger.debug("Feishu reaction added: %s on %s (id=%s)", emoji_type, message_id[:16], reaction_id[:12])
+                    logger.debug(
+                        "Feishu reaction added: %s on %s (id=%s)", emoji_type, message_id[:16], reaction_id[:12]
+                    )
                     return reaction_id
                 body = await resp.text()
                 logger.debug("Feishu reaction failed: %d %s", resp.status, body[:100])

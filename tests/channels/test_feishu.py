@@ -889,14 +889,16 @@ class TestFeishuTypingReactionLifecycle:
 
     def test_extract_message_id_from_inbound(self) -> None:
         ch = FeishuChannel(processor=_noop_processor, config=_make_config())
-        msg = ch.parse_inbound({
-            "message_id": "om_456",
-            "message_type": "text",
-            "content": '{"text":"hi"}',
-            "chat_id": "oc_chat",
-            "chat_type": "p2p",
-            "sender": {"sender_id": "ou_user", "sender_type": "user"},
-        })
+        msg = ch.parse_inbound(
+            {
+                "message_id": "om_456",
+                "message_type": "text",
+                "content": '{"text":"hi"}',
+                "chat_id": "oc_chat",
+                "chat_type": "p2p",
+                "sender": {"sender_id": "ou_user", "sender_type": "user"},
+            }
+        )
         assert FeishuChannel._extract_message_id(msg) == "om_456"
 
     @pytest.mark.asyncio
@@ -1011,3 +1013,64 @@ class TestFeishuTypingReactionLifecycle:
         await ch.handle_inbound({"message_id": "om_no_reaction"})
 
         assert calls == ["add", "process"]
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_reaction_failure_does_not_block_processing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A token-refresh/API failure while adding the reaction must never
+        abort message processing. Regression: _refresh_token raises RuntimeError,
+        which escaped handle_inbound because the call sat outside try/finally."""
+        from octop_gateway.channel import BaseChannel
+
+        ch = FeishuChannel(processor=_noop_processor, config=_make_config())
+        calls: list[str] = []
+
+        async def _failing_add(message_id: str, emoji_type: str) -> str:
+            calls.append("add")
+            raise RuntimeError("Feishu token refresh failed: invalid param")
+
+        async def _fake_remove(message_id: str, reaction_id: str) -> None:
+            calls.append("remove")
+
+        async def _fake_base_handle(self, raw_payload: object) -> None:
+            calls.append("process")
+
+        ch._add_reaction = _failing_add  # type: ignore[method-assign]
+        ch._remove_reaction = _fake_remove  # type: ignore[method-assign]
+        monkeypatch.setattr(BaseChannel, "handle_inbound", _fake_base_handle)
+
+        # Must not raise even though the reaction add failed.
+        await ch.handle_inbound({"message_id": "om_oauth_fail"})
+
+        assert calls == ["add", "process"]
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_reaction_remove_failure_does_not_break_processing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failure while removing the reaction in finally must not mask the
+        outcome of message processing."""
+        from octop_gateway.channel import BaseChannel
+
+        ch = FeishuChannel(processor=_noop_processor, config=_make_config())
+        calls: list[str] = []
+
+        async def _fake_add(message_id: str, emoji_type: str) -> str:
+            calls.append("add")
+            return "reaction_z"
+
+        async def _failing_remove(message_id: str, reaction_id: str) -> None:
+            calls.append("remove")
+            raise RuntimeError("Feishu token refresh failed: invalid param")
+
+        async def _fake_base_handle(self, raw_payload: object) -> None:
+            calls.append("process")
+
+        ch._add_reaction = _fake_add  # type: ignore[method-assign]
+        ch._remove_reaction = _failing_remove  # type: ignore[method-assign]
+        monkeypatch.setattr(BaseChannel, "handle_inbound", _fake_base_handle)
+
+        await ch.handle_inbound({"message_id": "om_rm_fail"})
+
+        assert calls == ["add", "process", "remove"]
