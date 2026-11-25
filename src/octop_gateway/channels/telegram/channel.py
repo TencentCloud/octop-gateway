@@ -1029,7 +1029,7 @@ class TelegramChannel(BaseChannel):
             await close_event_stream(source)
 
     async def _preview(self, subject: ChannelSubject, state: dict[str, Any]) -> None:
-        if not self._app or state.get("disabled"):
+        if not self._app or state.get("disabled") or self._has_outbound_text_filter():
             return
         text = self._clean_output(state["text"]).encode("utf-16-le")[:8000].decode("utf-16-le", errors="ignore")
         if not text:

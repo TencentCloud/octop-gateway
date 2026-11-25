@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import logging
 import mimetypes
+import re
 import time
 import uuid
 from collections import OrderedDict
@@ -362,12 +363,13 @@ class WeComChannel(BaseChannel):
                     exc_info=True,
                 )
 
-    async def handle_inbound(self, raw_payload: Any) -> None:
-        """Override: stream deltas progressively via WeCom reply_stream.
+    async def _process_inbound(self, message: InboundMessage, subject: ChannelSubject) -> bool:
+        """Process inbound message with WeCom streaming reply support.
 
         Instead of accumulating all deltas and sending once (BaseChannel default),
-        sends progressive updates via reply_stream(finish=False) as tokens arrive.
-        WeCom displays the content incrementally with a thinking bubble effect.
+        sends progressive updates via reply_stream(finish=False) as tokens arrive,
+        while inheriting shared preparation, per-dispatch filtering, and
+        finalization from :meth:`BaseChannel.handle_inbound`.
 
         Constraint integration:
           - One :meth:`_acquire_rate_slot` is taken at the top: each
@@ -376,15 +378,11 @@ class WeComChannel(BaseChannel):
           - When ``reply_timeout > 0`` and ``timeout_strategy == "placeholder"``,
             the wait for the *first* processor event is bounded; if the
             first token does not arrive in time, a placeholder is streamed
-            so WeCom does not drop the connection. Streaming continues
-            normally afterwards.
+            so WeCom does not drop the connection (skipped when a per-dispatch
+            text filter is active). Streaming continues normally afterwards.
           - The error path uses :attr:`ChannelConstraints.placeholder_text`
             so manager-level overrides take effect.
         """
-        prepared = await self._prepare_inbound(raw_payload)
-        if prepared is None:
-            return
-        message, subject = prepared
         meta = message.metadata
 
         ws_client = meta.get("_ws_client", self._ws_client)
@@ -392,9 +390,7 @@ class WeComChannel(BaseChannel):
 
         # If no frame/ws_client available, fall back to BaseChannel buffered delivery
         if not ws_client or not frame:
-            processing_succeeded = await self._process_inbound(message, subject)
-            self._finalize_inbound(message, processing_succeeded=processing_succeeded)
-            return
+            return await super()._process_inbound(message, subject)
 
         # One rate-limit slot for the whole stream reply.
         await self._acquire_rate_slot()
@@ -402,10 +398,47 @@ class WeComChannel(BaseChannel):
         from wecom_aibot_sdk import generate_req_id
 
         stream_id = generate_req_id("him")
-        content_buffer: list[str] = []
+        raw_content_parts: list[str] = []
+        filtered_content_parts: list[str] = []
         thinking_buffer: list[str] = []
         media_buffer: list[ContentPart] = []
         stream_open = False
+        last_sent_content = ""
+        filter_failed = False
+        processing_succeeded = False
+        show_thinking = self.should_show_thinking()
+
+        async def _send_stream(content: str, *, finish: bool) -> None:
+            nonlocal stream_open, last_sent_content
+            self._mark_receipt_attempted()
+            await ws_client.reply_stream(
+                frame=frame,
+                stream_id=stream_id,
+                content=content,
+                finish=finish,
+            )
+            self._mark_receipt_delivered()
+            stream_open = True
+            last_sent_content = content
+
+        def _append_body_chunk(chunk: str) -> str | None:
+            nonlocal filter_failed
+            if not chunk or filter_failed:
+                return None
+            raw_content_parts.append(chunk)
+            visible = chunk
+            if not show_thinking and "<think>" in visible:
+                visible = re.sub(r"<think>.*?</think>", "", visible, flags=re.DOTALL)
+                visible = re.sub(r"<think>.*$", "", visible, flags=re.DOTALL)
+            if not visible:
+                return ""
+            filtered = self._filter_outbound_text(visible, clean=False)
+            if filtered is None:
+                filter_failed = True
+                return None
+            if filtered:
+                filtered_content_parts.append(filtered)
+            return filtered
 
         # First-token timeout handling: if reply_timeout is configured and
         # the first event does not arrive in (timeout * 0.8) seconds, emit
@@ -414,36 +447,37 @@ class WeComChannel(BaseChannel):
         # We use ``asyncio.wait`` (not ``wait_for``) so the underlying
         # ``__anext__`` task is *not* cancelled on timeout — the placeholder
         # is streamed, then we await the in-flight first event normally.
-        if not self._accept_filtered_inbound(message):
-            return
         iterator = self._processor(message)
         first_event = None
         if self._constraints.reply_timeout > 0 and self._constraints.timeout_strategy == "placeholder":
             first_task: asyncio.Task[Any] = asyncio.create_task(iterator.__anext__())  # type: ignore[arg-type]
-            done, _pending = await asyncio.wait(
-                [first_task],
-                timeout=self._constraints.reply_timeout * 0.8,
-            )
-            if not done:
-                # Timeout fired — stream a placeholder, then keep waiting.
-                placeholder = self._constraints.placeholder_text
-                if placeholder:
-                    try:
-                        await ws_client.reply_stream(
-                            frame=frame,
-                            stream_id=stream_id,
-                            content=placeholder,
-                            finish=False,
-                        )
-                        stream_open = True
-                    except Exception:  # pylint: disable=broad-except
-                        # A placeholder failure must not cancel the underlying processor.
-                        logger.debug("WeCom placeholder reply_stream failed", exc_info=True)
             try:
-                first_event = await first_task
-            except StopAsyncIteration:
-                # Processor produced no events at all — nothing to stream.
-                return
+                done, _pending = await asyncio.wait(
+                    [first_task],
+                    timeout=self._constraints.reply_timeout * 0.8,
+                )
+                if not done and not self._has_outbound_text_filter():
+                    # Timeout fired — stream a placeholder, then keep waiting.
+                    placeholder = self._constraints.placeholder_text
+                    if placeholder:
+                        try:
+                            await _send_stream(placeholder, finish=False)
+                        except Exception:  # pylint: disable=broad-except
+                            # A placeholder failure must not cancel the underlying processor.
+                            logger.debug("WeCom placeholder reply_stream failed", exc_info=True)
+                try:
+                    first_event = await first_task
+                except StopAsyncIteration:
+                    # Processor produced no events at all — nothing to stream.
+                    await close_event_stream(iterator)
+                    return False
+            except BaseException:
+                if not first_task.done():
+                    first_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await first_task
+                await close_event_stream(iterator)
+                raise
 
         async def _events() -> Any:
             if first_event is not None:
@@ -458,115 +492,151 @@ class WeComChannel(BaseChannel):
                     pass  # WeCom shows thinking bubble on first stream chunk
 
                 elif event.type == MessageEventType.THINKING_DELTA:
-                    if self._constraints.show_thinking:
+                    if show_thinking and not filter_failed:
+                        added_thinking = False
                         for part in event.content:
                             if isinstance(part, TextContent) and part.text:
-                                thinking_buffer.append(part.text)
-                        thinking_text = self._constraints.thinking_template.format(
-                            content="".join(thinking_buffer).strip()
-                        )
-                        await ws_client.reply_stream(
-                            frame=frame,
-                            stream_id=stream_id,
-                            content=thinking_text,
-                            finish=False,
-                        )
-                        stream_open = True
+                                filtered_part = self._filter_outbound_text(part.text, clean=False)
+                                if filtered_part is None:
+                                    filter_failed = True
+                                    break
+                                if filtered_part:
+                                    thinking_buffer.append(filtered_part)
+                                    added_thinking = True
+                        if added_thinking and not filter_failed:
+                            thinking_text = self._constraints.thinking_template.format(
+                                content="".join(thinking_buffer).strip()
+                            )
+                            await _send_stream(thinking_text, finish=False)
+
+                elif event.type == MessageEventType.THINKING:
+                    if show_thinking and not filter_failed:
+                        for part in event.content:
+                            if isinstance(part, TextContent) and part.text:
+                                filtered_part = self._filter_outbound_text(part.text, clean=True)
+                                if filtered_part is None:
+                                    filter_failed = True
+                                    break
+                                if filtered_part.strip():
+                                    thinking_text = self._constraints.thinking_template.format(
+                                        content=filtered_part.strip()
+                                    )
+                                    await _send_stream(thinking_text, finish=False)
 
                 elif event.type == MessageEventType.FLUSH:
                     thinking_buffer.clear()
 
                 elif event.type == MessageEventType.DELTA:
+                    added = False
                     for part in event.content:
                         if isinstance(part, TextContent) and part.text:
-                            content_buffer.append(part.text)
-                    full_text = "".join(content_buffer)
-                    if full_text:
-                        await ws_client.reply_stream(
-                            frame=frame,
-                            stream_id=stream_id,
-                            content=full_text,
-                            finish=False,
-                        )
-                        stream_open = True
+                            piece = _append_body_chunk(part.text)
+                            if piece:
+                                added = True
+                    if added and not filter_failed:
+                        full_text = "".join(filtered_content_parts)
+                        if full_text:
+                            await _send_stream(full_text, finish=False)
 
                 elif event.type == MessageEventType.TOOL_START:
-                    if self._constraints.show_tool_hints:
+                    if self._constraints.show_tool_hints and not filter_failed:
                         hint = tool_hint_message(
                             event.metadata,
                             self._constraints,
                             phase="start",
                         )
-                        await ws_client.reply_stream(
-                            frame=frame,
-                            stream_id=stream_id,
-                            content=hint,
-                            finish=False,
-                        )
-                        stream_open = True
+                        filtered_hint = self._filter_outbound_text(hint, clean=True)
+                        if filtered_hint is None:
+                            filter_failed = True
+                        elif filtered_hint.strip():
+                            await _send_stream(filtered_hint, finish=False)
 
                 elif event.type == MessageEventType.TOOL_END:
                     pass
 
                 elif event.type == MessageEventType.ERROR:
                     error_text = event.error or "An unexpected error occurred."
-                    await ws_client.reply_stream(
-                        frame=frame,
-                        stream_id=stream_id,
-                        content=error_text,
-                        finish=True,
-                    )
-                    return
+                    filtered_err = self._filter_outbound_text(error_text, clean=True)
+                    if filtered_err and filtered_err.strip():
+                        await _send_stream(filtered_err, finish=True)
+                    elif stream_open:
+                        await _send_stream(last_sent_content, finish=True)
+                    return False
 
                 elif event.type == MessageEventType.MESSAGE:
                     from octop_gateway.utils import extract_media, extract_text
 
                     text = extract_text(event.content)
                     if text:
-                        content_buffer.append(text)
+                        raw_current = "".join(raw_content_parts)
+                        if not raw_current:
+                            _append_body_chunk(text)
+                        elif text.startswith(raw_current):
+                            suffix = text[len(raw_current) :]
+                            if suffix:
+                                _append_body_chunk(suffix)
+                        elif raw_current.startswith(text):
+                            pass
+                        else:
+                            _append_body_chunk(text)
                     media_buffer.extend(extract_media(event.content))
 
                 elif event.type == MessageEventType.COMPLETED:
+                    processing_succeeded = True
                     break
 
         except Exception:  # pylint: disable=broad-except
             # The processor and SDK stream are independent extension boundaries.
             logger.exception("WeComChannel streaming error")
             error_text = self._constraints.placeholder_text or "An unexpected error occurred."
-            await ws_client.reply_stream(
-                frame=frame,
-                stream_id=stream_id,
-                content=error_text,
-                finish=True,
-            )
-            return
+            filtered_err = self._filter_outbound_text(error_text, clean=True)
+            if filtered_err and filtered_err.strip():
+                await _send_stream(filtered_err, finish=True)
+            elif stream_open:
+                await _send_stream(last_sent_content, finish=True)
+            return False
 
         finally:
             await close_event_stream(events)
             await close_event_stream(iterator)
 
+        if processing_succeeded and not filter_failed:
+            tail = self._finish_outbound_text_filter(clean=False)
+            if tail is None:
+                filter_failed = True
+            elif tail:
+                filtered_content_parts.append(tail)
+        elif processing_succeeded and filter_failed:
+            self._suppress_outbound_text_filter_finish()
+
+        if filter_failed:
+            if stream_open:
+                await _send_stream(last_sent_content, finish=True)
+            return False
+
         # Close a text stream before replying with native media messages.
-        final_text = "".join(content_buffer)
-        if final_text or stream_open or not media_buffer:
-            await ws_client.reply_stream(
-                frame=frame,
-                stream_id=stream_id,
-                content=final_text or "✅",
-                finish=True,
-            )
+        final_text = "".join(filtered_content_parts)
+        if final_text.strip():
+            await _send_stream(final_text, finish=True)
+        elif stream_open:
+            await _send_stream(last_sent_content or "✅", finish=True)
+        elif not media_buffer and not self._has_outbound_text_filter():
+            await _send_stream("✅", finish=True)
 
         if media_buffer:
             subject_id = message.channel_subject.subject_id if message.channel_subject else ""
             media_meta = dict(meta)
-            if final_text or stream_open:
+            if final_text.strip() or stream_open:
                 # The callback frame has already completed its stream reply;
                 # send subsequent media proactively to the same chat.
                 media_meta.pop("_frame", None)
             reply_subject = ChannelSubject(subject_id=subject_id, metadata=media_meta)
             for media in media_buffer:
+                self._mark_receipt_attempted()
                 await self._send_media(reply_subject, media)
+                self._mark_receipt_delivered()
 
-        self._finalize_inbound(message, processing_succeeded=True)
+        return processing_succeeded
 
     def parse_inbound(self, raw_payload: Any) -> InboundMessage:
         """Parse WebSocket message frame into InboundMessage.

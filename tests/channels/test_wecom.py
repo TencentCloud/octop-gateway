@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from octop_gateway.channel import InboundReceipt
 from octop_gateway.channels.wecom import WeComChannel, WeComConfig
 from octop_gateway.models import (
     ChannelSubject,
@@ -386,7 +387,7 @@ class _FakeWSClient:
         self.media_replies.append((frame, media_type, media_id))
 
 
-def _make_stream_payload(ws: _FakeWSClient) -> dict:
+def _make_stream_payload(ws: _FakeWSClient, *, content: str = "hello") -> dict:
     """Build the dict shape WeComChannel.parse_inbound expects.
 
     The channel injects ``self._ws_client`` into metadata, so callers must
@@ -396,7 +397,7 @@ def _make_stream_payload(ws: _FakeWSClient) -> dict:
         "msgid": "m1",
         "msgtype": "text",
         "from": {"userid": "user_001"},
-        "text": {"content": "hello"},
+        "text": {"content": content},
         "_frame": {"body": {}},
     }
 
@@ -567,3 +568,243 @@ class TestWeComStreamConstraints:
         assert ws.calls
         assert ws.calls[-1]["finish"] is True
         assert ws.calls[-1]["content"] == "__ERROR_PLACEHOLDER__"
+
+
+class TestWeComDispatchProtection:
+    """Real WeComChannel WebSocket streaming tests for InboundReceipt protection."""
+
+    @staticmethod
+    def _configure_channel(ch: WeComChannel, *, show_thinking: bool = False) -> _FakeWSClient:
+        ch._constraints.reply_timeout = 0
+        ch._constraints.timeout_strategy = "none"
+        ch._constraints.show_thinking = show_thinking
+
+        async def _noop() -> None:
+            return None
+
+        ch._acquire_rate_slot = _noop  # type: ignore[method-assign]
+        ws = _FakeWSClient()
+        ch._ws_client = ws
+        return ws
+
+    @pytest.mark.asyncio
+    async def test_websocket_inbound_invokes_input_filter_exactly_once(self) -> None:
+        processor_calls: list[str] = []
+
+        async def processor(msg: InboundMessage):
+            processor_calls.append(msg.text)
+            yield MessageEvent.delta("admitted reply")
+            yield MessageEvent.completed()
+
+        ch = WeComChannel(processor=processor, config=_make_config())
+        ws = self._configure_channel(ch)
+
+        filter_calls = 0
+
+        def one_shot_filter(_msg: InboundMessage) -> bool:
+            nonlocal filter_calls
+            filter_calls += 1
+            return filter_calls == 1
+
+        receipt = await ch.dispatch_inbound(
+            _make_stream_payload(ws, content="ping"),
+            receipt=InboundReceipt(input_filter=one_shot_filter),
+        )
+
+        assert filter_calls == 1
+        assert processor_calls == ["ping"]
+        assert ws.calls
+        assert ws.calls[-1]["finish"] is True
+        assert ws.calls[-1]["content"] == "admitted reply"
+        assert receipt.delivered is True
+
+        # Rejecting input_filter must skip processing and streaming completely.
+        ws2 = self._configure_channel(ch)
+        rejected_calls = 0
+
+        def reject_filter(_msg: InboundMessage) -> bool:
+            nonlocal rejected_calls
+            rejected_calls += 1
+            return False
+
+        receipt2 = await ch.dispatch_inbound(
+            _make_stream_payload(ws2, content="blocked"),
+            receipt=InboundReceipt(input_filter=reject_filter),
+        )
+        assert rejected_calls == 1
+        assert processor_calls == ["ping"]
+        assert ws2.calls == []
+        assert receipt2.attempted is False
+        assert receipt2.delivered is False
+
+    @pytest.mark.asyncio
+    async def test_empty_text_filter_suppresses_stream_and_checkmark_fallback(self) -> None:
+        async def processor(_msg: InboundMessage):
+            yield MessageEvent.delta("secret")
+            yield MessageEvent.completed()
+
+        ch = WeComChannel(processor=processor, config=_make_config())
+        ws = self._configure_channel(ch)
+
+        receipt = await ch.dispatch_inbound(
+            _make_stream_payload(ws),
+            receipt=InboundReceipt(text_filter=lambda _text: ""),
+        )
+
+        assert ws.calls == []
+        assert receipt.attempted is False
+        assert receipt.delivered is False
+
+    @pytest.mark.asyncio
+    async def test_raising_and_non_string_text_filter_fail_closed(self) -> None:
+        async def processor(_msg: InboundMessage):
+            yield MessageEvent.delta("first ")
+            yield MessageEvent.delta("second")
+            yield MessageEvent.completed()
+
+        finish_calls: list[bool] = []
+
+        def raising_filter(_text: str) -> str:
+            raise RuntimeError("boom")
+
+        ch = WeComChannel(processor=processor, config=_make_config())
+        ws = self._configure_channel(ch)
+        receipt = await ch.dispatch_inbound(
+            _make_stream_payload(ws),
+            receipt=InboundReceipt(
+                text_filter=raising_filter,
+                text_filter_finish=lambda: finish_calls.append(True) or "tail",
+            ),
+        )
+        assert ws.calls == []
+        assert finish_calls == []
+        assert receipt.attempted is False
+        assert receipt.delivered is False
+
+        # Non-string return also fails closed without leaking raw text.
+        ws2 = self._configure_channel(ch)
+        receipt2 = await ch.dispatch_inbound(
+            _make_stream_payload(ws2),
+            receipt=InboundReceipt(text_filter=lambda _text: None),  # type: ignore[arg-type, return-value]
+        )
+        assert ws2.calls == []
+        assert receipt2.attempted is False
+        assert receipt2.delivered is False
+
+        # Failure on a later chunk closes the open stream without leaking raw chunk 2.
+        ws3 = self._configure_channel(ch)
+        seen = 0
+
+        def fail_on_second(text: str) -> str:
+            nonlocal seen
+            seen += 1
+            if seen == 2:
+                raise RuntimeError("second chunk boom")
+            return text.upper()
+
+        await ch.dispatch_inbound(
+            _make_stream_payload(ws3),
+            receipt=InboundReceipt(text_filter=fail_on_second),
+        )
+        assert len(ws3.calls) == 2
+        assert (ws3.calls[0]["content"], ws3.calls[0]["finish"]) == ("FIRST ", False)
+        assert (ws3.calls[1]["content"], ws3.calls[1]["finish"]) == ("FIRST ", True)
+
+    @pytest.mark.asyncio
+    async def test_stateful_incremental_filter_sees_each_chunk_once_and_flushes_tail(self) -> None:
+        async def processor(_msg: InboundMessage):
+            yield MessageEvent.delta("one ")
+            yield MessageEvent.delta("two")
+            yield MessageEvent.text("one two three")
+            yield MessageEvent.completed()
+
+        seen_chunks: list[str] = []
+        finish_calls: list[bool] = []
+
+        def stateful_filter(chunk: str) -> str:
+            seen_chunks.append(chunk)
+            return chunk.upper()
+
+        def finish_filter() -> str:
+            finish_calls.append(True)
+            return " [DONE]"
+
+        ch = WeComChannel(processor=processor, config=_make_config())
+        ws = self._configure_channel(ch)
+
+        receipt = await ch.dispatch_inbound(
+            _make_stream_payload(ws),
+            receipt=InboundReceipt(text_filter=stateful_filter, text_filter_finish=finish_filter),
+        )
+
+        assert seen_chunks == ["one ", "two", " three"]
+        assert finish_calls == [True]
+        assert [c["content"] for c in ws.calls] == ["ONE ", "ONE TWO", "ONE TWO THREE [DONE]"]
+        assert ws.calls[-1]["finish"] is True
+        assert receipt.attempted is True
+        assert receipt.delivered is True
+
+    @pytest.mark.asyncio
+    async def test_suppress_thinking_hides_thinking_without_mutating_channel(self) -> None:
+        async def processor(_msg: InboundMessage):
+            yield MessageEvent.thinking_delta("secret thought")
+            yield MessageEvent.thinking("more secret")
+            yield MessageEvent.delta("<think>inline secret</think>final answer")
+            yield MessageEvent.completed()
+
+        ch = WeComChannel(processor=processor, config=_make_config())
+        ws = self._configure_channel(ch, show_thinking=True)
+
+        receipt = await ch.dispatch_inbound(
+            _make_stream_payload(ws),
+            receipt=InboundReceipt(suppress_thinking=True),
+        )
+
+        assert all("secret" not in c["content"] for c in ws.calls)
+        assert (ws.calls[-1]["content"], ws.calls[-1]["finish"]) == ("final answer", True)
+        assert ch._constraints.show_thinking is True
+        assert receipt.delivered is True
+
+    @pytest.mark.asyncio
+    async def test_cancelled_stream_restores_persistent_settings_for_next_dispatch(self) -> None:
+        import asyncio as _asyncio
+
+        started = _asyncio.Event()
+        release = _asyncio.Event()
+        call_index = 0
+
+        async def processor(_msg: InboundMessage):
+            nonlocal call_index
+            call_index += 1
+            if call_index == 1:
+                yield MessageEvent.thinking_delta("hidden during cancel")
+                started.set()
+                await release.wait()
+                yield MessageEvent.delta("never reached")
+                yield MessageEvent.completed()
+            else:
+                yield MessageEvent.thinking_delta("restored thought")
+                yield MessageEvent.delta("restored answer")
+                yield MessageEvent.completed()
+
+        ch = WeComChannel(processor=processor, config=_make_config())
+        ws = self._configure_channel(ch, show_thinking=True)
+
+        task = _asyncio.create_task(
+            ch.dispatch_inbound(
+                _make_stream_payload(ws, content="first"),
+                receipt=InboundReceipt(suppress_thinking=True, text_filter=lambda _text: ""),
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(_asyncio.CancelledError):
+            await task
+
+        assert ws.calls == []
+        assert ch._constraints.show_thinking is True
+
+        next_receipt = await ch.dispatch_inbound(_make_stream_payload(ws, content="second"))
+        assert any("restored thought" in c["content"] for c in ws.calls)
+        assert (ws.calls[-1]["content"], ws.calls[-1]["finish"]) == ("restored answer", True)
+        assert next_receipt.delivered is True
