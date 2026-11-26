@@ -16,6 +16,8 @@ from __future__ import annotations
 from octop_gateway.channel import BaseChannel, ChannelConfig, ChannelCredentialsError, MessageProcessor
 from octop_gateway.channels import SUPPORTED_CHANNEL_KINDS, ChannelKind
 from octop_gateway.channels.discord import DiscordChannel, DiscordConfig
+from octop_gateway.channels.slack import SlackChannel, SlackConfig
+from octop_gateway.channels.whatsapp import WhatsAppChannel, WhatsAppConfig
 from octop_gateway.constraints import ChannelConstraints, RateLimiter, ReplyTimeoutGuard, TypingKeepalive
 from octop_gateway.group_context import (
     GroupActivation,
@@ -24,7 +26,7 @@ from octop_gateway.group_context import (
     GroupHistoryMode,
     GroupVisibility,
 )
-from octop_gateway.manager import ChannelManager
+from octop_gateway.manager import AdmissionHandler, ChannelManager, InboundDispatch
 from octop_gateway.media import FileSystemMediaBackend, MediaBackend
 from octop_gateway.models import (
     AudioContent,
@@ -46,6 +48,7 @@ from octop_gateway.utils import Debouncer, extract_media, extract_text, has_medi
 __all__ = [
     "DASHBOARD_CHANNEL_ID",
     "SUPPORTED_CHANNEL_KINDS",
+    "AdmissionHandler",
     "AudioContent",
     "BaseChannel",
     "ChannelConfig",
@@ -70,6 +73,7 @@ __all__ = [
     "GroupHistoryMode",
     "GroupVisibility",
     "ImageContent",
+    "InboundDispatch",
     "InboundMessage",
     "MediaBackend",
     "MessageEvent",
@@ -77,9 +81,13 @@ __all__ = [
     "MessageProcessor",
     "RateLimiter",
     "ReplyTimeoutGuard",
+    "SlackChannel",
+    "SlackConfig",
     "TextContent",
     "TypingKeepalive",
     "VideoContent",
+    "WhatsAppChannel",
+    "WhatsAppConfig",
     "extract_media",
     "extract_text",
     "has_media",

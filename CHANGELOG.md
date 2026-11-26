@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-11-26
+
+### 新增
+
+- 新增入站消息准入控制与受保护分发，支持群参与元数据、群消息过滤及安全默认策略。
+- QQ 支持群资料查询，并为查询操作增加独立频控。
+- 新增 Slack 通道，支持 Socket Mode 与 HTTP Events API。
+- 新增 WhatsApp 双模式通道，支持 Cloud API 与 WAHA/Evolution QR Bridge。
+
+### 修复
+
+- 修复群消息 subject 路由、LRU 去重、飞书域名及回复引用问题。
+- 加强 Slack 与 WhatsApp 的 webhook 鉴权、消息路由、流式输出保护和群聊处理。
+
 ## [1.0.4] - 2026-11-17
 
 ### 新增
