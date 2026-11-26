@@ -920,6 +920,7 @@ class SlackChannel(BaseChannel):
                 "ts": message_ts,
                 "text": first_chunk,
             }
+            self._mark_receipt_attempted()
             try:
                 async with http.post(
                     self._api_url("chat.update"),
@@ -931,6 +932,7 @@ class SlackChannel(BaseChannel):
                     data: dict[str, Any] = await resp.json()
                     if data.get("ok"):
                         self.note_outbound()
+                        self._mark_receipt_delivered()
                     else:
                         logger.warning("Slack chat.update failed: %s", data.get("error", "unknown_error"))
             except Exception:
@@ -943,6 +945,7 @@ class SlackChannel(BaseChannel):
             post_payload["thread_ts"] = thread_ts
             if reply_broadcast:
                 post_payload["reply_broadcast"] = True
+        self._mark_receipt_attempted()
         try:
             async with http.post(
                 self._api_url("chat.postMessage"),
@@ -954,6 +957,7 @@ class SlackChannel(BaseChannel):
                 data = await resp.json()
                 if data.get("ok"):
                     self.note_outbound()
+                    self._mark_receipt_delivered()
                     if thread_ts:
                         self._mark_thread_participated(channel_id, thread_ts)
                     return str(data.get("ts") or "") or None
@@ -973,43 +977,90 @@ class SlackChannel(BaseChannel):
             await self._set_reaction(src_channel, src_ts, "hourglass_flowing_sand")
 
         if not use_stream_edit:
+            ok = False
             try:
                 ok = await super()._process_inbound(message, subject)
+                return ok
+            finally:
                 if use_reactions:
                     await self._set_reaction(src_channel, src_ts, "hourglass_flowing_sand", remove=True)
                     if ok:
                         await self._set_reaction(src_channel, src_ts, "white_check_mark")
-                return ok
-            except Exception:
-                if use_reactions:
-                    await self._set_reaction(src_channel, src_ts, "hourglass_flowing_sand", remove=True)
-                raise
 
         channel_id, thread_ts = self._resolve_target(subject)
         stream_ts: str | None = None
         broadcast_pending = self._should_broadcast_reply(subject, thread_ts)
-        delta_buffer: list[str] = []
+        filtered_delta_parts: list[str] = []
         thinking_buffer: list[str] = []
-        show_thinking = self._constraints.show_thinking
+        show_thinking = self.should_show_thinking()
+        filter_failed = False
+        in_think_tag = False
         last_edit_at = 0.0
         succeeded = False
         timeout_guard: ReplyTimeoutGuard | None = None
+
+        def _append_delta(chunk: str) -> bool:
+            nonlocal filter_failed, in_think_tag
+            if not chunk or filter_failed:
+                return False
+            visible = chunk
+            if not show_thinking:
+                if in_think_tag:
+                    end_idx = visible.find("</think>")
+                    if end_idx == -1:
+                        return False
+                    visible = visible[end_idx + len("</think>") :]
+                    in_think_tag = False
+                if "<think>" in visible:
+                    visible = re.sub(r"<think>.*?</think>", "", visible, flags=re.DOTALL)
+                    start_idx = visible.find("<think>")
+                    if start_idx != -1:
+                        visible = visible[:start_idx]
+                        in_think_tag = True
+            if not visible:
+                return False
+            filtered = self._filter_outbound_text(visible, clean=False)
+            if filtered is None:
+                filter_failed = True
+                return False
+            if filtered:
+                filtered_delta_parts.append(filtered)
+                return True
+            return False
+
+        async def _send_filtered(text: str) -> None:
+            nonlocal filter_failed
+            if filter_failed:
+                return
+            filtered = self._filter_outbound_text(text, clean=True)
+            if filtered is None:
+                filter_failed = True
+                return
+            if filtered.strip():
+                await self.reply_text(subject, filtered)
 
         async def _flush_thinking() -> None:
             if not thinking_buffer:
                 return
             thinking_text = "".join(thinking_buffer).strip()
             thinking_buffer.clear()
-            if thinking_text:
+            if thinking_text and not filter_failed:
                 formatted = self._constraints.thinking_template.format(content=thinking_text)
-                await self._rate_limited_send(subject, formatted)
+                await _send_filtered(formatted)
 
         async def _flush_deltas(*, reset_stream: bool = False) -> None:
             nonlocal stream_ts, broadcast_pending
-            if not delta_buffer:
+            if filter_failed:
+                filtered_delta_parts.clear()
+                if reset_stream:
+                    stream_ts = None
                 return
-            final_text = self._clean_output("".join(delta_buffer))
-            delta_buffer.clear()
+            if not filtered_delta_parts:
+                if reset_stream:
+                    stream_ts = None
+                return
+            final_text = self._clean_output("".join(filtered_delta_parts))
+            filtered_delta_parts.clear()
             if final_text:
                 chunks = split_slack_text(final_text, limit=_SLACK_MAX_MESSAGE_LEN)
                 stream_ts = await self._post_or_update_stream_text(
@@ -1029,7 +1080,7 @@ class SlackChannel(BaseChannel):
         if self._constraints.reply_timeout > 0:
 
             async def _on_reply_timeout() -> None:
-                if self._constraints.timeout_strategy == "placeholder":
+                if self._constraints.timeout_strategy == "placeholder" and not self._has_outbound_text_filter():
                     await self._rate_limited_send(subject, self._constraints.placeholder_text)
 
             timeout_guard = ReplyTimeoutGuard(
@@ -1047,28 +1098,34 @@ class SlackChannel(BaseChannel):
                 if event.type == MessageEventType.DELTA and ev_text:
                     if timeout_guard:
                         timeout_guard.cancel()
-                    delta_buffer.append(ev_text)
-                    now = time.monotonic()
-                    if now - last_edit_at >= 0.5:
-                        current_text = self._clean_output("".join(delta_buffer))
-                        if current_text:
-                            stream_ts = await self._post_or_update_stream_text(
-                                channel_id,
-                                thread_ts,
-                                current_text,
-                                message_ts=stream_ts,
-                                reply_broadcast=broadcast_pending,
-                            )
-                            if stream_ts:
-                                broadcast_pending = False
-                            last_edit_at = now
+                    if _append_delta(ev_text) and not filter_failed:
+                        now = time.monotonic()
+                        if now - last_edit_at >= 0.5:
+                            current_text = self._clean_output("".join(filtered_delta_parts))
+                            if current_text:
+                                stream_ts = await self._post_or_update_stream_text(
+                                    channel_id,
+                                    thread_ts,
+                                    current_text,
+                                    message_ts=stream_ts,
+                                    reply_broadcast=broadcast_pending,
+                                )
+                                if stream_ts:
+                                    broadcast_pending = False
+                                last_edit_at = now
                 elif event.type == MessageEventType.THINKING and show_thinking:
-                    await self._on_thinking(subject, event)
+                    if not filter_failed:
+                        for part in event.content:
+                            if isinstance(part, TextContent) and part.text:
+                                formatted = self._constraints.thinking_template.format(content=part.text.strip())
+                                await _send_filtered(formatted)
                 elif event.type == MessageEventType.THINKING_DELTA and show_thinking:
-                    for part in event.content:
-                        if isinstance(part, TextContent) and part.text:
-                            thinking_buffer.append(part.text)
+                    if not filter_failed:
+                        for part in event.content:
+                            if isinstance(part, TextContent) and part.text:
+                                thinking_buffer.append(part.text)
                 elif event.type == MessageEventType.FLUSH:
+                    in_think_tag = False
                     await _flush_thinking()
                     await _flush_deltas(reset_stream=True)
                 elif event.type == MessageEventType.MESSAGE:
@@ -1076,33 +1133,46 @@ class SlackChannel(BaseChannel):
                         timeout_guard.cancel()
                     await _flush_thinking()
                     await _flush_deltas(reset_stream=True)
-                    cleaned = self._clean_output(ev_text) if ev_text else ""
-                    if cleaned:
-                        await self._rate_limited_send(subject, cleaned)
-                    for m in ev_media:
-                        await self.reply_media(subject, m)
+                    if ev_text:
+                        await _send_filtered(ev_text)
+                    if not filter_failed:
+                        for m in ev_media:
+                            await self.reply_media(subject, m)
                 elif event.type == MessageEventType.TOOL_START:
-                    if self._constraints.show_tool_hints:
+                    if self._constraints.show_tool_hints and not filter_failed:
                         hint = tool_hint_message(event.metadata, self._constraints, phase="start")
-                        await self._rate_limited_send(subject, hint)
+                        await _send_filtered(hint)
                 elif event.type == MessageEventType.TOOL_END:
-                    if self._constraints.show_tool_hints:
+                    if self._constraints.show_tool_hints and not filter_failed:
                         hint = tool_hint_message(event.metadata, self._constraints, phase="end")
-                        await self._rate_limited_send(subject, hint)
+                        await _send_filtered(hint)
                 elif event.type == MessageEventType.ERROR:
                     if timeout_guard:
                         timeout_guard.cancel()
                     await _flush_deltas(reset_stream=True)
                     error_text = event.error or "An unexpected error occurred."
-                    await self._rate_limited_send(subject, error_text)
+                    await _send_filtered(error_text)
                     break
                 elif event.type == MessageEventType.COMPLETED:
                     if timeout_guard:
                         timeout_guard.cancel()
-                    await _flush_thinking()
-                    await _flush_deltas()
                     succeeded = True
                     break
+
+            if succeeded and not filter_failed:
+                tail = self._finish_outbound_text_filter(clean=False)
+                if tail is None:
+                    filter_failed = True
+                elif tail:
+                    filtered_delta_parts.append(tail)
+            elif filter_failed:
+                self._suppress_outbound_text_filter_finish()
+
+            if filter_failed:
+                filtered_delta_parts.clear()
+                thinking_buffer.clear()
+                succeeded = False
+                return False
 
             await _flush_thinking()
             await _flush_deltas()
@@ -1116,7 +1186,9 @@ class SlackChannel(BaseChannel):
             if timeout_guard:
                 timeout_guard.cancel()
             await _flush_deltas(reset_stream=True)
-            await self._rate_limited_send(subject, "An error occurred while processing your message.")
+            await _send_filtered("An error occurred while processing your message.")
+            if filter_failed:
+                self._suppress_outbound_text_filter_finish()
             return False
         finally:
             if timeout_guard:

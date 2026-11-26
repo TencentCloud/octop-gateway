@@ -427,22 +427,37 @@ class XiaoyiChannel(BaseChannel):
         task_id = message.metadata.get("task_id", "")
         message_id = message.metadata.get("message_id", str(uuid.uuid4()))
         processing_succeeded = False
+        filter_failed = False
         events = None
 
         try:
             events = self._processor(message)
             async for event in events:
                 if event.type == MessageEventType.COMPLETED:
-                    await self._deliver_a2a_event(subject, event, session_id, task_id, message_id)
-                    processing_succeeded = True
+                    if not filter_failed:
+                        filter_failed = not await self._deliver_a2a_event(
+                            subject, event, session_id, task_id, message_id
+                        )
+                    if not filter_failed:
+                        tail = self._finish_outbound_text_filter(clean=False)
+                        if tail is None:
+                            filter_failed = True
+                        elif tail:
+                            await self._send_text_chunk(session_id, task_id, message_id, tail)
+                    else:
+                        self._suppress_outbound_text_filter_finish()
+                    processing_succeeded = not filter_failed
                     break
-                await self._deliver_a2a_event(subject, event, session_id, task_id, message_id)
+                if not filter_failed:
+                    filter_failed = not await self._deliver_a2a_event(subject, event, session_id, task_id, message_id)
                 if event.type == MessageEventType.ERROR:
                     break
         except Exception:  # pylint: disable=broad-except
             # The processor is host-provided; one failed turn must not break A2A delivery.
             logger.exception("Xiaoyi processing error session=%s", session_id)
-            await self._send_text_chunk(session_id, task_id, message_id, "An error occurred.")
+            err = self._filter_outbound_text("An error occurred.", clean=True)
+            if err and err.strip():
+                await self._send_text_chunk(session_id, task_id, message_id, err)
         finally:
             try:
                 await self._send_final_message(session_id, task_id, message_id, failed=not processing_succeeded)
@@ -458,33 +473,58 @@ class XiaoyiChannel(BaseChannel):
         session_id: str,
         task_id: str,
         message_id: str,
-    ) -> None:
+    ) -> bool:
         if event.type in (MessageEventType.THINKING, MessageEventType.THINKING_DELTA):
-            if self._constraints.show_thinking:
+            if self.should_show_thinking():
                 for part in event.content:
                     if isinstance(part, TextContent) and part.text:
-                        await self._send_reasoning_chunk(session_id, task_id, message_id, part.text)
+                        filtered = self._filter_outbound_text(part.text, clean=False)
+                        if filtered is None:
+                            return False
+                        if filtered:
+                            await self._send_reasoning_chunk(session_id, task_id, message_id, filtered)
         elif event.type in (MessageEventType.MESSAGE, MessageEventType.DELTA, MessageEventType.FLUSH):
             text = self._extract_text_from_event(event)
             if text:
-                await self._send_text_chunk(session_id, task_id, message_id, text)
+                filtered = self._filter_outbound_text(text, clean=False)
+                if filtered is None:
+                    return False
+                if filtered:
+                    await self._send_text_chunk(session_id, task_id, message_id, filtered)
         elif event.type == MessageEventType.TOOL_START:
             if self._constraints.show_tool_hints:
                 hint = tool_hint_message(event.metadata, self._constraints, phase="start")
-                await self._send_text_chunk(session_id, task_id, message_id, f"\n\n{hint}\n")
+                filtered = self._filter_outbound_text(f"\n\n{hint}\n", clean=False)
+                if filtered is None:
+                    return False
+                if filtered:
+                    await self._send_text_chunk(session_id, task_id, message_id, filtered)
         elif event.type == MessageEventType.TOOL_END:
             if self._constraints.show_tool_hints:
                 hint = tool_hint_message(event.metadata, self._constraints, phase="end")
-                await self._send_text_chunk(session_id, task_id, message_id, f"\n\n{hint}\n")
+                filtered = self._filter_outbound_text(f"\n\n{hint}\n", clean=False)
+                if filtered is None:
+                    return False
+                if filtered:
+                    await self._send_text_chunk(session_id, task_id, message_id, filtered)
         elif event.type == MessageEventType.ERROR:
             err = event.error or "An error occurred."
-            await self._send_text_chunk(session_id, task_id, message_id, err)
+            filtered = self._filter_outbound_text(err, clean=True)
+            if filtered is None:
+                return False
+            if filtered.strip():
+                await self._send_text_chunk(session_id, task_id, message_id, filtered)
         elif event.type == MessageEventType.COMPLETED:
             for part in event.content:
                 if isinstance(part, ImageContent | VideoContent | FileContent):
                     await self._send_media_artifact(session_id, task_id, message_id, part)
                 elif isinstance(part, TextContent) and part.text:
-                    await self._send_text_chunk(session_id, task_id, message_id, part.text)
+                    filtered = self._filter_outbound_text(part.text, clean=False)
+                    if filtered is None:
+                        return False
+                    if filtered:
+                        await self._send_text_chunk(session_id, task_id, message_id, filtered)
+        return True
 
     def _extract_text_from_event(self, event: MessageEvent) -> str:
         parts: list[str] = []
@@ -553,7 +593,9 @@ class XiaoyiChannel(BaseChannel):
                 message_id,
                 [{"kind": "text", "text": chunk}],
             )
+            self._mark_receipt_attempted()
             await self._send_to_session(session_id, msg)
+            self._mark_receipt_delivered()
 
     async def _send_reasoning_chunk(
         self,
@@ -571,7 +613,9 @@ class XiaoyiChannel(BaseChannel):
                 message_id,
                 [{"kind": "reasoningText", "reasoningText": chunk}],
             )
+            self._mark_receipt_attempted()
             await self._send_to_session(session_id, msg)
+            self._mark_receipt_delivered()
 
     async def _send_media_artifact(
         self,

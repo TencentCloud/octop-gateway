@@ -26,7 +26,7 @@ from octop_gateway.group_context import (
     GroupHistoryMode,
     GroupVisibility,
 )
-from octop_gateway.manager import ChannelManager
+from octop_gateway.manager import AdmissionHandler, ChannelManager, InboundDispatch
 from octop_gateway.media import FileSystemMediaBackend, MediaBackend
 from octop_gateway.models import (
     AudioContent,
@@ -48,6 +48,7 @@ from octop_gateway.utils import Debouncer, extract_media, extract_text, has_medi
 __all__ = [
     "DASHBOARD_CHANNEL_ID",
     "SUPPORTED_CHANNEL_KINDS",
+    "AdmissionHandler",
     "AudioContent",
     "BaseChannel",
     "ChannelConfig",
@@ -72,6 +73,7 @@ __all__ = [
     "GroupHistoryMode",
     "GroupVisibility",
     "ImageContent",
+    "InboundDispatch",
     "InboundMessage",
     "MediaBackend",
     "MessageEvent",
