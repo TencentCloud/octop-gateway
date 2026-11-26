@@ -9,6 +9,7 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import urlparse
 
 import pytest
 
@@ -269,7 +270,8 @@ async def test_whatsapp_cloud_and_waha_outbound_and_qr_helpers() -> None:
                     "mime_type": "image/jpeg",
                 },
             )
-        if "lookaside.fbsbx.com" in url:
+        # Match the CDN host exactly; a substring check is what CodeQL flags.
+        if (urlparse(url).hostname or "").lower() == "lookaside.fbsbx.com":
             return _FakeResponse(200, json_data=None, body=b"JPEG_BINARY", content_type="image/jpeg")
         if url.endswith("/api/sessions/default"):
             return _FakeResponse(200, {"name": "default", "status": "SCAN_QR_CODE"})

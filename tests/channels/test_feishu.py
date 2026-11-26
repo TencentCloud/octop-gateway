@@ -81,6 +81,56 @@ class TestFeishuChannelUnit:
         assert ch2._api_base == "https://open.larksuite.com/open-apis"
         assert ch2._ws_domain == "https://open.larksuite.com"
 
+    async def test_fetch_remote_media_auth_uses_parsed_host(self) -> None:
+        ch = FeishuChannel(processor=_noop_processor, config=_make_config())
+        ch._tenant_token = "tenant-token"
+        ch._token_expires_at = time.time() + 3600
+        seen: list[dict[str, str]] = []
+
+        class _Resp:
+            content_type = "image/png"
+
+            def raise_for_status(self) -> None:
+                return None
+
+            async def read(self) -> bytes:
+                return b"img"
+
+            async def __aenter__(self) -> _Resp:
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+        def _get(url: str, headers: dict[str, str] | None = None, **_kwargs: object) -> _Resp:
+            seen.append(dict(headers or {}))
+            return _Resp()
+
+        http = MagicMock()
+        http.closed = False
+        http.get = MagicMock(side_effect=_get)
+        ch._http = http
+
+        await ch.fetch_remote_media("https://open.feishu.cn/open-apis/im/v1/images/img")
+        await ch.fetch_remote_media("https://evil.example/path?x=open.feishu.cn")
+        await ch.fetch_remote_media("https://open.feishu.cn.evil.example/open-apis/file")
+        await ch.fetch_remote_media("https://not-feishu.example/open-apis/file")
+
+        assert seen[0]["Authorization"] == "Bearer tenant-token"
+        assert seen[1] == {}
+        assert seen[2] == {}
+        assert seen[3] == {}
+
+        custom = FeishuChannel(
+            processor=_noop_processor,
+            config=FeishuConfig(app_id="cli_1", app_secret="sec_1", domain="https://custom.example"),
+        )
+        custom._tenant_token = "custom-token"
+        custom._token_expires_at = time.time() + 3600
+        custom._http = http
+        await custom.fetch_remote_media("https://custom.example/open-apis/im/v1/images/img")
+        assert seen[4]["Authorization"] == "Bearer custom-token"
+
     def test_parse_inbound_parent_id_and_quote(self) -> None:
         ch = FeishuChannel(processor=_noop_processor, config=_make_config())
         payload = {
