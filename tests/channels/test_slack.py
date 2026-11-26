@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -1020,3 +1021,326 @@ async def test_slack_thread_isolation_isolates_passive_context_and_cleanup() -> 
     assert seen_contexts[2] == ("C_ISO:thread:100.0", [], None)
 
     await ch.stop()
+
+
+class TestSlackEditStreamOutputProtection:
+    """Real SlackChannel streaming_mode='edit' regressions for per-dispatch output protection."""
+
+    @staticmethod
+    def _config(*, show_thinking: bool = False, status_reactions: bool = False) -> SlackConfig:
+        return SlackConfig(
+            bot_token="xoxb-stream-test",
+            streaming_mode="edit",
+            show_thinking=show_thinking,
+            status_reactions=status_reactions,
+        )
+
+    @staticmethod
+    def _dm_event(ts: str = "100.1", text: str = "hello") -> dict[str, Any]:
+        return {
+            "type": "message",
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U1",
+            "text": text,
+            "ts": ts,
+        }
+
+    @staticmethod
+    def _wire_http(channel: SlackChannel) -> list[tuple[str, dict[str, Any]]]:
+        calls: list[tuple[str, dict[str, Any]]] = []
+        post_count = 0
+
+        def _fake_post(url: str, **kwargs: Any) -> _FakeResponse:
+            nonlocal post_count
+            endpoint = url.rsplit("/", 1)[-1]
+            payload = dict(kwargs.get("json") or {})
+            calls.append((endpoint, payload))
+            if endpoint == "chat.postMessage":
+                post_count += 1
+                return _FakeResponse(200, {"ok": True, "ts": f"999.{post_count}"})
+            return _FakeResponse(200, {"ok": True})
+
+        fake_http = MagicMock()
+        fake_http.closed = False
+        fake_http.post = MagicMock(side_effect=_fake_post)
+        fake_http.close = AsyncMock()
+        channel._http = fake_http
+        return calls
+
+    @staticmethod
+    def _patch_slack_clock(monkeypatch: pytest.MonkeyPatch, clock: list[float]) -> None:
+        from types import SimpleNamespace
+
+        import octop_gateway.channels.slack as slack_mod
+
+        monkeypatch.setattr(slack_mod, "time", SimpleNamespace(time=time.time, monotonic=lambda: clock[0]))
+
+    @pytest.mark.asyncio
+    async def test_empty_filter_suppresses_all_slack_posts_and_updates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from octop_gateway.channel import InboundReceipt
+
+        clock = [10.0]
+        self._patch_slack_clock(monkeypatch, clock)
+
+        async def processor(_msg: InboundMessage) -> Any:
+            yield MessageEvent.delta("secret part 1 ")
+            clock[0] += 1.0
+            yield MessageEvent.delta("secret part 2")
+            yield MessageEvent.completed()
+
+        ch = SlackChannel(processor, self._config())
+        calls = self._wire_http(ch)
+        finish_calls: list[bool] = []
+
+        receipt = await ch.dispatch_inbound(
+            self._dm_event(),
+            receipt=InboundReceipt(
+                text_filter=lambda _text: "",
+                text_filter_finish=lambda: finish_calls.append(True) or "",
+            ),
+        )
+
+        message_calls = [c for c in calls if c[0] in ("chat.postMessage", "chat.update")]
+        assert message_calls == []
+        assert finish_calls == [True]
+        assert receipt.attempted is False
+        assert receipt.delivered is False
+        await ch.stop()
+
+    @pytest.mark.asyncio
+    async def test_filter_exception_and_non_str_fail_closed_and_suppress_finish(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from octop_gateway.channel import InboundReceipt
+
+        clock = [10.0]
+        self._patch_slack_clock(monkeypatch, clock)
+
+        async def processor(_msg: InboundMessage) -> Any:
+            yield MessageEvent.delta("raw chunk 1 ")
+            clock[0] += 1.0
+            yield MessageEvent.delta("raw chunk 2")
+            yield MessageEvent.completed()
+
+        def failing_filter(_text: str) -> str:
+            raise RuntimeError("filter boom")
+
+        finish_calls: list[bool] = []
+        ch = SlackChannel(processor, self._config())
+        calls = self._wire_http(ch)
+
+        receipt = await ch.dispatch_inbound(
+            self._dm_event("100.1"),
+            receipt=InboundReceipt(
+                text_filter=failing_filter,
+                text_filter_finish=lambda: finish_calls.append(True) or "leaked tail",
+            ),
+        )
+        assert [c for c in calls if c[0] in ("chat.postMessage", "chat.update")] == []
+        assert finish_calls == []
+        assert receipt.attempted is False
+        assert receipt.delivered is False
+        await ch.stop()
+
+        # Non-str return from text_filter also fails closed and suppresses finish.
+        ch2 = SlackChannel(processor, self._config())
+        calls2 = self._wire_http(ch2)
+        finish_calls2: list[bool] = []
+        receipt2 = await ch2.dispatch_inbound(
+            self._dm_event("100.2"),
+            receipt=InboundReceipt(
+                text_filter=lambda _text: None,  # type: ignore[arg-type, return-value]
+                text_filter_finish=lambda: finish_calls2.append(True) or "leaked tail",
+            ),
+        )
+        assert [c for c in calls2 if c[0] in ("chat.postMessage", "chat.update")] == []
+        assert finish_calls2 == []
+        assert receipt2.attempted is False
+        assert receipt2.delivered is False
+        await ch2.stop()
+
+        # Exception inside text_filter_finish also fails closed without posting.
+        ch3 = SlackChannel(processor, self._config())
+        calls3 = self._wire_http(ch3)
+
+        def failing_finish() -> str:
+            raise RuntimeError("finish boom")
+
+        receipt3 = await ch3.dispatch_inbound(
+            self._dm_event("100.3"),
+            receipt=InboundReceipt(
+                text_filter=lambda _text: "",
+                text_filter_finish=failing_finish,
+            ),
+        )
+        assert [c for c in calls3 if c[0] in ("chat.postMessage", "chat.update")] == []
+        assert receipt3.attempted is False
+        assert receipt3.delivered is False
+        await ch3.stop()
+
+    @pytest.mark.asyncio
+    async def test_stateful_incremental_filter_sees_each_chunk_once_and_flushes_tail_in_place(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from octop_gateway.channel import InboundReceipt
+
+        clock = [10.0]
+        self._patch_slack_clock(monkeypatch, clock)
+
+        async def processor(_msg: InboundMessage) -> Any:
+            yield MessageEvent.delta("alpha ")
+            clock[0] += 1.0
+            yield MessageEvent.delta("beta")
+            clock[0] += 1.0
+            yield MessageEvent.delta(" gamma")
+            yield MessageEvent.completed()
+
+        seen_chunks: list[str] = []
+        finish_calls: list[bool] = []
+
+        def stateful_filter(chunk: str) -> str:
+            seen_chunks.append(chunk)
+            return chunk.upper()
+
+        def finish_filter() -> str:
+            finish_calls.append(True)
+            return " [END]"
+
+        ch = SlackChannel(processor, self._config())
+        calls = self._wire_http(ch)
+
+        receipt = await ch.dispatch_inbound(
+            self._dm_event(),
+            receipt=InboundReceipt(text_filter=stateful_filter, text_filter_finish=finish_filter),
+        )
+
+        assert seen_chunks == ["alpha ", "beta", " gamma"]
+        assert finish_calls == [True]
+        posts = [p for ep, p in calls if ep == "chat.postMessage"]
+        updates = [p for ep, p in calls if ep == "chat.update"]
+        assert len(posts) == 1
+        assert posts[0]["text"] == "ALPHA"
+        assert updates
+        assert updates[-1]["ts"] == "999.1"
+        assert updates[-1]["text"] == "ALPHA BETA GAMMA [END]"
+        assert receipt.attempted is True
+        assert receipt.delivered is True
+        await ch.stop()
+
+    @pytest.mark.asyncio
+    async def test_buffering_filter_flushes_on_finish_without_premature_post(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from octop_gateway.channel import InboundReceipt
+
+        clock = [10.0]
+        self._patch_slack_clock(monkeypatch, clock)
+
+        async def processor(_msg: InboundMessage) -> Any:
+            yield MessageEvent.delta("Hel")
+            clock[0] += 1.0
+            yield MessageEvent.delta("lo")
+            yield MessageEvent.completed()
+
+        buf: list[str] = []
+
+        def buffering_filter(chunk: str) -> str:
+            buf.append(chunk)
+            return ""
+
+        def finish_filter() -> str:
+            return "".join(buf)
+
+        ch = SlackChannel(processor, self._config())
+        calls = self._wire_http(ch)
+
+        receipt = await ch.dispatch_inbound(
+            self._dm_event(),
+            receipt=InboundReceipt(text_filter=buffering_filter, text_filter_finish=finish_filter),
+        )
+
+        posts = [p for ep, p in calls if ep == "chat.postMessage"]
+        updates = [p for ep, p in calls if ep == "chat.update"]
+        assert len(posts) == 1
+        assert posts[0]["text"] == "Hello"
+        assert updates == []
+        assert receipt.attempted is True
+        assert receipt.delivered is True
+        await ch.stop()
+
+    @pytest.mark.asyncio
+    async def test_suppress_thinking_hides_thinking_without_mutating_channel(self) -> None:
+        from octop_gateway.channel import InboundReceipt
+
+        async def processor(_msg: InboundMessage) -> Any:
+            yield MessageEvent.thinking_delta("secret step 1")
+            yield MessageEvent.thinking("secret step 2")
+            yield MessageEvent.delta("<think>inline ")
+            yield MessageEvent.delta("secret</think>Visible answer.")
+            yield MessageEvent.completed()
+
+        ch = SlackChannel(processor, self._config(show_thinking=True))
+        calls = self._wire_http(ch)
+
+        receipt = await ch.dispatch_inbound(
+            self._dm_event(),
+            receipt=InboundReceipt(suppress_thinking=True),
+        )
+
+        texts = [p["text"] for ep, p in calls if ep in ("chat.postMessage", "chat.update")]
+        assert texts
+        assert texts[-1] == "Visible answer."
+        assert all("secret" not in text for text in texts)
+        assert ch._constraints.show_thinking is True
+        assert receipt.delivered is True
+        await ch.stop()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_stream_restores_persistent_settings_for_next_dispatch(self) -> None:
+        from octop_gateway.channel import InboundReceipt
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        call_index = 0
+
+        async def processor(_msg: InboundMessage) -> Any:
+            nonlocal call_index
+            call_index += 1
+            if call_index == 1:
+                yield MessageEvent.thinking_delta("hidden during cancel")
+                yield MessageEvent.delta("first part")
+                started.set()
+                await release.wait()
+                yield MessageEvent.completed()
+            else:
+                yield MessageEvent.thinking("restored thought")
+                yield MessageEvent.delta("normal answer")
+                yield MessageEvent.completed()
+
+        ch = SlackChannel(processor, self._config(show_thinking=True, status_reactions=True))
+        calls = self._wire_http(ch)
+
+        task = asyncio.create_task(
+            ch.dispatch_inbound(
+                self._dm_event("100.1"),
+                receipt=InboundReceipt(suppress_thinking=True, text_filter=lambda _text: ""),
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert [c for c in calls if c[0] in ("chat.postMessage", "chat.update")] == []
+        assert any(ep == "reactions.remove" and p.get("name") == "hourglass_flowing_sand" for ep, p in calls)
+        assert not any(ep == "reactions.add" and p.get("name") == "white_check_mark" for ep, p in calls)
+        assert ch._constraints.show_thinking is True
+
+        calls.clear()
+        next_receipt = await ch.dispatch_inbound(self._dm_event("100.2"))
+        texts = [p["text"] for ep, p in calls if ep in ("chat.postMessage", "chat.update")]
+        assert any("restored thought" in text for text in texts)
+        assert any("normal answer" in text for text in texts)
+        assert next_receipt.delivered is True
+        await ch.stop()
