@@ -18,7 +18,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, ClassVar
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import aiohttp
 
@@ -46,6 +46,33 @@ logger = logging.getLogger(__name__)
 # Feishu / Lark API base URLs
 _API_BASE = "https://open.feishu.cn/open-apis"
 _LARK_API_BASE = "https://open.larksuite.com/open-apis"
+_FEISHU_API_HOSTS = frozenset({"open.feishu.cn", "open.larksuite.com"})
+
+
+def _url_hostname(url: str) -> str:
+    """Return the lowercase hostname, ignoring userinfo and a trailing dot."""
+    return (urlparse(url).hostname or "").lower().rstrip(".")
+
+
+def _feishu_media_needs_auth(url: str, api_base: str) -> bool:
+    """Return whether a media URL is on this tenant's Feishu or Lark API host.
+
+    Compare the parsed hostname exactly. A substring check would attach the
+    tenant token to lookalike hosts and to URLs that only mention the API
+    domain in the path or query.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = _url_hostname(url)
+    if not host:
+        return False
+    allowed = set(_FEISHU_API_HOSTS)
+    api_host = _url_hostname(api_base)
+    if api_host:
+        allowed.add(api_host)
+    return host in allowed
+
 
 # Maximum number of message IDs to track for deduplication
 _DEDUP_MAX_SIZE = 2000
@@ -930,7 +957,7 @@ class FeishuChannel(BaseChannel):
         """Download a URL, attaching tenant_access_token for Feishu API URLs."""
         http = await self._ensure_http()
         headers: dict[str, str] = {}
-        if "open.feishu.cn" in url or "open.larksuite.com" in url or "open-apis" in url:
+        if _feishu_media_needs_auth(url, self._api_base):
             token = await self._refresh_token()
             headers["Authorization"] = f"Bearer {token}"
         async with http.get(url, headers=headers) as resp:
