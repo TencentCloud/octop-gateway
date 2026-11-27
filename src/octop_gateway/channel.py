@@ -51,6 +51,15 @@ from octop_gateway.utils import Debouncer, close_event_stream, extract_media, ex
 logger = logging.getLogger(__name__)
 
 _GROUP_CONTEXT_FIELDS = frozenset(item.name for item in fields(GroupContextConfig))
+_ERROR_PAGE_MIME_TYPES = frozenset(
+    {
+        "text/html",
+        "application/json",
+        "text/plain",
+        "application/xml",
+        "text/xml",
+    }
+)
 
 
 def _plugin_group_settings(data: dict[str, Any]) -> dict[str, bool]:
@@ -589,6 +598,31 @@ class BaseChannel(ABC):
     # Media — fetch (inbound) / load (outbound)
     # =========================================================================
 
+    @staticmethod
+    async def _read_verified_response(resp: Any, *, url: str) -> bytes:
+        """Read an HTTP response body and reject empty or truncated payloads."""
+        data: bytes = await resp.read()
+        if not data:
+            raise aiohttp.ClientPayloadError(f"Empty media response: {url[:100]}")
+        headers = getattr(resp, "headers", None)
+        has_content_encoding = bool(
+            headers is not None
+            and hasattr(headers, "items")
+            and any(str(key).lower() == "content-encoding" and str(val).strip() for key, val in headers.items())
+        )
+        expected = getattr(resp, "content_length", None)
+        if (
+            not has_content_encoding
+            and isinstance(expected, int)
+            and not isinstance(expected, bool)
+            and expected >= 0
+            and len(data) != expected
+        ):
+            raise aiohttp.ClientPayloadError(
+                f"Truncated media response: received {len(data)} of {expected} bytes for {url[:100]}"
+            )
+        return data
+
     async def fetch_remote_media(self, url: str) -> tuple[bytes, str]:
         """Download a remote URL and return ``(bytes, content_type)``.
 
@@ -601,7 +635,7 @@ class BaseChannel(ABC):
         async with http.get(url) as resp:
             resp.raise_for_status()
             content_type = resp.content_type or _guess_content_type(url)
-            data = await resp.read()
+            data = await self._read_verified_response(resp, url=url)
             return data, content_type
 
     async def load_media_bytes(self, part: ContentPart) -> tuple[bytes, str]:
@@ -703,6 +737,16 @@ class BaseChannel(ABC):
 
         try:
             data, mime = await self.fetch_remote_media(url)
+            norm_mime = mime.split(";", 1)[0].strip().lower()
+            if isinstance(part, ImageContent) and norm_mime in _ERROR_PAGE_MIME_TYPES:
+                raise aiohttp.ClientPayloadError(f"Unexpected non-image content_type {norm_mime!r} for {url[:100]}")
+        except Exception:  # pylint: disable=broad-except
+            # Drop broken or auth-gated URLs so downstream LLM assembly never forwards them raw.
+            logger.warning("Failed to fetch inbound media; dropping broken URL: url=%s", url[:100], exc_info=True)
+            part.url = ""
+            return
+
+        try:
             # Image downloaders may identify the actual format from file bytes.
             # Resolve the storage extension only after applying that information.
             if isinstance(part, ImageContent) and mime.startswith("image/"):

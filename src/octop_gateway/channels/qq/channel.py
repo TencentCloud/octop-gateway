@@ -20,7 +20,10 @@ from dataclasses import dataclass, field
 from typing import Any, Self
 from urllib.parse import quote
 
-from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor
+import aiohttp
+from aiohttp import http_exceptions as aiohttp_http_exceptions
+
+from octop_gateway.channel import _ERROR_PAGE_MIME_TYPES, BaseChannel, ChannelConfig, MessageProcessor
 from octop_gateway.channels.qq.login_qr import QQBotQRCredentials
 from octop_gateway.channels.qq.stream import (
     STREAM_DONE,
@@ -162,6 +165,8 @@ _GATEWAY_PATH = "/gateway/bot"
 
 # Deduplication window size
 _DEDUP_MAX_SIZE = 1000
+_MEDIA_FETCH_MAX_ATTEMPTS = 2
+_MEDIA_FETCH_RETRY_DELAY_S = 0.3
 
 # ---------------------------------------------------------------------------
 # Module-level msg_seq counter (per msg_id)
@@ -1026,15 +1031,40 @@ class QQChannel(BaseChannel):
         return None
 
     async def fetch_remote_media(self, url: str) -> tuple[bytes, str]:
-        """Download with QQ OAuth ('QQBot {access_token}') header."""
-        token = await self._ensure_access_token()
+        """Download with QQ OAuth ('QQBot {access_token}') header and integrity checks."""
         http = await self._ensure_http()
-        headers = {"Authorization": f"QQBot {token}"}
-        async with http.get(url, headers=headers) as resp:
-            resp.raise_for_status()
-            content_type = resp.content_type or "application/octet-stream"
-            data = await resp.read()
-            return data, content_type
+        refreshed_token = False
+        attempt = 0
+        while True:
+            token = await self._ensure_access_token()
+            headers = {"Authorization": f"QQBot {token}"}
+            try:
+                async with http.get(url, headers=headers) as resp:
+                    if getattr(resp, "status", None) == 401 and not refreshed_token:
+                        refreshed_token = True
+                        self._invalidate_access_token()
+                        continue
+                    resp.raise_for_status()
+                    raw_ct = getattr(resp, "content_type", None)
+                    content_type = raw_ct if isinstance(raw_ct, str) and raw_ct else "application/octet-stream"
+                    norm_mime = content_type.split(";", 1)[0].strip().lower()
+                    if self._is_image_url(url) and norm_mime in _ERROR_PAGE_MIME_TYPES:
+                        raise aiohttp.ClientPayloadError(
+                            f"Unexpected non-image content_type {norm_mime!r} for {url[:100]}"
+                        )
+                    data = await self._read_verified_response(resp, url=url)
+                    return data, content_type
+            except (
+                aiohttp.ClientPayloadError,
+                aiohttp.ClientConnectionError,
+                aiohttp_http_exceptions.ContentLengthError,
+                TimeoutError,
+            ):
+                attempt += 1
+                if attempt >= _MEDIA_FETCH_MAX_ATTEMPTS:
+                    raise
+                if _MEDIA_FETCH_RETRY_DELAY_S > 0:
+                    await asyncio.sleep(_MEDIA_FETCH_RETRY_DELAY_S)
 
     async def _upload_media(
         self,
