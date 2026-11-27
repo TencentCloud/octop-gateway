@@ -12,8 +12,9 @@ import json
 import logging
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import aiohttp
 
@@ -27,12 +28,14 @@ from octop_gateway.models import (
     InboundMessage,
     TextContent,
 )
+from octop_gateway.push_routing import alias_subject_fields
 
 logger = logging.getLogger(__name__)
 
 # DingTalk OpenAPI base URL
 _API_BASE = "https://api.dingtalk.com"
 _OAPI_BASE = "https://oapi.dingtalk.com"
+_DEDUP_MAX_SIZE = 1000
 
 # Token refresh interval (1.5 hours, token valid for 2 hours)
 _TOKEN_REFRESH_INTERVAL = 5400
@@ -100,6 +103,26 @@ class DingTalkChannel(BaseChannel):
         self._stream_task: asyncio.Task[None] | None = None
         # Stream connection session ID (generated on each connect)
         self._stream_session_id: str | None = None
+        self._seen_messages: OrderedDict[str, None] = OrderedDict()
+
+    def _is_duplicate(self, msg_id: str) -> bool:
+        """Check and record DingTalk msg_id for deduplication."""
+        if not msg_id:
+            return False
+        if msg_id in self._seen_messages:
+            self._seen_messages.move_to_end(msg_id)
+            self.dropped_duplicate += 1
+            return True
+        self._seen_messages[msg_id] = None
+        while len(self._seen_messages) > _DEDUP_MAX_SIZE:
+            self._seen_messages.popitem(last=False)
+        return False
+
+    def _enrich_push_metadata(self, subject: ChannelSubject, meta: dict[str, Any]) -> dict[str, Any]:
+        out = dict(meta)
+        if subject.chat_type == "group" or str(out.get("conversation_type", "")) == "2":
+            alias_subject_fields(out, subject.subject_id, "conversation_id")
+        return out
 
     # =========================================================================
     # Lifecycle
@@ -253,6 +276,12 @@ class DingTalkChannel(BaseChannel):
         """
         if not self._running:
             return
+
+        msg_id = str(raw_payload.get("msg_id") or "")
+        if self._is_duplicate(msg_id):
+            logger.debug("Duplicate DingTalk message ignored: %s", msg_id)
+            return
+        self.note_inbound()
 
         if self._enqueue_callback:
             self._enqueue_callback(raw_payload)
@@ -447,15 +476,37 @@ class DingTalkChannel(BaseChannel):
             msg_param = json.dumps({"mediaId": media_id})
 
         # Session webhooks support text/Markdown replies but not uploaded media.
-        # Direct chats still include a sessionWebhook, so media must use the
-        # robot OpenAPI instead of following the text-message routing path.
-        if str(meta.get("conversation_type", "1")) != "1":
-            raise RuntimeError("DingTalk group session webhooks do not support uploaded media")
+        # Direct chats use oToMessages/batchSend; group chats use groupMessages/send
+        # when openConversationId (conversation_id) is available.
+        is_group = str(meta.get("conversation_type", "1")) != "1"
+        if is_group:
+            open_conv_id = str(meta.get("conversation_id") or subject_id or "").strip()
+            if not open_conv_id:
+                raise RuntimeError("DingTalk group media send requires conversation_id")
+            group_url = f"{_API_BASE}/v1.0/robot/groupMessages/send"
+            payload_group = {
+                "robotCode": self._config.effective_robot_code,
+                "openConversationId": open_conv_id,
+                "msgKey": msg_key,
+                "msgParam": msg_param,
+            }
+            try:
+                async with http.post(group_url, headers=headers, json=payload_group) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    if "processQueryKey" not in data and "requestId" not in data:
+                        raise RuntimeError(f"DingTalk group media send failed: {data}")
+                return
+            except RuntimeError:
+                raise
+            except (aiohttp.ClientError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as e:
+                raise RuntimeError(f"DingTalk OpenAPI group media send error: {e}") from e
 
         # DM via OpenAPI
+        target_user_id = str(meta.get("sender_id") or meta.get("to_handle") or subject_id)
         payload_dm = {
             "robotCode": self._config.effective_robot_code,
-            "userIds": [subject_id],
+            "userIds": [target_user_id],
             "msgKey": msg_key,
             "msgParam": msg_param,
         }
@@ -586,12 +637,20 @@ class DingTalkChannel(BaseChannel):
         parts = self._parse_content_parts(msgtype, raw_payload)
 
         # Build metadata for routing
+        is_group = conversation_type == "2" and bool(conversation_id)
+        subject_id = conversation_id if is_group else sender_id
+        chat_type: Literal["direct", "group"] = "group" if is_group else "direct"
         metadata: dict[str, Any] = {
             "msg_id": msg_id,
+            "message_id": msg_id,
             "conversation_id": conversation_id,
             "conversation_type": conversation_type,
+            "chat_type": chat_type,
+            "sender_id": sender_id,
             "sender_nick": sender_nick,
-            "to_handle": sender_id,
+            "sender_name": sender_nick or sender_id,
+            "to_handle": subject_id,
+            "bot_mentioned": True,
         }
 
         # Include webhook URL for reply-mode sending
@@ -603,7 +662,12 @@ class DingTalkChannel(BaseChannel):
             channel_id=self.channel_id,
             channel_type=self.channel_type,
             tenant_id=self._tenant_id,
-            channel_subject=ChannelSubject(subject_id=sender_id, metadata=metadata),
+            channel_subject=ChannelSubject(
+                subject_id=subject_id,
+                chat_type=chat_type,
+                display_name=sender_nick if not is_group else conversation_id,
+                metadata=metadata,
+            ),
             channel_session_id=session_id,
             content=parts,
             metadata=metadata,

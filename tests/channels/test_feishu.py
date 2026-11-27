@@ -69,6 +69,85 @@ class TestFeishuChannelUnit:
         config = _make_config()
         assert config.app_id == _FEISHU_APP_ID
         assert config.app_secret == _FEISHU_APP_SECRET
+        assert config.domain == "feishu"
+
+    def test_lark_international_domain_resolution(self) -> None:
+        lark_cfg = FeishuConfig(app_id="cli_1", app_secret="sec_1", domain="lark")
+        ch = FeishuChannel(processor=_noop_processor, config=lark_cfg)
+        assert ch._api_base == "https://open.larksuite.com/open-apis"
+        assert ch._ws_domain == "https://open.larksuite.com"
+
+        custom_cfg = FeishuConfig(app_id="cli_1", app_secret="sec_1", domain="https://open.larksuite.com")
+        ch2 = FeishuChannel(processor=_noop_processor, config=custom_cfg)
+        assert ch2._api_base == "https://open.larksuite.com/open-apis"
+        assert ch2._ws_domain == "https://open.larksuite.com"
+
+    async def test_fetch_remote_media_auth_uses_parsed_host(self) -> None:
+        ch = FeishuChannel(processor=_noop_processor, config=_make_config())
+        ch._tenant_token = "tenant-token"
+        ch._token_expires_at = time.time() + 3600
+        seen: list[dict[str, str]] = []
+
+        class _Resp:
+            content_type = "image/png"
+
+            def raise_for_status(self) -> None:
+                return None
+
+            async def read(self) -> bytes:
+                return b"img"
+
+            async def __aenter__(self) -> _Resp:
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+        def _get(url: str, headers: dict[str, str] | None = None, **_kwargs: object) -> _Resp:
+            seen.append(dict(headers or {}))
+            return _Resp()
+
+        http = MagicMock()
+        http.closed = False
+        http.get = MagicMock(side_effect=_get)
+        ch._http = http
+
+        await ch.fetch_remote_media("https://open.feishu.cn/open-apis/im/v1/images/img")
+        await ch.fetch_remote_media("https://evil.example/path?x=open.feishu.cn")
+        await ch.fetch_remote_media("https://open.feishu.cn.evil.example/open-apis/file")
+        await ch.fetch_remote_media("https://not-feishu.example/open-apis/file")
+
+        assert seen[0]["Authorization"] == "Bearer tenant-token"
+        assert seen[1] == {}
+        assert seen[2] == {}
+        assert seen[3] == {}
+
+        custom = FeishuChannel(
+            processor=_noop_processor,
+            config=FeishuConfig(app_id="cli_1", app_secret="sec_1", domain="https://custom.example"),
+        )
+        custom._tenant_token = "custom-token"
+        custom._token_expires_at = time.time() + 3600
+        custom._http = http
+        await custom.fetch_remote_media("https://custom.example/open-apis/im/v1/images/img")
+        assert seen[4]["Authorization"] == "Bearer custom-token"
+
+    def test_parse_inbound_parent_id_and_quote(self) -> None:
+        ch = FeishuChannel(processor=_noop_processor, config=_make_config())
+        payload = {
+            "message_id": "om_child",
+            "parent_id": "om_parent",
+            "reply_quote_text": "Quoted parent text",
+            "message_type": "text",
+            "content": '{"text":"my reply"}',
+            "chat_id": "oc_chat001",
+            "chat_type": "p2p",
+            "sender": {"sender_id": "ou_abc123", "sender_type": "user"},
+        }
+        msg = ch.parse_inbound(payload)
+        assert msg.metadata["parent_id"] == "om_parent"
+        assert msg.metadata["reply_to_message_id"] == "om_parent"
+        assert msg.metadata["reply_quote_text"] == "Quoted parent text"
 
     def test_parse_inbound_text(self) -> None:
         ch = FeishuChannel(processor=_noop_processor, config=_make_config())
@@ -142,6 +221,7 @@ class TestFeishuChannelUnit:
         assert msg.channel_subject is not None
         assert msg.channel_subject.chat_type == "group"
         assert msg.metadata["bot_mentioned"] is True
+        assert msg.metadata["has_mentions"] is True
         assert msg.metadata["sender_id"] == "ou_human"
         assert "@_user_1" not in msg.text
         assert "please help" in msg.text
@@ -162,6 +242,7 @@ class TestFeishuChannelUnit:
         }
         msg = ch.parse_inbound(payload)
         assert msg.metadata["bot_mentioned"] is False
+        assert msg.metadata["has_mentions"] is False
 
     def test_parse_inbound_image(self) -> None:
         ch = FeishuChannel(processor=_noop_processor, config=_make_config())

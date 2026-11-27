@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from octop_gateway.channel import InboundReceipt
 from octop_gateway.channels.qq import QQChannel, QQConfig
 from octop_gateway.channels.qq.channel import (
     extract_think_blocks,
@@ -740,3 +741,159 @@ class TestStreamDoesNotRepeat:
         assert "深证还在写" not in visible[0]
         assert all(p["json"].get("input_state") != STREAM_DONE for p in _stream_posts(http))
         assert sent == ["导语。\n\n| 指数 | 收盘 |\n| --- | --- |\n| 上证 | 3888 |\n" + "深证还在写" * 25]
+
+
+class TestQQStreamDispatchProtection:
+    """Real QQChannel C2C streaming tests for per-dispatch InboundReceipt protection."""
+
+    @pytest.mark.asyncio
+    async def test_empty_text_filter_suppresses_stream_and_static_output(self) -> None:
+        ch = QQChannel(processor=_delta_processor, config=_config())
+        http = _wire_http(ch)
+
+        receipt = await ch.dispatch_inbound(
+            _c2c_payload(),
+            receipt=InboundReceipt(text_filter=lambda _text: ""),
+        )
+
+        assert _stream_posts(http) == []
+        assert _static_texts(http) == []
+        assert receipt.attempted is False
+        assert receipt.delivered is False
+
+    @pytest.mark.asyncio
+    async def test_raising_and_non_string_text_filter_fail_closed(self) -> None:
+        def raising_filter(_text: str) -> str:
+            raise RuntimeError("filter boom")
+
+        finish_calls: list[bool] = []
+        ch = QQChannel(processor=_delta_processor, config=_config())
+        http = _wire_http(ch)
+
+        receipt = await ch.dispatch_inbound(
+            _c2c_payload(),
+            receipt=InboundReceipt(
+                text_filter=raising_filter,
+                text_filter_finish=lambda: finish_calls.append(True) or "should not flush",
+            ),
+        )
+
+        assert _stream_posts(http) == []
+        assert _static_texts(http) == []
+        assert finish_calls == []
+        assert receipt.attempted is False
+        assert receipt.delivered is False
+
+        ch2 = QQChannel(processor=_delta_processor, config=_config())
+        http2 = _wire_http(ch2)
+        receipt2 = await ch2.dispatch_inbound(
+            _c2c_payload(),
+            receipt=InboundReceipt(text_filter=lambda _text: None),  # type: ignore[arg-type, return-value]
+        )
+        assert _stream_posts(http2) == []
+        assert _static_texts(http2) == []
+        assert receipt2.attempted is False
+        assert receipt2.delivered is False
+
+    @pytest.mark.asyncio
+    async def test_stateful_incremental_filter_sees_each_chunk_once_and_flushes_tail(self) -> None:
+        async def processor(_msg: InboundMessage):
+            yield MessageEvent.delta("alpha ")
+            await asyncio.sleep(0)
+            yield MessageEvent.delta("beta")
+            await asyncio.sleep(0)
+            yield MessageEvent.text("alpha beta gamma")
+            yield MessageEvent.completed()
+
+        seen_chunks: list[str] = []
+        finish_calls: list[bool] = []
+
+        def stateful_filter(chunk: str) -> str:
+            seen_chunks.append(chunk)
+            return chunk.upper()
+
+        def finish_filter() -> str:
+            finish_calls.append(True)
+            return " [END]"
+
+        ch = QQChannel(processor=processor, config=_config())
+        http = _wire_http(ch)
+
+        receipt = await ch.dispatch_inbound(
+            _c2c_payload(),
+            receipt=InboundReceipt(text_filter=stateful_filter, text_filter_finish=finish_filter),
+        )
+
+        assert seen_chunks == ["alpha ", "beta", " gamma"]
+        assert finish_calls == [True]
+        assert _stream_posts(http)
+        assert _stream_posts(http)[-1]["json"]["input_state"] == STREAM_DONE
+        assert _stream_texts(http)[-1].strip() == "ALPHA BETA GAMMA [END]"
+        assert _static_texts(http) == []
+        assert receipt.attempted is True
+        assert receipt.delivered is True
+
+    @pytest.mark.asyncio
+    async def test_suppress_thinking_hides_thinking_without_mutating_channel(self) -> None:
+        async def processor(_msg: InboundMessage):
+            yield MessageEvent.thinking_delta("secret step 1")
+            yield MessageEvent.thinking("secret step 2")
+            yield MessageEvent.delta("<think>inline secret</think>Visible answer.")
+            yield MessageEvent.completed()
+
+        ch = QQChannel(processor=processor, config=_config(show_thinking=True))
+        http = _wire_http(ch)
+
+        receipt = await ch.dispatch_inbound(
+            _c2c_payload(),
+            receipt=InboundReceipt(suppress_thinking=True),
+        )
+
+        assert _static_texts(http) == []
+        assert _stream_texts(http)[-1].strip() == "Visible answer."
+        assert all("secret" not in text for text in _stream_texts(http))
+        assert ch._constraints.show_thinking is True
+        assert receipt.delivered is True
+
+    @pytest.mark.asyncio
+    async def test_cancelled_stream_restores_persistent_settings_for_next_dispatch(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        call_index = 0
+
+        async def processor(_msg: InboundMessage):
+            nonlocal call_index
+            call_index += 1
+            if call_index == 1:
+                yield MessageEvent.thinking_delta("hidden during cancel")
+                yield MessageEvent.delta("first part\n\n")
+                started.set()
+                await release.wait()
+                yield MessageEvent.completed()
+            else:
+                yield MessageEvent.thinking("restored thought")
+                yield MessageEvent.delta("normal answer")
+                yield MessageEvent.completed()
+
+        ch = QQChannel(processor=processor, config=_config(show_thinking=True))
+        http = _wire_http(ch)
+
+        task = asyncio.create_task(
+            ch.dispatch_inbound(
+                _c2c_payload("msg1"),
+                receipt=InboundReceipt(suppress_thinking=True, text_filter=lambda _text: ""),
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert _stream_posts(http) == []
+        assert _static_texts(http) == []
+        assert ch._constraints.show_thinking is True
+
+        next_receipt = await ch.dispatch_inbound(_c2c_payload("msg2"))
+        assert any("restored thought" in text for text in _static_texts(http))
+        assert _stream_texts(http)[-1].strip() == "normal answer"
+        assert next_receipt.delivered is True
