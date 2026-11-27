@@ -170,33 +170,53 @@ class FeishuChannel(BaseChannel):
 
         Feishu has no native typing API; the ``Typing`` reaction is the
         in-product "someone is typing" signal, and it never expires on its own.
-        Add it when processing starts and always remove it in ``finally`` so a
-        reply (or an error) clears the indicator instead of leaving it stuck.
+        Add it in the background when processing starts and always remove it in
+        ``finally`` so a reply (or an error) clears the indicator instead of
+        leaving it stuck. The add runs off the critical path so a slow Feishu
+        API cannot delay the agent turn.
         """
         message_id = self._extract_message_id(raw_payload)
-        reaction_id = ""
+        reaction_task: asyncio.Task[str] | None = None
         if message_id:
-            # Typing feedback is strictly best-effort: a token-refresh error or
-            # a stalled Feishu API must never delay or abort message processing.
-            try:
-                reaction_id = await asyncio.wait_for(
-                    self._add_reaction(message_id, self._TYPING_EMOJI),
-                    timeout=self._TYPING_REACTION_TIMEOUT_S,
-                )
-            except Exception:
-                logger.debug("Feishu: failed to add Typing reaction", exc_info=True)
-                reaction_id = ""
+            reaction_task = asyncio.create_task(
+                self._add_typing_reaction(message_id),
+                name=f"feishu-typing-add-{message_id[:12]}",
+            )
         try:
             await super().handle_inbound(raw_payload)
         finally:
-            if message_id and reaction_id:
+            if message_id and reaction_task is not None:
+                reaction_id = ""
                 try:
-                    await asyncio.wait_for(
-                        self._remove_reaction(message_id, reaction_id),
+                    reaction_id = await asyncio.wait_for(
+                        reaction_task,
                         timeout=self._TYPING_REACTION_TIMEOUT_S,
                     )
+                except asyncio.CancelledError:
+                    reaction_task.cancel()
+                    raise
                 except Exception:
-                    logger.debug("Feishu: failed to remove Typing reaction", exc_info=True)
+                    logger.debug("Feishu: failed to add Typing reaction", exc_info=True)
+                if reaction_id:
+                    try:
+                        await asyncio.wait_for(
+                            self._remove_reaction(message_id, reaction_id),
+                            timeout=self._TYPING_REACTION_TIMEOUT_S,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.debug("Feishu: failed to remove Typing reaction", exc_info=True)
+
+    async def _add_typing_reaction(self, message_id: str) -> str:
+        """Add the Typing reaction without letting failures escape the task."""
+        try:
+            return await self._add_reaction(message_id, self._TYPING_EMOJI)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Feishu: failed to add Typing reaction", exc_info=True)
+            return ""
 
     @staticmethod
     def _extract_message_id(raw_payload: Any) -> str:
@@ -1038,9 +1058,11 @@ class FeishuChannel(BaseChannel):
 
     # Emoji type Feishu renders as the "typing" indicator on a message.
     _TYPING_EMOJI = "Typing"
-    # A stalled reaction call must not hold up message processing. Typing feedback
-    # is cosmetic, so bound it tightly and drop it on timeout.
-    _TYPING_REACTION_TIMEOUT_S = 0.2
+    # The add runs in the background, so this only bounds how long completion
+    # waits for the reaction id and how long removal may take. Feishu API round
+    # trips can exceed one second on slow links; a 0.2 s budget dropped the
+    # indicator before the request even completed.
+    _TYPING_REACTION_TIMEOUT_S = 2.0
 
     def _add_reaction_async(self, message_id: str, emoji_type: str = "Typing") -> None:
         """Add emoji reaction to a message (fire-and-forget from lark-oapi thread).

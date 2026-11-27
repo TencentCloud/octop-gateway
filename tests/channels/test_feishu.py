@@ -13,6 +13,7 @@ Requires: FEISHU_APP_ID and FEISHU_APP_SECRET environment variables
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -924,9 +925,10 @@ class TestFeishuTypingReactionLifecycle:
 
         await ch.handle_inbound({"message_id": "om_ok"})
 
+        # The add is a background task, so processing starts before it lands.
         assert calls == [
-            ("add", "om_ok", "Typing"),
             ("process",),
+            ("add", "om_ok", "Typing"),
             ("remove", "om_ok", "reaction_1"),
         ]
 
@@ -957,8 +959,8 @@ class TestFeishuTypingReactionLifecycle:
 
         # Removal must still happen even when processing fails.
         assert calls == [
-            ("add", "om_err", "Typing"),
             ("process",),
+            ("add", "om_err", "Typing"),
             ("remove", "om_err", "reaction_2"),
         ]
 
@@ -1012,7 +1014,7 @@ class TestFeishuTypingReactionLifecycle:
 
         await ch.handle_inbound({"message_id": "om_no_reaction"})
 
-        assert calls == ["add", "process"]
+        assert calls == ["process", "add"]
 
     @pytest.mark.asyncio
     async def test_handle_inbound_reaction_failure_does_not_block_processing(
@@ -1043,7 +1045,7 @@ class TestFeishuTypingReactionLifecycle:
         # Must not raise even though the reaction add failed.
         await ch.handle_inbound({"message_id": "om_oauth_fail"})
 
-        assert calls == ["add", "process"]
+        assert calls == ["process", "add"]
 
     @pytest.mark.asyncio
     async def test_handle_inbound_reaction_remove_failure_does_not_break_processing(
@@ -1073,4 +1075,74 @@ class TestFeishuTypingReactionLifecycle:
 
         await ch.handle_inbound({"message_id": "om_rm_fail"})
 
-        assert calls == ["add", "process", "remove"]
+        assert calls == ["process", "add", "remove"]
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_does_not_wait_for_slow_add(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A slow Feishu API must not delay the agent turn: the Typing add is
+        started in the background while processing begins immediately."""
+        from octop_gateway.channel import BaseChannel
+
+        ch = FeishuChannel(processor=_noop_processor, config=_make_config())
+        calls: list[str] = []
+        add_started = asyncio.Event()
+        release_add = asyncio.Event()
+        processed = asyncio.Event()
+        add_finished = False
+
+        async def _slow_add(message_id: str, emoji_type: str) -> str:
+            nonlocal add_finished
+            calls.append("add")
+            add_started.set()
+            await release_add.wait()
+            add_finished = True
+            return "reaction_slow"
+
+        async def _fake_remove(message_id: str, reaction_id: str) -> None:
+            calls.append("remove")
+
+        async def _fake_base_handle(self, raw_payload: object) -> None:
+            calls.append("process")
+            processed.set()
+
+        ch._add_reaction = _slow_add  # type: ignore[method-assign]
+        ch._remove_reaction = _fake_remove  # type: ignore[method-assign]
+        monkeypatch.setattr(BaseChannel, "handle_inbound", _fake_base_handle)
+
+        task = asyncio.create_task(ch.handle_inbound({"message_id": "om_slow"}))
+        await asyncio.wait_for(processed.wait(), timeout=1.0)
+        assert not add_finished
+        await asyncio.wait_for(add_started.wait(), timeout=1.0)
+        release_add.set()
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert calls == ["process", "add", "remove"]
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_add_timeout_does_not_block_completion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When the add exceeds the bounded wait, drop the indicator and finish
+        instead of hanging the inbound handler."""
+        from octop_gateway.channel import BaseChannel
+
+        ch = FeishuChannel(processor=_noop_processor, config=_make_config())
+        monkeypatch.setattr(ch, "_TYPING_REACTION_TIMEOUT_S", 0.05)
+        calls: list[str] = []
+
+        async def _hanging_add(message_id: str, emoji_type: str) -> str:
+            calls.append("add")
+            await asyncio.Event().wait()
+            return "never"
+
+        async def _fake_remove(message_id: str, reaction_id: str) -> None:
+            calls.append("remove")
+
+        async def _fake_base_handle(self, raw_payload: object) -> None:
+            calls.append("process")
+
+        ch._add_reaction = _hanging_add  # type: ignore[method-assign]
+        ch._remove_reaction = _fake_remove  # type: ignore[method-assign]
+        monkeypatch.setattr(BaseChannel, "handle_inbound", _fake_base_handle)
+
+        await asyncio.wait_for(ch.handle_inbound({"message_id": "om_timeout"}), timeout=1.0)
+
+        assert calls == ["process", "add"]

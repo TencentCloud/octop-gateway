@@ -120,7 +120,12 @@ async def test_error_is_visible_terminal_and_next_turn_recovers(
     ws = MagicMock(reply_stream=AsyncMock())
     frames: list[Any] = []
     a2a = AsyncMock()
-    if kind == "wecom":
+    if kind == "feishu":
+        # Typing reactions are cosmetic; without mocks the background add hits
+        # the live Feishu API and outlives this test's timeout.
+        monkeypatch.setattr(channel, "_add_reaction", AsyncMock(return_value=""))
+        monkeypatch.setattr(channel, "_remove_reaction", AsyncMock())
+    elif kind == "wecom":
         channel._ws_client = ws
         message.metadata.update({"_ws_client": ws, "_frame": {"body": {}}})
     elif kind == "qq":
