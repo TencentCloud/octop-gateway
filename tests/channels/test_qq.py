@@ -1550,3 +1550,169 @@ class TestQQInvalidSessionRecovery:
         assert ch._session_id_ws == "active_session"
         assert ch._last_sequence == 123
         assert ch._force_token_refresh is False
+
+
+class TestQQMediaFetchIntegrity:
+    """Verify QQChannel.fetch_remote_media integrity checks, retries, and URL drop."""
+
+    @staticmethod
+    def _setup_http(ch: QQChannel, responses: list[object]) -> list[str]:
+        calls: list[str] = []
+        queue = list(responses)
+
+        class _Http:
+            closed = False
+
+            def get(self, url: str, headers: dict[str, str] | None = None):
+                del headers
+                calls.append(url)
+                nxt = queue.pop(0)
+                if isinstance(nxt, BaseException):
+                    raise nxt
+                return nxt
+
+        ch._http = _Http()  # type: ignore[assignment]
+        ch._access_token = "tok"
+        ch._token_expires_at = 9999999999.0
+        ch._token_refresh_at = 9999999999.0
+        return calls
+
+    @staticmethod
+    def _resp(
+        *,
+        status: int = 200,
+        body: bytes = b"ok",
+        content_type: str = "image/jpeg",
+        content_length: int | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> object:
+        class _Resp:
+            def __init__(self) -> None:
+                self.status = status
+                self.content_type = content_type
+                self.content_length = content_length
+                self.headers = headers or {}
+
+            def raise_for_status(self) -> None:
+                if self.status >= 400:
+                    raise RuntimeError(f"HTTP {self.status}")
+
+            async def read(self) -> bytes:
+                return body
+
+            async def __aenter__(self) -> _Resp:
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+        return _Resp()
+
+    @pytest.mark.asyncio
+    async def test_fetch_remote_media_retries_truncated_payload_and_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import octop_gateway.channels.qq.channel as qq_mod
+
+        monkeypatch.setattr(qq_mod, "_MEDIA_FETCH_RETRY_DELAY_S", 0.0)
+        ch = QQChannel(processor=_noop_processor, config=_make_config())
+        calls = self._setup_http(
+            ch,
+            [
+                self._resp(body=b"short", content_length=10, content_type="image/jpeg"),
+                self._resp(body=b"0123456789", content_length=10, content_type="image/jpeg"),
+            ],
+        )
+
+        data, mime = await ch.fetch_remote_media("https://cdn.qq.com/pic.jpg")
+        assert data == b"0123456789"
+        assert mime == "image/jpeg"
+        assert len(calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_persist_media_drops_url_after_repeated_content_length_error(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import aiohttp
+        from aiohttp import http_exceptions
+
+        import octop_gateway.channels.qq.channel as qq_mod
+        from octop_gateway.media import FileSystemMediaBackend
+
+        monkeypatch.setattr(qq_mod, "_MEDIA_FETCH_RETRY_DELAY_S", 0.0)
+        ch = QQChannel(processor=_noop_processor, config=_make_config())
+        ch.set_media_backend(FileSystemMediaBackend(tmp_path))
+        err = aiohttp.ClientPayloadError("ContentLengthError: received 491520 of 1095644 bytes")
+        err.__cause__ = http_exceptions.ContentLengthError("Not enough data")
+        calls = self._setup_http(ch, [err, err])
+
+        part = ImageContent(url="https://cdn.qq.com/broken.jpg", mime_type="image/jpeg")
+        await ch._persist_media_part(part, 0, 12345)
+
+        assert len(calls) == 2
+        assert part.local_path is None
+        assert part.url == ""
+        assert list(tmp_path.rglob("*")) == []
+
+    @pytest.mark.asyncio
+    async def test_fetch_remote_media_allows_gzip_response_longer_than_content_length(self) -> None:
+        ch = QQChannel(processor=_noop_processor, config=_make_config())
+        self._setup_http(
+            ch,
+            [
+                self._resp(
+                    body=b"decompressed-bytes-longer-than-wire",
+                    content_length=10,
+                    content_type="image/png",
+                    headers={"Content-Encoding": "gzip"},
+                )
+            ],
+        )
+
+        data, mime = await ch.fetch_remote_media("https://cdn.qq.com/compressed.png")
+        assert data == b"decompressed-bytes-longer-than-wire"
+        assert mime == "image/png"
+
+    @pytest.mark.asyncio
+    async def test_fetch_remote_media_rejects_empty_and_refreshes_401(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import octop_gateway.channels.qq.channel as qq_mod
+
+        monkeypatch.setattr(qq_mod, "_MEDIA_FETCH_RETRY_DELAY_S", 0.0)
+        ch = QQChannel(processor=_noop_processor, config=_make_config())
+        refreshed = AsyncMock(return_value="fresh-tok")
+        ch._ensure_access_token = refreshed  # type: ignore[method-assign]
+        calls = self._setup_http(
+            ch,
+            [
+                self._resp(status=401, body=b""),
+                self._resp(body=b"", content_type="image/png"),
+                self._resp(body=b"valid-png", content_length=9, content_type="image/png"),
+            ],
+        )
+
+        data, mime = await ch.fetch_remote_media("https://cdn.qq.com/retry.png")
+        assert data == b"valid-png"
+        assert mime == "image/png"
+        assert len(calls) == 3
+        assert refreshed.await_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_fetch_remote_media_rejects_html_error_page_for_image_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import aiohttp
+
+        import octop_gateway.channels.qq.channel as qq_mod
+
+        monkeypatch.setattr(qq_mod, "_MEDIA_FETCH_RETRY_DELAY_S", 0.0)
+        ch = QQChannel(processor=_noop_processor, config=_make_config())
+        self._setup_http(
+            ch,
+            [
+                self._resp(body=b"<html>error</html>", content_type="text/html"),
+                self._resp(body=b"<html>error</html>", content_type="text/html"),
+            ],
+        )
+
+        with pytest.raises(aiohttp.ClientPayloadError, match="Unexpected non-image"):
+            await ch.fetch_remote_media("https://cdn.qq.com/expired.jpg")

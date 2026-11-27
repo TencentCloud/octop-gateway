@@ -943,3 +943,83 @@ async def test_text_filter_tail_is_not_flushed_after_failed_processing() -> None
     await channel.dispatch_inbound("hello", receipt=receipt)
     assert finished == []
     assert channel.sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_base_fetch_remote_media_rejects_truncated_and_empty_responses() -> None:
+    import aiohttp
+
+    class _FakeResp:
+        def __init__(
+            self,
+            body: bytes,
+            *,
+            content_length: int | None,
+            content_type: str = "image/png",
+            headers: dict[str, str] | None = None,
+        ) -> None:
+            self.status = 200
+            self.content_type = content_type
+            self.content_length = content_length
+            self.headers = headers or {}
+            self._body = body
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def read(self) -> bytes:
+            return self._body
+
+        async def __aenter__(self) -> _FakeResp:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    responses = [
+        _FakeResp(b"", content_length=0),
+        _FakeResp(b"abc", content_length=10),
+        _FakeResp(b"abcdef", content_length=6),
+    ]
+
+    class _FakeHttp:
+        closed = False
+
+        def get(self, url: str) -> _FakeResp:
+            del url
+            return responses.pop(0)
+
+    channel = EchoChannel(make_echo_processor)
+    channel._http = _FakeHttp()  # type: ignore[assignment]
+
+    with pytest.raises(aiohttp.ClientPayloadError, match="Empty"):
+        await channel.fetch_remote_media("https://example.com/empty.png")
+    with pytest.raises(aiohttp.ClientPayloadError, match="Truncated"):
+        await channel.fetch_remote_media("https://example.com/short.png")
+    data, mime = await channel.fetch_remote_media("https://example.com/good.png")
+    assert data == b"abcdef"
+    assert mime == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_persist_media_part_drops_url_when_fetch_fails_or_returns_html(tmp_path) -> None:
+    from unittest.mock import AsyncMock
+
+    from octop_gateway.media import FileSystemMediaBackend
+    from octop_gateway.models import ImageContent
+
+    channel = EchoChannel(make_echo_processor)
+    channel.set_media_backend(FileSystemMediaBackend(tmp_path))
+
+    channel.fetch_remote_media = AsyncMock(side_effect=RuntimeError("network error"))  # type: ignore[method-assign]
+    failed_part = ImageContent(url="https://example.com/fail.jpg")
+    await channel._persist_media_part(failed_part, 0, 100)
+    assert failed_part.local_path is None
+    assert failed_part.url == ""
+
+    channel.fetch_remote_media = AsyncMock(return_value=(b"<html>403</html>", "text/html"))  # type: ignore[method-assign]
+    html_part = ImageContent(url="https://example.com/no-ext")
+    await channel._persist_media_part(html_part, 1, 101)
+    assert html_part.local_path is None
+    assert html_part.url == ""
+    assert list(tmp_path.rglob("*")) == []
