@@ -220,6 +220,68 @@ class FeishuChannel(BaseChannel):
         await self._close_http()
         logger.info("FeishuChannel stopped")
 
+    async def handle_inbound(self, raw_payload: Any) -> None:
+        """Run the shared inbound flow with a bounded "Typing" reaction.
+
+        Feishu has no native typing API; the ``Typing`` reaction is the
+        in-product "someone is typing" signal, and it never expires on its own.
+        Add it in the background when processing starts and always remove it in
+        ``finally`` so a reply (or an error) clears the indicator instead of
+        leaving it stuck. The add runs off the critical path so a slow Feishu
+        API cannot delay the agent turn.
+        """
+        message_id = self._extract_message_id(raw_payload)
+        reaction_task: asyncio.Task[str] | None = None
+        if message_id:
+            reaction_task = asyncio.create_task(
+                self._add_typing_reaction(message_id),
+                name=f"feishu-typing-add-{message_id[:12]}",
+            )
+        try:
+            await super().handle_inbound(raw_payload)
+        finally:
+            if message_id and reaction_task is not None:
+                reaction_id = ""
+                try:
+                    reaction_id = await asyncio.wait_for(
+                        reaction_task,
+                        timeout=self._TYPING_REACTION_TIMEOUT_S,
+                    )
+                except asyncio.CancelledError:
+                    reaction_task.cancel()
+                    raise
+                except Exception:
+                    logger.debug("Feishu: failed to add Typing reaction", exc_info=True)
+                if reaction_id:
+                    try:
+                        await asyncio.wait_for(
+                            self._remove_reaction(message_id, reaction_id),
+                            timeout=self._TYPING_REACTION_TIMEOUT_S,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.debug("Feishu: failed to remove Typing reaction", exc_info=True)
+
+    async def _add_typing_reaction(self, message_id: str) -> str:
+        """Add the Typing reaction without letting failures escape the task."""
+        try:
+            return await self._add_reaction(message_id, self._TYPING_EMOJI)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Feishu: failed to add Typing reaction", exc_info=True)
+            return ""
+
+    @staticmethod
+    def _extract_message_id(raw_payload: Any) -> str:
+        """Best-effort extraction of the Feishu message id from a raw payload."""
+        if isinstance(raw_payload, InboundMessage):
+            return str((raw_payload.metadata or {}).get("message_id", "") or "")
+        if isinstance(raw_payload, dict):
+            return str(raw_payload.get("message_id", "") or "")
+        return ""
+
     async def _ensure_bot_open_id(self) -> str | None:
         """Resolve and cache this bot's open_id via ``/bot/v3/info``."""
         if self._bot_open_id:
@@ -626,8 +688,9 @@ class FeishuChannel(BaseChannel):
             )
             self._mark_ws_activity()
 
-            # Add "Typing" reaction to acknowledge receipt (non-blocking)
-            self._add_reaction_async(message_id, "Typing")
+            # The "Typing" reaction lifecycle is now owned by handle_inbound:
+            # add on processing start, remove on completion/error. This keeps
+            # Feishu's "typing" indicator from lingering after a reply.
 
             self.note_inbound()
             # Enqueue for processing
@@ -1059,6 +1122,14 @@ class FeishuChannel(BaseChannel):
     # Reactions (typing acknowledgement)
     # =========================================================================
 
+    # Emoji type Feishu renders as the "typing" indicator on a message.
+    _TYPING_EMOJI = "Typing"
+    # The add runs in the background, so this only bounds how long completion
+    # waits for the reaction id and how long removal may take. Feishu API round
+    # trips can exceed one second on slow links; a 0.2 s budget dropped the
+    # indicator before the request even completed.
+    _TYPING_REACTION_TIMEOUT_S = 2.0
+
     def _add_reaction_async(self, message_id: str, emoji_type: str = "Typing") -> None:
         """Add emoji reaction to a message (fire-and-forget from lark-oapi thread).
 
@@ -1072,7 +1143,7 @@ class FeishuChannel(BaseChannel):
         else:
             logger.debug("Feishu: main loop not available, skipping reaction")
 
-    async def _add_reaction(self, message_id: str, emoji_type: str = "Typing") -> None:
+    async def _add_reaction(self, message_id: str, emoji_type: str = "Typing") -> str:
         """Add an emoji reaction to a Feishu message via API.
 
         Runs in the main event loop (dispatched by _add_reaction_async).
@@ -1082,6 +1153,10 @@ class FeishuChannel(BaseChannel):
         Args:
             message_id: The message to react to.
             emoji_type: Feishu emoji type string (e.g. "Typing", "THUMBSUP", "OK").
+
+        Returns:
+            The reaction_id assigned by Feishu, or "" if unavailable. The id is
+            required to later remove the reaction (typing lifecycle).
         """
         try:
             token = await self._refresh_token()
@@ -1094,12 +1169,41 @@ class FeishuChannel(BaseChannel):
 
             async with aiohttp.ClientSession() as session, session.post(url, headers=headers, json=payload) as resp:
                 if resp.status == 200:
-                    logger.debug("Feishu reaction added: %s on %s", emoji_type, message_id[:16])
-                else:
-                    body = await resp.text()
-                    logger.debug("Feishu reaction failed: %d %s", resp.status, body[:100])
+                    reaction_id = ""
+                    with contextlib.suppress(json.JSONDecodeError, UnicodeDecodeError, aiohttp.ClientError):
+                        data = await resp.json()
+                        reaction_id = str((data.get("data") or {}).get("reaction_id") or "")
+                    logger.debug(
+                        "Feishu reaction added: %s on %s (id=%s)", emoji_type, message_id[:16], reaction_id[:12]
+                    )
+                    return reaction_id
+                body = await resp.text()
+                logger.debug("Feishu reaction failed: %d %s", resp.status, body[:100])
         except (aiohttp.ClientError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError):
             logger.debug("Feishu _add_reaction error for %s", message_id[:16], exc_info=True)
+        return ""
+
+    async def _remove_reaction(self, message_id: str, reaction_id: str) -> None:
+        """Remove an emoji reaction from a Feishu message via API.
+
+        DELETE /im/v1/messages/{message_id}/reactions/{reaction_id}. Only the
+        original adder (this bot) may remove a reaction, which is the case for
+        the Typing reaction created on processing start.
+        """
+        if not message_id or not reaction_id:
+            return
+        try:
+            token = await self._refresh_token()
+            headers = {"Authorization": f"Bearer {token}"}
+            url = f"{_API_BASE}/im/v1/messages/{message_id}/reactions/{reaction_id}"
+            async with aiohttp.ClientSession() as session, session.delete(url, headers=headers) as resp:
+                if resp.status == 200:
+                    logger.debug("Feishu reaction removed: %s on %s", reaction_id[:12], message_id[:16])
+                else:
+                    body = await resp.text()
+                    logger.debug("Feishu reaction removal failed: %d %s", resp.status, body[:100])
+        except (aiohttp.ClientError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError):
+            logger.debug("Feishu _remove_reaction error for %s", message_id[:16], exc_info=True)
 
     # =========================================================================
     # Inbound Parsing
